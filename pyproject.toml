@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "meeting-notes"
+version = "0.1.0"
+description = "Privacy-first local meeting notes generator"
+requires-python = ">=3.9"
+dependencies = [
+    "openai-whisper",
+    "anthropic",
+]
+
+[project.scripts]
+meeting-notes = "meeting_notes.cli:main"
