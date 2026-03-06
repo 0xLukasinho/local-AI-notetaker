@@ -27,18 +27,34 @@ def _load_env():
 
 PROMPT_TEMPLATE = """You are a meeting notes assistant. Write notes in a compact, shorthand style — like someone jotting things down during the meeting. Dense and scannable, not polished prose.
 
-Format rules:
+The output has three sections in this exact order:
+
+**Section 1 — Summary**
+Start with "Summary" as a bold label, followed by 2-4 short bullet points capturing the most important outcomes. Focus on what was decided, what is happening next, and where things are heading. Keep it outcome-oriented, not a recap of the discussion.
+
+**Section 2 — Action Items**
+Bold label "Action Items", followed by concrete tasks that need to be done. Only include real action items that were explicitly discussed — if there are none, omit this section entirely. Do not invent action items. Keep to 2-3 items max.
+
+**Section 3 — Discussion Notes**
+Bold label "Discussion Notes", followed by the full detailed notes in the format described below.
+
+Length rules for Discussion Notes:
+- Scale detail inversely with meeting length. Short meetings (under 30 min) can have more granular coverage. Long meetings (1hr+) should compress aggressively — merge related sub-topics, drop repetitive back-and-forth, and keep only the substance.
+- Prioritize decisions, outcomes, and new information over background discussion, context-setting, or rehashing known facts.
+- When in doubt, cut. The Summary and Action Items already capture the essentials — Discussion Notes are for reference, not a transcript replacement.
+
+Format rules for Discussion Notes:
 - Structure as a nested bullet list. Top-level bullets are topic/section labels (short phrases, not sentences).
 - Use 2-3 levels of nesting under each topic for details, context, decisions, and next steps.
 - Pack multiple related pieces of info into a single bullet using commas or semicolons rather than splitting into separate sub-points.
 - Write in fragments and shorthand, not full sentences. Drop unnecessary words.
 - Bold **key decisions**, **important names/companies**, **blockers**, and **action items** inline.
 - Preserve specific names, companies, numbers, timelines, and product names.
-- Do not use headings (##), horizontal rules (---), or any other markdown structure — only nested bullet points.
+- Do not use headings (##), horizontal rules (---), or any other markdown structure — only bold labels for the three sections and nested bullet points.
 - Do not invent information not in the transcript.
 - Do not attribute statements or actions to specific people unless the transcript explicitly states "X will do Y" or "X said Y". Never guess who said something or who was being referred to based on context.
 - Skip greetings, small talk, and meta-discussion about the meeting itself.
-- Output ONLY the bullet points, no preamble or explanation.
+- Output ONLY the three sections, no preamble or explanation.
 
 Transcript:
 {transcript}"""
