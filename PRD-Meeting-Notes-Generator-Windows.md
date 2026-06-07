@@ -1,14 +1,14 @@
 # Product Requirements Document: Meeting Notes Generator (Windows)
 
-**Version:** 1.0
-**Date:** 2026-06-05
-**Status:** Design approved, pending implementation
+**Version:** 1.1
+**Date:** 2026-06-07
+**Status:** Implemented. Note generation uses Claude Code subscription (OAuth) rather than the Anthropic API.
 
 ---
 
 ## Executive Summary
 
-A Windows port of the existing macOS Meeting Notes Generator. CLI tool that records meeting audio (system + microphone), transcribes it locally with Whisper, and generates structured notes via the Claude API. Same user experience as the Mac version, same file outputs, same prompt — adapted to Windows audio capture primitives.
+A Windows port of the existing macOS Meeting Notes Generator. CLI tool that records meeting audio (system + microphone), transcribes it locally with Whisper, and generates structured notes by invoking the Claude Code CLI (which uses the user's Claude subscription via OAuth — no API key, no per-meeting cost). Same user experience as the Mac version, same file outputs, same prompt — adapted to Windows audio capture primitives.
 
 ---
 
@@ -20,7 +20,7 @@ This port reuses the existing codebase rather than forking. The summarizer (`sum
 |-----------|-----|---------|
 | Audio capture | ffmpeg + AVFoundation | `soundcard` (WASAPI loopback + mic), mixed in Python |
 | Transcription | openai-whisper (local) | openai-whisper (local) — unchanged |
-| Note generation | Claude API | Claude API — unchanged |
+| Note generation | Claude Code CLI subprocess (`claude -p`) | Claude Code CLI subprocess (`claude -p`) |
 | Clipboard | `pbcopy` | `clip` |
 | Stop hotkey | Cmd+Alt+Q (new global hotkey) | Ctrl+Alt+Q (new global hotkey) |
 | Output dir | `~/meeting-notes/` | `%USERPROFILE%\meeting-notes\` |
@@ -42,7 +42,7 @@ Enable a Windows user to generate structured meeting notes and action items from
 3. User stops recording with the global hotkey **Ctrl+Alt+Q** (works even when the terminal is not focused).
 4. Tool automatically:
    - Transcribes audio using local Whisper
-   - Generates notes using the Claude API
+   - Generates notes by invoking `claude -p --model claude-opus-4-7` as a subprocess (uses the user's Claude subscription)
    - Saves transcript + notes as markdown files
    - Copies notes to the Windows clipboard
 5. User pastes notes into Notion (or other tools) with Ctrl+V.
@@ -57,17 +57,17 @@ The Mac PRD's security analysis applies unchanged. Summary for Windows:
 |------|----------|-----------------|
 | Audio recording | Local (`%USERPROFILE%\meeting-notes\...\audio.wav`) | None |
 | Transcription | Local (Whisper runs on CPU/GPU) | None (after one-time model download) |
-| Note generation | Transcript sent to Anthropic API | HTTPS POST + response |
+| Note generation | Transcript sent to Claude via Claude Code CLI | HTTPS to Anthropic (subscription-authenticated) |
 | Final storage | Local | None |
 
-The transcript leaves the machine during note generation. Audio never does. Anthropic's published policy is zero data retention for API calls; consult your own IT for approval against your data classification.
+The transcript leaves the machine during note generation. Audio never does. Traffic goes through Claude Code's standard channel (OAuth-authenticated against the user's Max/Pro subscription); Anthropic's data-handling policy for that channel applies.
 
 ### File Structure
 
 ```
 %USERPROFILE%\meeting-notes\
 ├── 2026-06-05_project-sync\
-│   ├── audio.wav          # Can be auto-deleted via --delete-audio
+│   ├── audio.wav          # Auto-deleted after notes generation (use --keep-audio to retain)
 │   ├── transcript.txt
 │   └── notes.md
 └── 2026-06-05_client-call\
@@ -76,7 +76,7 @@ The transcript leaves the machine during note generation. Audio never does. Anth
     └── notes.md
 ```
 
-API key lives in a `.env` file at the project root (`ANTHROPIC_API_KEY=...`), same as the Mac version.
+No API key required. Authentication is whatever Claude Code is logged in as on the machine (`claude login`).
 
 ---
 
@@ -86,7 +86,7 @@ API key lives in a `.env` file at the project root (`ANTHROPIC_API_KEY=...`), sa
 
 - **OS:** Windows 10 (1903+) or Windows 11
 - **Python:** 3.9 or higher
-- **External tools:** ffmpeg on PATH (required by Whisper for audio decoding)
+- **External tools:** ffmpeg on PATH (required by Whisper for audio decoding); Claude Code CLI on PATH and logged in (used for note generation)
 - **Audio:** A default playback device and a default recording device configured in Windows Sound settings
 - **Disk:** ~2GB for Python + Whisper model; ~100–500MB per meeting (audio) + ~50KB transcript + ~5KB notes
 
@@ -95,7 +95,7 @@ API key lives in a `.env` file at the project root (`ANTHROPIC_API_KEY=...`), sa
 Existing (shared with Mac):
 
 - `openai-whisper` — local speech-to-text
-- `anthropic` — Claude API client
+- Claude Code CLI (`claude`) — external dependency, invoked as a subprocess for note generation. No Python client library required.
 
 New (Windows-only, declared as an optional extra in `pyproject.toml`):
 
@@ -149,9 +149,19 @@ Unchanged from the Mac version. `meeting_notes/transcriber.py` calls `whisper.lo
 
 ### Note Generation
 
-Unchanged. `meeting_notes/summarizer.py` calls the Claude API with the existing prompt template (Summary / Action Items / Discussion Notes). Default model `claude-sonnet-4-6`, overridable via `--model`.
+`meeting_notes/summarizer.py` invokes the Claude Code CLI as a subprocess:
 
-The Notion-paste cleanup (`_clean_for_notion`) and clipboard copy both work on Windows once `pbcopy` is swapped for `clip`.
+```
+claude -p --model claude-opus-4-7
+```
+
+The prompt (template + transcript) is piped over stdin to avoid Windows command-line length limits. The CLI authenticates against the user's existing Claude subscription (OAuth via `claude login`), so usage counts against subscription quota rather than per-call API billing.
+
+Default model is `claude-opus-4-7` (Max plan affords generous Opus limits); overridable via `--model` or the `MEETING_NOTES_MODEL` env var.
+
+The prompt template (Summary / Action Items / Discussion Notes) is preserved verbatim, and the Notion-paste cleanup (`_clean_for_notion`) is unchanged. Clipboard copy uses `pbcopy` on Mac, `clip` on Windows.
+
+**Why subprocess instead of an SDK:** Anthropic explicitly does not allow third-party tools (including the Claude Agent SDK) to authenticate against claude.ai subscriptions. The only realistic path to using a Max/Pro subscription for note generation is to invoke the user's own Claude Code installation, which is what this design does.
 
 ---
 
@@ -190,16 +200,16 @@ meeting-notes list
 meeting-notes reprocess 2026-06-05_project-sync
 meeting-notes reprocess 2026-06-05_project-sync --notes-only
 
-# Start with auto-delete of audio after notes succeed
-meeting-notes start "Meeting Name" --delete-audio
+# Keep the WAV around after notes succeed (default behavior deletes it)
+meeting-notes start "Meeting Name" --keep-audio
 ```
 
 ### Flags
 
-- `--model <name>` — Claude model (default `claude-sonnet-4-6`, env override `MEETING_NOTES_MODEL`)
+- `--model <name>` — Claude model (default `claude-opus-4-7`, env override `MEETING_NOTES_MODEL`)
 - `--whisper-model <size>` — Whisper model size (default `medium`)
 - `--notes-only` — on `reprocess`, skip transcription
-- `--delete-audio` — **new**: delete `audio.wav` after a non-empty `notes.md` is successfully written
+- `--keep-audio` — **new**: skip the default auto-delete of `audio.wav` after a non-empty `notes.md` is successfully written
 
 ### Output Format
 
@@ -271,7 +281,7 @@ Same exclusions as the Mac PRD:
 
 ### Phase 2: Quality of Life
 
-- `--delete-audio` flag
+- Auto-delete of `audio.wav` on success (with `--keep-audio` opt-out)
 - Better error messages for missing audio devices
 - README section for Windows setup (ffmpeg install, default-device hint)
 
@@ -285,7 +295,7 @@ Same exclusions as the Mac PRD:
 
 ## Open Questions
 
-1. Should `--delete-audio` become the default once the workflow is proven? (Mac PRD raised this; still off by default for safety.)
+1. (Resolved in v1.1: audio auto-deletes by default once notes are written; `--keep-audio` opts out.)
 2. Should we ship a Whisper model preset based on detected hardware (CPU vs GPU) to avoid users picking the wrong size?
 3. Is there an appetite later for a `meeting-notes serve` daemon that exposes the hotkey without re-registering per call?
 

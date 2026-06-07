@@ -1,29 +1,12 @@
-import os
 import re
+import shutil
+import subprocess
 import sys
-from pathlib import Path
-
-import anthropic
 
 
-DEFAULT_MODEL = "claude-sonnet-4-6"
-ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
+DEFAULT_MODEL = "claude-opus-4-7"
+CLAUDE_TIMEOUT_SECONDS = 600
 
-
-def _load_env():
-    """Load variables from .env file if it exists."""
-    if not ENV_FILE.exists():
-        return
-    with open(ENV_FILE) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            key, _, value = line.partition("=")
-            key = key.strip()
-            value = value.strip()
-            if key and key not in os.environ:
-                os.environ[key] = value
 
 PROMPT_TEMPLATE = """You are a meeting notes assistant. Write notes in a compact, shorthand style — like someone jotting things down during the meeting. Dense and scannable, not polished prose.
 
@@ -69,7 +52,6 @@ def _clean_for_notion(text):
     lines = text.split("\n")
     result = []
 
-    # Detect indent unit from the first indented bullet
     indent_unit = 4
     for line in lines:
         m = re.match(r"^( +)- ", line)
@@ -78,22 +60,18 @@ def _clean_for_notion(text):
             break
 
     for i, line in enumerate(lines):
-        # Convert space-indented bullets to tab-indented
         m = re.match(r"^( +)(- )", line)
         if m:
             spaces = len(m.group(1))
             level = max(1, round(spaces / indent_unit))
             line = "\t" * level + m.group(2) + line[m.end():]
 
-        # Skip blank lines between consecutive bullet lines
         if line.strip() == "":
-            # Look ahead: if next non-empty line is a bullet, skip this blank line
             next_is_bullet = False
             for j in range(i + 1, len(lines)):
                 if lines[j].strip():
                     next_is_bullet = bool(re.match(r"^[\t ]*- ", lines[j]))
                     break
-            # Look back: was the previous non-empty line a bullet?
             prev_is_bullet = False
             for j in range(len(result) - 1, -1, -1):
                 if result[j].strip():
@@ -107,44 +85,64 @@ def _clean_for_notion(text):
     return "\n".join(result)
 
 
-def check_api_key():
-    """Load .env and verify the Anthropic API key is set."""
-    _load_env()
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key or api_key == "your-api-key-here":
-        print("Error: ANTHROPIC_API_KEY not configured.", file=sys.stderr)
-        print("Add your key to the .env file in the project root.", file=sys.stderr)
-        return False
-    return True
+def _resolve_claude_cli():
+    """Return the absolute path of the `claude` executable, or None.
+
+    Uses shutil.which so we get the .cmd/.exe shim on Windows and a plain
+    binary on macOS — and so subprocess can launch it without shell=True.
+    """
+    return shutil.which("claude")
 
 
 def generate_notes(transcript, meeting_name, date, model=None):
-    """Generate structured meeting notes from a transcript using Claude API.
+    """Generate structured meeting notes by invoking the Claude Code CLI.
 
-    Args:
-        transcript: The meeting transcript text.
-        meeting_name: Name of the meeting.
-        date: Date string (YYYY-MM-DD).
-        model: Claude model name (default: claude-sonnet-4-6).
+    Uses the user's Claude subscription (OAuth via Claude Code), not the
+    Anthropic API. Sends the prompt over stdin to avoid Windows command-line
+    length limits on long transcripts.
 
-    Returns:
-        str: Formatted markdown notes.
+    Returns the cleaned markdown notes, or None on any failure.
     """
-    if not check_api_key():
+    claude_path = _resolve_claude_cli()
+    if claude_path is None:
+        print("Error: Claude Code CLI ('claude') not found on PATH.", file=sys.stderr)
+        print(
+            "Install Claude Code from https://claude.com/code and run "
+            "'claude login' before using this tool.",
+            file=sys.stderr,
+        )
         return None
 
     model = model or DEFAULT_MODEL
     prompt = PROMPT_TEMPLATE.format(transcript=transcript)
 
-    print(f"Generating notes with {model}...")
+    print(f"Generating notes with {model} via Claude Code (subscription)...")
 
-    client = anthropic.Anthropic()
+    try:
+        result = subprocess.run(
+            [claude_path, "-p", "--model", model],
+            input=prompt,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=CLAUDE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        print(
+            f"Error: Claude Code did not respond within {CLAUDE_TIMEOUT_SECONDS}s.",
+            file=sys.stderr,
+        )
+        return None
 
-    message = client.messages.create(
-        model=model,
-        max_tokens=16384,
-        messages=[{"role": "user", "content": prompt}],
-    )
+    if result.returncode != 0:
+        print(f"Error: Claude Code exited with code {result.returncode}.", file=sys.stderr)
+        if result.stderr:
+            print(result.stderr.strip(), file=sys.stderr)
+        return None
 
-    notes_body = message.content[0].text
+    notes_body = (result.stdout or "").strip()
+    if not notes_body:
+        print("Error: Claude Code returned empty output.", file=sys.stderr)
+        return None
+
     return _clean_for_notion(notes_body)

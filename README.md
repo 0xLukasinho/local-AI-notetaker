@@ -1,10 +1,10 @@
 # Meeting Notes Generator
 
-A CLI tool that records meeting audio, transcribes it locally with Whisper, and generates structured notes using the Claude API. Audio and transcripts stay on your machine — only the transcript text is sent to the API for note generation.
+A CLI tool that records meeting audio, transcribes it locally with Whisper, and generates structured notes by invoking the Claude Code CLI (which uses your Claude subscription — no API key). Audio and transcripts stay on your machine; only the transcript text is sent to Claude for note generation.
 
 ```
-Meeting Audio → [Whisper STT] → Transcript → [Claude API] → Structured Notes
-                  (local)                      (remote)
+Meeting Audio → [Whisper STT] → Transcript → [claude -p] → Structured Notes
+                  (local)                     (subscription)
 ```
 
 ## Quick Start
@@ -28,7 +28,7 @@ When processing completes, notes are automatically copied to your clipboard — 
 ## Options
 
 ```bash
-# Use a different Claude model
+# Use a different Claude model (default: claude-opus-4-7)
 meeting-notes start "Sprint Planning" --model claude-sonnet-4-6
 
 # Use a smaller/faster Whisper model
@@ -41,7 +41,7 @@ meeting-notes start "Board Meeting" --whisper-model large
 Set `MEETING_NOTES_MODEL` to change the default Claude model:
 
 ```bash
-export MEETING_NOTES_MODEL="claude-sonnet-4-6"
+export MEETING_NOTES_MODEL="claude-opus-4-7"
 ```
 
 ## Output
@@ -63,7 +63,7 @@ Each meeting creates a folder in `~/meeting-notes/`:
 - **macOS** (uses AVFoundation) or **Windows 10/11** (uses WASAPI loopback)
 - **Python 3.9+**
 - **ffmpeg** (required by Whisper for audio decoding; also handles capture on macOS)
-- **Anthropic API key** (for note generation via Claude)
+- **Claude Code CLI** (`claude` on PATH, logged in via `claude login`) — used to generate notes against your Claude subscription
 
 ### Step 1: Install ffmpeg
 
@@ -98,15 +98,15 @@ cd local-AI-notetaker
 pip install -e ".[windows]"
 ```
 
-### Step 3: Set up your API key
+### Step 3: Set up Claude Code
 
-Copy the example env file and add your Anthropic API key:
+Install Claude Code from [claude.com/code](https://claude.com/code) and log in:
 
 ```bash
-cp .env.example .env
+claude login
 ```
 
-Edit `.env` and replace `your-api-key-here` with your key from [console.anthropic.com](https://console.anthropic.com).
+That's it — no API key needed. Note generation runs against whichever subscription that login is authenticated to, with no per-meeting cost.
 
 ### Step 4: Verify your PATH
 
@@ -144,17 +144,17 @@ Update `device_index` in `meeting_notes/recorder_mac.py` to change.
 ## Privacy
 
 - Audio recording and Whisper transcription run entirely on your machine
-- The transcript text is sent to the Anthropic API for note generation — this is the only network call
+- The transcript text is sent to Claude via the Claude Code CLI for note generation — this is the only network call
 - All files (audio, transcript, notes) are stored locally in `~/meeting-notes/`
-- Your API key is stored in `.env` which is git-ignored
+- No API key is stored; authentication is whatever your Claude Code login is
 
 ## Troubleshooting
 
 **"ffmpeg is not installed"**
 Install it with `brew install ffmpeg`.
 
-**"ANTHROPIC_API_KEY not configured"**
-Copy `.env.example` to `.env` and add your API key.
+**"Claude Code CLI ('claude') not found on PATH"**
+Install Claude Code from [claude.com/code](https://claude.com/code), then run `claude login`. Reopen your terminal so the PATH refresh takes effect.
 
 **"No audio was recorded"**
 On macOS, check that microphone permission is granted and run `ffmpeg -f avfoundation -list_devices true -i ""` to see available devices.

@@ -12,7 +12,7 @@ from meeting_notes.transcriber import transcribe
 from meeting_notes.summarizer import generate_notes
 
 OUTPUT_DIR = os.path.expanduser("~/meeting-notes")
-DEFAULT_MODEL = os.environ.get("MEETING_NOTES_MODEL", "claude-sonnet-4-6")
+DEFAULT_MODEL = os.environ.get("MEETING_NOTES_MODEL", "claude-opus-4-7")
 DEFAULT_WHISPER_MODEL = "medium"
 
 
@@ -105,9 +105,12 @@ def _release_hotkey():
         pass
 
 
-def _maybe_delete_audio(audio_path, notes_path, delete_audio):
-    """Delete the audio file only if notes were successfully written."""
-    if not delete_audio:
+def _maybe_delete_audio(audio_path, notes_path, keep_audio):
+    """Delete the audio file by default; skip if keep_audio is True.
+
+    Only deletes when notes.md exists and is non-empty.
+    """
+    if keep_audio:
         return
     if not os.path.exists(notes_path) or os.path.getsize(notes_path) == 0:
         return
@@ -178,7 +181,7 @@ def cmd_start(args):
     if copy_to_clipboard(notes):
         print("Notes copied to clipboard — paste into Notion with Ctrl+V.")
 
-    _maybe_delete_audio(audio_path, notes_path, args.delete_audio)
+    _maybe_delete_audio(audio_path, notes_path, args.keep_audio)
     print("Done!")
 
 
@@ -247,7 +250,7 @@ def cmd_reprocess(args):
     if copy_to_clipboard(notes):
         print("Notes copied to clipboard — paste into Notion with Ctrl+V.")
 
-    _maybe_delete_audio(audio_path, notes_path, args.delete_audio)
+    _maybe_delete_audio(audio_path, notes_path, args.keep_audio)
     print("Done!")
 
 
@@ -294,9 +297,9 @@ def main():
         choices=["tiny", "base", "small", "medium", "large"],
     )
     start_parser.add_argument(
-        "--delete-audio",
+        "--keep-audio",
         action="store_true",
-        help="Delete audio.wav after notes are successfully generated",
+        help="Keep audio.wav on disk (default: deleted after notes are generated)",
     )
     start_parser.set_defaults(func=cmd_start)
 
@@ -320,9 +323,9 @@ def main():
         help="Only regenerate notes from existing transcript (skip transcription)",
     )
     reprocess_parser.add_argument(
-        "--delete-audio",
+        "--keep-audio",
         action="store_true",
-        help="Delete audio.wav after notes are successfully generated",
+        help="Keep audio.wav on disk (default: deleted after notes are generated)",
     )
     reprocess_parser.set_defaults(func=cmd_reprocess)
 

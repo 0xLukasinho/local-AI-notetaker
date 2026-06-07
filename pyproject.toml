@@ -9,7 +9,6 @@ description = "Privacy-first local meeting notes generator"
 requires-python = ">=3.9"
 dependencies = [
     "openai-whisper",
-    "anthropic",
 ]
 
 [project.optional-dependencies]
