@@ -12,5 +12,12 @@ dependencies = [
     "anthropic",
 ]
 
+[project.optional-dependencies]
+windows = [
+    "soundcard",
+    "numpy",
+    "keyboard",
+]
+
 [project.scripts]
 meeting-notes = "meeting_notes.cli:main"
