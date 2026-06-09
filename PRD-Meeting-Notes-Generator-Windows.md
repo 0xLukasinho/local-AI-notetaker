@@ -1,8 +1,13 @@
 # Product Requirements Document: Meeting Notes Generator (Windows)
 
-**Version:** 1.1
-**Date:** 2026-06-07
+**Version:** 1.2
+**Date:** 2026-06-08
 **Status:** Implemented. Note generation uses Claude Code subscription (OAuth) rather than the Anthropic API.
+
+### Changelog
+
+- **v1.2 (2026-06-08):** Migrated the Windows audio backend from `soundcard` to `pyaudiowpatch`. `soundcard` 0.4.6 crashed the process with `STATUS_HEAP_CORRUPTION (0xC0000374)` inside WASAPI `IAudioClient::Initialize` the instant any recorder opened (on Realtek/Intel Smart Sound hardware), producing an empty output folder and no traceback. This is the "soundcard loopback fails on a given audio driver" risk materializing. See [Audio Recording (Windows)](#audio-recording-windows) for the replacement design.
+- **v1.1 (2026-06-07):** Switched note generation to the Claude Code subscription (OAuth); audio auto-deletes by default with `--keep-audio` opt-out.
 
 ---
 
@@ -18,7 +23,7 @@ This port reuses the existing codebase rather than forking. The summarizer (`sum
 
 | Component | Mac | Windows |
 |-----------|-----|---------|
-| Audio capture | ffmpeg + AVFoundation | `soundcard` (WASAPI loopback + mic), mixed in Python |
+| Audio capture | ffmpeg + AVFoundation | `pyaudiowpatch` (WASAPI loopback + mic), mixed in Python |
 | Transcription | openai-whisper (local) | openai-whisper (local) — unchanged |
 | Note generation | Claude Code CLI subprocess (`claude -p`) | Claude Code CLI subprocess (`claude -p`) |
 | Clipboard | `pbcopy` | `clip` |
@@ -99,31 +104,34 @@ Existing (shared with Mac):
 
 New (Windows-only, declared as an optional extra in `pyproject.toml`):
 
-- `soundcard` — native WASAPI loopback + mic capture, no driver install required
-- `numpy` — for in-memory audio mixing (sum, gain, clip to int16)
+- `pyaudiowpatch` — native WASAPI loopback + mic capture (PyAudio fork), no driver install required
+- `numpy` — for in-memory audio mixing (resample, sum, gain, clip to int16)
 - `keyboard` — global hotkey registration for stop signal
 
 External:
 
-- **ffmpeg** — required by Whisper. Install via `winget install ffmpeg` or `choco install ffmpeg`. Not used for recording on Windows (`soundcard` handles capture).
+- **ffmpeg** — required by Whisper. Install via `winget install ffmpeg` or `choco install ffmpeg`. Not used for recording on Windows (`pyaudiowpatch` handles capture).
 
 ---
 
 ### Audio Recording (Windows)
 
-**Library:** `soundcard` (PyPI)
+**Library:** `pyaudiowpatch` (PyPI) — a PyAudio fork that adds WASAPI loopback.
 
-**Why not ffmpeg here:** ffmpeg on Windows cannot capture system audio without a third-party virtual-device install (screen-capture-recorder, VB-Cable). `soundcard` does it natively via WASAPI loopback with zero user setup. ffmpeg stays in the dependency tree only because Whisper needs it to decode the WAV.
+**Why not ffmpeg here:** ffmpeg on Windows cannot capture system audio without a third-party virtual-device install (screen-capture-recorder, VB-Cable). `pyaudiowpatch` does it natively via WASAPI loopback with zero user setup. ffmpeg stays in the dependency tree only because Whisper needs it to decode the WAV.
+
+**Why not `soundcard`:** the original implementation used `soundcard`, but v0.4.6 corrupted the process heap inside WASAPI `IAudioClient::Initialize` on at least one common audio driver (Realtek/Intel Smart Sound), hard-crashing the process before any audio was written. `pyaudiowpatch` proved stable on the same hardware. See the v1.2 changelog entry.
 
 **Capture model:**
 
-- A background `threading.Thread` opens two recorders:
-  - `soundcard.default_speaker()` exposed as a loopback recorder (system audio — what other meeting participants are saying)
-  - `soundcard.default_microphone()` (user's voice)
-- Both are read in ~100ms blocks at 16kHz mono.
-- Each block is summed sample-for-sample with light gain on the mic: `mix = clip(speaker + 0.7 * mic, -32768, 32767)` to keep the meeting content dominant and avoid clipping.
+- Two dedicated capture threads, one per source — required because WASAPI here is unforgiving about threading (each PyAudio instance must be created and used on the same thread; concurrent `Pa_Initialize` calls or two streams on one thread crash or starve). Each thread owns its own PyAudio instance, initializes COM for itself (`CoInitializeEx`), and serializes construction under a shared lock:
+  - **Speaker (loopback):** the WASAPI loopback device matching the default speaker — system audio, i.e. what other meeting participants are saying. Read non-blocking via `get_read_available()`, because loopback only delivers samples while audio is actually playing.
+  - **Microphone:** the default input device (user's voice). Read blocking, so it streams continuously.
+- Each source is downmixed to mono and resampled from its native rate (e.g. 48kHz / 44.1kHz) to 16kHz with a small streaming linear resampler, then handed to a mixer thread.
+- **The microphone drives the timeline** (it is continuous); system audio is overlaid where present and padded with silence when the loopback is idle. The mix keeps meeting content dominant with light gain on the mic: `mix = clip(speaker + 0.7 * mic, -1.0, 1.0)` → PCM16.
 - The mix is appended to a streaming `wave` file (`audio.wav`, PCM16, 16kHz, mono) — same format the Mac version produces.
-- A `threading.Event` ("stop") is checked each iteration. When set, the loop exits, flushes, closes the file.
+- A `threading.Event` ("stop") is checked by every thread. When set, the loops exit, the mixer flushes any remainder, and the file is closed.
+- **Known characteristic:** ~0.7s of WASAPI stream-priming latency at startup means the very beginning of a recording is dropped (typically pre-meeting silence). After startup, capture is real-time accurate with no drift.
 
 **Stop signal:**
 
@@ -134,7 +142,7 @@ External:
 **Edge cases handled:**
 
 - No default speaker or microphone configured → exit before recording starts with a hint to configure defaults in Windows Sound settings.
-- Sample-rate mismatch between mic and speaker → resample mic to 16kHz inside the capture loop (`soundcard` returns float32; we convert and resample).
+- Sample-rate mismatch between mic and speaker → each source is independently resampled to 16kHz inside its capture thread, so the two native rates never need to match.
 - Disk full / WAV write fails mid-recording → catch, close the file, surface a clear error, do not auto-delete.
 
 ---
@@ -172,13 +180,13 @@ meeting_notes/
 ├── cli.py              # OS-detects clipboard + hotkey, otherwise unchanged
 ├── recorder.py         # Thin dispatcher: imports the right backend
 ├── recorder_mac.py     # Existing ffmpeg/AVFoundation code (renamed)
-├── recorder_windows.py # NEW: soundcard-based capture
+├── recorder_windows.py # pyaudiowpatch-based WASAPI loopback + mic capture
 ├── transcriber.py      # Unchanged
 ├── summarizer.py       # Unchanged
 └── summarizer_local.py # Unchanged (unused by default; kept for parity)
 ```
 
-`recorder.py` exposes the same `record_audio(output_path)` and `stop_recording(handle)` API both backends implement. On Windows, the "handle" is the capture thread + stop Event + WAV handle bundled into a small object; on Mac it remains the `subprocess.Popen` for ffmpeg.
+`recorder.py` exposes the same `record_audio(output_path)` and `stop_recording(handle)` API both backends implement. On Windows, the "handle" is the capture/mixer threads + stop Event + WAV handle bundled into a small object; on Mac it remains the `subprocess.Popen` for ffmpeg.
 
 ---
 
@@ -257,7 +265,8 @@ Same exclusions as the Mac PRD:
 
 | Risk | Impact | Mitigation |
 |------|--------|-----------|
-| `soundcard` loopback fails on a given audio driver | High | Surface a clear error; document fallback to VB-Cable for unusual setups |
+| ~~`soundcard` loopback fails on a given audio driver~~ **(materialized v1.2)** | High | **Resolved by migrating to `pyaudiowpatch`** after `soundcard` crashed the process with heap corruption on Realtek/Intel Smart Sound. Loopback errors now surface clearly; VB-Cable remains a documented fallback for unusual setups |
+| WASAPI threading instability (cross-thread streams, concurrent `Pa_Initialize`) crashes the process | High | One PyAudio instance per thread, per-thread `CoInitializeEx`, construction serialized under a lock — established empirically and documented in `recorder_windows.py` |
 | `keyboard` library blocked by AV / requires admin | Medium | Detect failure at startup, fall back to "press Enter to stop" with warning |
 | ffmpeg not on PATH | Medium | Upfront check with `winget install ffmpeg` hint |
 | Whisper transcription slow on CPU | Medium | Document `--whisper-model small` option; mention optional CUDA build of PyTorch |
@@ -272,7 +281,7 @@ Same exclusions as the Mac PRD:
 
 ### Phase 1: Core Functionality (MVP)
 
-- `recorder_windows.py` with `soundcard` loopback + mic capture, mixed to 16kHz mono WAV
+- `recorder_windows.py` with `pyaudiowpatch` WASAPI loopback + mic capture, mixed to 16kHz mono WAV
 - Global hotkey (Ctrl+Alt+Q) via `keyboard` library with Enter-to-stop fallback
 - `recorder.py` dispatcher; rename current recorder to `recorder_mac.py`
 - `cli.py` clipboard branch (`clip` vs `pbcopy`)
@@ -303,16 +312,21 @@ Same exclusions as the Mac PRD:
 
 ## Appendix: Why These Library Choices
 
-### Why `soundcard` for capture
+### Why `pyaudiowpatch` for capture
 
 - Native WASAPI loopback support out of the box, no driver install
-- Pure Python API, no subprocess plumbing
-- Maintained, MIT-licensed, widely used for exactly this use case
+- A maintained PyAudio fork; the loopback API is purpose-built for "record what's playing + the mic"
 - Lets us mix mic + system audio in-process with precise control over gain and format
+- Proved stable on hardware where `soundcard` corrupted the heap (see below)
+
+### Why not `soundcard` (the original choice)
+
+- `soundcard` 0.4.6 crashed the entire process with `STATUS_HEAP_CORRUPTION (0xC0000374)` inside WASAPI `IAudioClient::Initialize` the moment any recorder opened, on Realtek/Intel Smart Sound hardware. The crash was in the library's native code (no Python traceback) and left an empty output folder. No reliable workaround existed across `soundcard` versions, so the backend was replaced in v1.2.
+- Trade-off accepted: `pyaudiowpatch` requires more careful threading (one PyAudio instance per thread, serialized init, per-thread COM) and self-managed resampling, but it does not crash.
 
 ### Why not ffmpeg for capture on Windows
 
-- ffmpeg's `dshow` backend cannot tap system audio without a third-party virtual device (screen-capture-recorder, VB-Cable). Both work, both require user installs. `soundcard` removes that friction entirely.
+- ffmpeg's `dshow` backend cannot tap system audio without a third-party virtual device (screen-capture-recorder, VB-Cable). Both work, both require user installs. `pyaudiowpatch` removes that friction entirely.
 
 ### Why `keyboard` for the stop hotkey
 

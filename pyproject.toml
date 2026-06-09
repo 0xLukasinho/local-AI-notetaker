@@ -13,7 +13,7 @@ dependencies = [
 
 [project.optional-dependencies]
 windows = [
-    "soundcard",
+    "PyAudioWPatch",
     "numpy",
     "keyboard",
 ]

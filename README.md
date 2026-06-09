@@ -90,7 +90,7 @@ cd local-AI-notetaker
 pip3 install -e .
 ```
 
-Windows (the `[windows]` extra pulls in `soundcard`, `numpy`, and `keyboard` for capture + hotkey):
+Windows (the `[windows]` extra pulls in `pyaudiowpatch`, `numpy`, and `keyboard` for capture + hotkey):
 
 ```powershell
 git clone <repo-url>
