@@ -14,6 +14,7 @@ from meeting_notes.summarizer import generate_notes
 OUTPUT_DIR = os.path.expanduser("~/meeting-notes")
 DEFAULT_MODEL = os.environ.get("MEETING_NOTES_MODEL", "claude-opus-4-7")
 DEFAULT_WHISPER_MODEL = "medium"
+DEFAULT_LANGUAGE = "en"
 
 
 def _hotkey_label():
@@ -128,6 +129,7 @@ def cmd_start(args):
     meeting_name = args.name
     model = args.model or DEFAULT_MODEL
     whisper_model = args.whisper_model or DEFAULT_WHISPER_MODEL
+    language = args.language or DEFAULT_LANGUAGE
 
     meeting_dir, today = create_meeting_dir(meeting_name)
     audio_path = os.path.join(meeting_dir, "audio.wav")
@@ -160,7 +162,7 @@ def cmd_start(args):
 
     # --- Transcription ---
     print("\n--- Transcription ---")
-    transcript = transcribe(audio_path, model_size=whisper_model)
+    transcript = transcribe(audio_path, model_size=whisper_model, language=language)
 
     with open(transcript_path, "w", encoding="utf-8") as f:
         f.write(transcript)
@@ -190,6 +192,7 @@ def cmd_reprocess(args):
     meeting_folder = args.folder
     model = args.model or DEFAULT_MODEL
     whisper_model = args.whisper_model or DEFAULT_WHISPER_MODEL
+    language = args.language or DEFAULT_LANGUAGE
     notes_only = args.notes_only
 
     if os.path.isabs(meeting_folder):
@@ -230,7 +233,7 @@ def cmd_reprocess(args):
         print(f"Reprocessing: {meeting_name}")
 
         print("\n--- Transcription ---")
-        transcript = transcribe(audio_path, model_size=whisper_model)
+        transcript = transcribe(audio_path, model_size=whisper_model, language=language)
 
         with open(transcript_path, "w", encoding="utf-8") as f:
             f.write(transcript)
@@ -297,6 +300,10 @@ def main():
         choices=["tiny", "base", "small", "medium", "large"],
     )
     start_parser.add_argument(
+        "--language",
+        help=f"Language code to force, or 'auto' to detect (default: {DEFAULT_LANGUAGE})",
+    )
+    start_parser.add_argument(
         "--keep-audio",
         action="store_true",
         help="Keep audio.wav on disk (default: deleted after notes are generated)",
@@ -316,6 +323,10 @@ def main():
         "--whisper-model",
         help=f"Whisper model size (default: {DEFAULT_WHISPER_MODEL})",
         choices=["tiny", "base", "small", "medium", "large"],
+    )
+    reprocess_parser.add_argument(
+        "--language",
+        help=f"Language code to force, or 'auto' to detect (default: {DEFAULT_LANGUAGE})",
     )
     reprocess_parser.add_argument(
         "--notes-only",

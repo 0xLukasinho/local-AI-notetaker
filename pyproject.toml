@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Privacy-first local meeting notes generator"
 requires-python = ">=3.9"
 dependencies = [
-    "openai-whisper",
+    "faster-whisper",
 ]
 
 [project.optional-dependencies]
@@ -16,6 +16,12 @@ windows = [
     "PyAudioWPatch",
     "numpy",
     "keyboard",
+]
+# NVIDIA CUDA runtime libs for GPU transcription. Optional: the transcriber
+# auto-detects a usable GPU and falls back to CPU (int8) when these are absent.
+cuda = [
+    "nvidia-cublas-cu12",
+    "nvidia-cudnn-cu12",
 ]
 
 [project.scripts]
