@@ -23,6 +23,15 @@ cuda = [
     "nvidia-cublas-cu12",
     "nvidia-cudnn-cu12",
 ]
+app = [
+    "PySide6",
+]
+dev = [
+    "pytest",
+]
 
 [project.scripts]
 meeting-notes = "meeting_notes.cli:main"
+
+[project.gui-scripts]
+meeting-notes-app = "meeting_notes.app:main"
