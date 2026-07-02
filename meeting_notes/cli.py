@@ -259,26 +259,17 @@ def cmd_reprocess(args):
 
 def cmd_list(_args):
     """List past meetings."""
-    if not os.path.isdir(OUTPUT_DIR):
-        print("No meetings found.")
-        return
+    from meeting_notes.library import list_meetings
 
-    entries = sorted(os.listdir(OUTPUT_DIR), reverse=True)
-    dirs = [e for e in entries if os.path.isdir(os.path.join(OUTPUT_DIR, e))]
-
-    if not dirs:
+    meetings = list_meetings(OUTPUT_DIR)
+    if not meetings:
         print("No meetings found.")
         return
 
     print("Past meetings:\n")
-    for d in dirs:
-        parts = d.split("_", 1)
-        date_str = parts[0] if len(parts) > 0 else "unknown"
-        name = parts[1].replace("-", " ").title() if len(parts) > 1 else d
-        meeting_dir = os.path.join(OUTPUT_DIR, d)
-        has_notes = os.path.exists(os.path.join(meeting_dir, "notes.md"))
-        status = "notes ready" if has_notes else "no notes"
-        print(f"  {date_str}  {name}  ({status})")
+    for m in meetings:
+        status = "notes ready" if m.has_notes else "no notes"
+        print(f"  {m.date}  {m.title}  ({status})")
 
 
 def main():
