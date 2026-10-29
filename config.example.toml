@@ -1,0 +1,41 @@
+# Copy this file to ~/.meeting-notes/config.toml and edit it there.
+# Do not commit the copy. Webhook credentials can also be set with
+# MEETING_NOTES_WEBHOOK_URL, MEETING_NOTES_WEBHOOK_AUTH_HEADER, and
+# MEETING_NOTES_WEBHOOK_AUTH_VALUE (those override this file).
+
+# Where a finished watcher session is POSTed. Empty disables delivery.
+webhook_url = "https://example.invalid/meeting-notes"
+
+# Sent only when both the name and the value are non-empty.
+webhook_auth_header = "Authorization"
+webhook_auth_value = "replace-me"
+
+# How long a Meet window AND an in-use Chrome microphone must hold
+# before a recording starts, and how long both must be gone before it stops.
+join_debounce_seconds = 12
+leave_debounce_seconds = 25
+poll_interval_seconds = 2
+outbox_retry_seconds = 60
+
+# transcript_only applies to manual `start` and `reprocess`.
+# Leave it false so `meeting-notes start "Name"` still writes Claude notes.
+transcript_only = false
+
+# Watcher-started sessions. Independent of the manual default above.
+watcher_transcript_only = true
+
+# Delete audio.wav after a successful webhook delivery. Manual sessions
+# still delete audio after notes.md is written, unless --keep-audio is set.
+delete_audio_after_delivery = false
+
+# Optional. Empty uses the built-in "Meet - <code or title>" Chrome title.
+# A pattern with a capture group uses that group as the display name.
+window_title_regex = ""
+
+# Substring matched against microphone consent-store subkeys. Chrome is unpackaged,
+# so the default looks for chrome.exe under ConsentStore\microphone\NonPackaged.
+mic_process_marker = "chrome.exe"
+
+# Whisper settings for sessions started by the watcher.
+whisper_model = "medium"
+language = "en"

@@ -4,3 +4,9 @@ __pycache__/
 dist/
 build/
 *.pyc
+
+# Local meeting-notes config. Webhook secrets belong in ~/.meeting-notes/config.toml
+# (or config.json), never in the repo. config.example.toml is the template.
+config.toml
+config.json
+.meeting-notes/
