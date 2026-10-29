@@ -2,8 +2,9 @@
 
 The loop is platform-neutral: detectors, the session launcher, and delivery
 are injected. On Windows, `serve` wires the real Chrome/mic probes and a
-hidden recorder subprocess. A human session that is already recording blocks
-a second start for the rest of that call.
+hidden recorder subprocess. The mic probe ORs the consent-store registry with
+WASAPI capture sessions. A human session that is already recording blocks a
+second start for the rest of that call.
 """
 
 import logging
@@ -242,7 +243,11 @@ class MeetWatcher:
         ):
             self._retry_outbox()
             self._last_outbox = now
-        sighting = self.detector.poll()
+        # arming: after the first coincident sample, either signal may finish
+        # the join hold (the Meet tab does not have to stay focused).
+        # active/dropping: a mute or a background tab must not look like a hangup.
+        in_call = self.debouncer.phase in ("arming", "active", "dropping")
+        sighting = self.detector.poll(in_call=in_call)
         self._log_signal(sighting)
         events = self.debouncer.update(sighting, now)
         for event in events:
@@ -264,9 +269,9 @@ class MeetWatcher:
         if key == self._last_seen_key:
             return
         if key:
-            self.log.info("Saw Meet window: %s", sighting.window_title)
+            self.log.info("Call signal present: %s", sighting.window_title)
         elif self._last_seen_key:
-            self.log.info("Meet window or microphone signal lost")
+            self.log.info("Call signal lost")
         self._last_seen_key = key
 
     def _on_join(self):
@@ -421,20 +426,21 @@ def configure_watch_logging(control_dir):
     return logger, path
 
 
-def build_windows_detector(config):
-    from meeting_notes.meet_detect import ChromeMeetDetector, mic_in_use_from_entries
-    from meeting_notes.meet_detect_windows import list_top_level_windows, read_microphone_entries
+def build_windows_detector(config, log=None):
+    from meeting_notes.meet_detect import ChromeMeetDetector
+    from meeting_notes.meet_detect_windows import list_top_level_windows, probe_microphone
 
     marker = config.mic_process_marker or "chrome.exe"
 
     def mic():
-        return mic_in_use_from_entries(read_microphone_entries(), marker)
+        return probe_microphone(marker)
 
     return ChromeMeetDetector(
         windows=list_top_level_windows,
         mic_in_use=mic,
         title_regex=config.window_title_regex or None,
         process_marker=marker,
+        log=log,
     )
 
 
@@ -445,7 +451,7 @@ def serve(config, control_dir, output_dir, sleep=None, monotonic=None):
     if sys.platform != "win32":
         raise RuntimeError(
             "meeting-notes watch requires Windows "
-            "(Chrome window enumeration and the microphone consent registry)."
+            "(Chrome window enumeration and the microphone probes)."
         )
     logger, _path = configure_watch_logging(control_dir)
     write_watcher_pid(control_dir)
@@ -488,7 +494,7 @@ def serve(config, control_dir, output_dir, sleep=None, monotonic=None):
 
     watcher = MeetWatcher(
         config=config,
-        detector=build_windows_detector(config),
+        detector=build_windows_detector(config, log=logger),
         launcher=SubprocessLauncher(control_dir),
         deliver_fn=_deliver,
         lock_store=FileLockStore(control_dir),

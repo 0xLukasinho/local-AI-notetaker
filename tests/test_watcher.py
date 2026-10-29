@@ -2,12 +2,13 @@ import sys
 from datetime import datetime, timezone
 
 from meeting_notes.config import Config
-from meeting_notes.meet_detect import Sighting
+from meeting_notes.meet_detect import ChromeMeetDetector, Sighting, WindowInfo
 from meeting_notes.watcher import (
     MeetWatcher,
     RunningSession,
     SessionSpec,
     build_start_argv,
+    build_windows_detector,
     hidden_popen_kwargs,
 )
 
@@ -58,7 +59,7 @@ class ScriptDetector:
         self.clock = clock
         self.present_until = present_until
 
-    def poll(self):
+    def poll(self, in_call=False):
         if self.clock.t < self.present_until:
             return SIGHT
         return None
@@ -204,6 +205,149 @@ def test_build_start_argv_is_hidden_and_transcript_only():
         assert flags["creationflags"] & 0x08000000
     else:
         assert flags == {}
+
+
+MEET_TITLE = "Meet - abc-defg-hij - Google Chrome"
+
+
+class _SignalDetector:
+    """ChromeMeetDetector whose mic/window flip after the joining poll."""
+
+    def __init__(self, after_join):
+        self.n = 0
+        self.mic = True
+        self.windows = [WindowInfo(MEET_TITLE, "chrome.exe")]
+        self.after_join = after_join
+        self.calls = []
+        self.detector = ChromeMeetDetector(
+            windows=lambda: self.windows,
+            mic_in_use=lambda: self.mic,
+        )
+
+    def poll(self, in_call=False):
+        # The first sample only arms the debouncer; the second confirms the
+        # join. Flip the signals after that so the in-call hold is what we test.
+        if self.n >= 2:
+            self.after_join(self)
+        self.n += 1
+        self.calls.append(in_call)
+        return self.detector.poll(in_call=in_call)
+
+
+def _run_signal_watcher(tmp_path, after_join, leave_after):
+    clock = Clock()
+    detector = _SignalDetector(after_join)
+    launcher = FakeLauncher()
+    delivered = []
+    config = _config()
+    config.leave_debounce_seconds = leave_after
+    watcher = MeetWatcher(
+        config=config,
+        detector=detector,
+        launcher=launcher,
+        deliver_fn=lambda folder: delivered.append(folder) or True,
+        lock_store=Lock(),
+        outbox_retry=lambda: 0,
+        sleep=clock.sleep,
+        monotonic=clock.monotonic,
+        wall_iso=lambda: "2026-10-29T15:04:00+00:00",
+        wall_datetime=lambda: datetime(2026, 10, 29, 15, 4, tzinfo=timezone.utc),
+        output_dir=str(tmp_path),
+        log=ListLog(),
+    )
+    watcher.run(max_ticks=4)
+    return detector, launcher, delivered
+
+
+def test_mute_does_not_end_the_call_while_the_meet_window_is_open(tmp_path):
+    def mute(detector):
+        detector.mic = False
+
+    detector, launcher, delivered = _run_signal_watcher(tmp_path, mute, leave_after=100)
+    assert detector.calls[0] is False
+    assert True in detector.calls[1:]
+    assert len(launcher.started) == 1
+    assert launcher.stopped == []
+    assert delivered == []
+
+
+def test_background_tab_does_not_end_the_call_while_the_mic_is_held(tmp_path):
+    def switch_tab(detector):
+        detector.windows = [WindowInfo("Slack - Google Chrome", "chrome.exe")]
+
+    _detector, launcher, delivered = _run_signal_watcher(tmp_path, switch_tab, leave_after=100)
+    assert len(launcher.started) == 1
+    assert launcher.stopped == []
+    assert delivered == []
+
+
+def test_call_ends_when_the_meet_window_and_the_mic_are_both_gone(tmp_path):
+    def drop_both(detector):
+        detector.mic = False
+        detector.windows = []
+
+    _detector, launcher, delivered = _run_signal_watcher(tmp_path, drop_both, leave_after=0)
+    assert len(launcher.started) == 1
+    assert launcher.stopped == [launcher.started[0].folder]
+    assert delivered == [launcher.started[0].folder]
+
+
+def test_build_windows_detector_accepts_wasapi_when_the_registry_is_stale(monkeypatch):
+    import meeting_notes.meet_detect_windows as windows
+
+    monkeypatch.setattr(
+        windows,
+        "read_microphone_entries",
+        lambda: [(r"C:#Program Files#Google#Chrome#Application#chrome.exe", 133)],
+    )
+    monkeypatch.setattr(
+        windows,
+        "read_wasapi_capture_sessions",
+        lambda: [("chrome.exe", 1)],
+    )
+    monkeypatch.setattr(
+        windows,
+        "list_top_level_windows",
+        lambda: [WindowInfo(MEET_TITLE, "chrome.exe")],
+    )
+    log = ListLog()
+    detector = build_windows_detector(Config(), log=log)
+    sighting = detector.poll()
+    assert sighting is not None
+    assert sighting.meet_code == "abc-defg-hij"
+    text = " ".join(message for _level, message in log.messages)
+    assert "registry=no" in text
+    assert "wasapi=yes" in text
+    assert "Meet window detected" in text
+
+
+def test_build_windows_detector_keeps_the_registry_when_pycaw_is_missing(monkeypatch):
+    import meeting_notes.meet_detect_windows as windows
+
+    monkeypatch.setattr(
+        windows,
+        "read_microphone_entries",
+        lambda: [(r"C:#Program Files#Google#Chrome#Application#chrome.exe", 0)],
+    )
+
+    def missing():
+        raise ImportError("pycaw is not installed; pip install pycaw")
+
+    monkeypatch.setattr(windows, "read_wasapi_capture_sessions", missing)
+    monkeypatch.setattr(
+        windows,
+        "list_top_level_windows",
+        lambda: [WindowInfo(MEET_TITLE, "chrome.exe")],
+    )
+    log = ListLog()
+    detector = build_windows_detector(Config(), log=log)
+    sighting = detector.poll()
+    assert sighting is not None
+    assert sighting.meet_code == "abc-defg-hij"
+    assert any(
+        level == "warning" and "pip install pycaw" in message for level, message in log.messages
+    )
+    assert any("registry=yes" in message and "wasapi=unavailable" in message for _level, message in log.messages)
 
 
 def test_outbox_is_retried_when_the_watcher_starts(tmp_path):

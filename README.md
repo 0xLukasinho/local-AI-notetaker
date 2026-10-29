@@ -90,7 +90,7 @@ cd local-AI-notetaker
 pip3 install -e .
 ```
 
-Windows (the `[windows]` extra pulls in `pyaudiowpatch`, `numpy`, and `keyboard` for capture + hotkey):
+Windows (the `[windows]` extra pulls in `pyaudiowpatch`, `numpy`, `keyboard`, `pycaw`, and `psutil` for capture, hotkey, and Meet microphone detection):
 
 ```powershell
 git clone <repo-url>
@@ -177,12 +177,22 @@ meeting-notes stop
 meeting-notes watch
 ```
 
-On Windows this loops until Ctrl+C. A call counts only when both are true:
+On Windows this loops until Ctrl+C. A call **starts** only when both are true:
 
-1. A top-level Chrome window is titled like `Meet - <code or title>` (the ` - Google Chrome` suffix is ignored).
-2. `chrome.exe` is using the microphone, read from `HKCU\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone\NonPackaged`. `LastUsedTimeStop == 0` means the mic is in use.
+1. A top-level Chrome window is titled like `Meet - <code or title>` (the ` - Google Chrome` suffix is ignored). Chrome puts only the **active tab** in the window title, so a Meet in a background tab is invisible until that tab is focused.
+2. `chrome.exe` is using the microphone. Two probes are OR-ed, and either one is enough:
+   - **WASAPI** capture sessions on active input devices (`pycaw` + `psutil`). A session counts when its state is Active and the process name contains `mic_process_marker`.
+   - The legacy consent store `HKCU\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone\NonPackaged`, where `LastUsedTimeStop == 0` means the mic is in use. Windows 11 26H2 (and some earlier builds) stop updating this key, so it is not sufficient on its own. It is still checked so older Windows keeps working.
 
-The Meet lobby or landing page has no microphone in use, so it is ignored. Both signals must hold for `join_debounce_seconds` (default 12) before a transcript-only session starts, named from the Meet code when there is one, otherwise the window title. They must stay gone for `leave_debounce_seconds` (default 25) before the watcher stops the session, waits for transcription, and delivers it. A reload, a mic toggle, or a short tab switch inside those windows does not split the call.
+If `pycaw` is not installed, the watcher logs that once and uses the registry probe only. It is part of the `[windows]` extra. On an existing install, add it with `pip install pycaw` (`pycaw` 20260926 and newer need Python 3.10+; Python 3.9 should install `pycaw>=20251023,<20260926`).
+
+The Meet lobby title does not match `Meet - <code or title>`, so a preview microphone on the pre-join screen does not start a recording. The Meet tab has to be focused while the microphone is in use at least once. After that coincident sample, either signal keeps the join timer running, so muting or switching to another Chrome tab during `join_debounce_seconds` (default 12) does not cancel it. The session is named from the Meet code when there is one, otherwise the window title.
+
+**After the call has started**, mute and tab switches are handled separately. Muting in Meet can release the capture session, and a muted stretch is often longer than the leave debounce, so the watcher keeps the session while that Meet window is still open. Switching to another Chrome tab hides the Meet title; the session stays while the microphone capture session is still active. The session stops only after **both** have been gone for `leave_debounce_seconds` (default 25).
+
+That choice has a limit. A Meet tab left open on the post-call page looks the same as a mute (the title is still a Meet title, the mic is already released), so recording continues until you switch away from that tab or close it. A mute that releases the mic **and** a Meet tab that is not the active tab for longer than the leave debounce also looks like leaving, and the session ends. Those two cases cannot be told apart without reading Chrome's background tabs.
+
+The log (`~/.meeting-notes/watch.log`) records an INFO line whenever the microphone signal or the Meet-window signal changes, including which microphone probe said yes (`registry=yes/no/unavailable`, `wasapi=yes/no/unavailable`). A probe that cannot run is logged once with the reason.
 
 If a session is already recording, the watcher does not start a second one and logs that. A manual `meeting-notes start` while the watcher is recording prints a warning and does not start either. Stop the current session with `meeting-notes stop` first.
 
@@ -223,7 +233,7 @@ Copy `config.example.toml` to `~/.meeting-notes/config.toml`, or use `config.jso
 | `watcher_transcript_only` | `true` | Watcher sessions skip Claude notes. |
 | `delete_audio_after_delivery` | `false` | Remove `audio.wav` after a successful POST. |
 | `window_title_regex` | empty | Replaces the built-in `Meet - ...` pattern. |
-| `mic_process_marker` | `chrome.exe` | Substring required in the mic consent subkey. |
+| `mic_process_marker` | `chrome.exe` | Substring matched against the process using the microphone (registry subkey and WASAPI capture session). |
 | `whisper_model` | `medium` | Whisper size for watcher sessions. |
 | `language` | `en` | Language forced for watcher sessions. |
 
@@ -258,6 +268,9 @@ Install Claude Code from [claude.com/code](https://claude.com/code), then run `c
 **"No audio was recorded"**
 On macOS, check that microphone permission is granted and run `ffmpeg -f avfoundation -list_devices true -i ""` to see available devices.
 On Windows, check that you have a default speaker and microphone set in *Settings → System → Sound*.
+
+**Watcher never notices a Google Meet**
+Open `~/.meeting-notes/watch.log`. `Microphone not in use (registry=no, wasapi=unavailable)` means the WASAPI probe is off (usually `pycaw` is not installed: `pip install pycaw`) and the consent-store registry also did not show Chrome. `Meet window not detected` while you are in the call means the Meet tab is not the active Chrome tab; focus it for the join hold (`join_debounce_seconds`, default 12). After the session has started, a mute or a background tab does not by itself end it.
 
 **"global hotkey unavailable" on Windows**
 The `keyboard` library couldn't install its low-level hook (often due to AV software). The tool falls back to Ctrl+C in the terminal. To use the hotkey, try running the terminal as administrator.

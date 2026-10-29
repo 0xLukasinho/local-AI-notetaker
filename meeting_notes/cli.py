@@ -646,7 +646,7 @@ def cmd_watch(args):
     if sys.platform != "win32":
         print(
             "meeting-notes watch requires Windows "
-            "(Chrome window enumeration and the microphone consent registry).",
+            "(Chrome window enumeration and the microphone probes).",
             file=sys.stderr,
         )
         sys.exit(1)
