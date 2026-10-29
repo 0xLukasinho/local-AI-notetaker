@@ -10,8 +10,10 @@ webhook_url = "https://example.invalid/meeting-notes"
 webhook_auth_header = "Authorization"
 webhook_auth_value = "replace-me"
 
-# How long a Meet window AND an in-use Chrome microphone must hold
-# before a recording starts, and how long both must be gone before it stops.
+# How long the call signal must hold before a recording starts, and how long
+# it must be gone before it stops. The Meet tab and the microphone have to
+# be seen together once; after that, either one keeps the join and the
+# recording alive. See the README.
 join_debounce_seconds = 12
 leave_debounce_seconds = 25
 poll_interval_seconds = 2
@@ -32,8 +34,9 @@ delete_audio_after_delivery = false
 # A pattern with a capture group uses that group as the display name.
 window_title_regex = ""
 
-# Substring matched against microphone consent-store subkeys. Chrome is unpackaged,
-# so the default looks for chrome.exe under ConsentStore\microphone\NonPackaged.
+# Substring matched against the process using the microphone: the consent-store
+# subkey and, when pycaw is installed, the WASAPI capture-session process name.
+# Chrome is unpackaged, so the default looks for chrome.exe.
 mic_process_marker = "chrome.exe"
 
 # Whisper settings for sessions started by the watcher.

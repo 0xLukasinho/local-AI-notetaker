@@ -1,13 +1,16 @@
 """Google Meet detection primitives that do not touch Windows APIs.
 
-A call is "present" only when the caller has already combined both signals:
-a top-level Chrome window titled like ``Meet - <code or title>`` AND the
-microphone consent record showing Chrome is using the mic. The lobby page
-fails the mic check and must be passed in as no sighting.
+A call *starts* only when both signals agree: a top-level Chrome window
+titled like ``Meet - <code or title>`` AND the microphone in use by the
+browser process. The lobby page does not match that title.
 
-CallDebouncer turns that instantaneous signal into join/leave events with
-separate hold times so a reload, a mic toggle, or a brief tab switch does
-not split one call into two sessions.
+Once the call is active, either signal keeps it. Muting in Meet can release
+the capture session for longer than the leave debounce, and Chrome's window
+title is only the active tab, so requiring both signals for the whole call
+ends real meetings. See ``ChromeMeetDetector.poll``.
+
+CallDebouncer turns that signal into join/leave events with separate hold
+times so a reload or a brief blip does not split one call into two sessions.
 """
 
 import re
@@ -119,40 +122,275 @@ def mic_in_use_from_entries(entries, marker="chrome.exe"):
     return False
 
 
-class ChromeMeetDetector:
-    """Combine a window list and a mic probe. Both have to agree.
+# IAudioSessionControl::GetState. Inactive (0) and Expired (2) are not
+# "in use". A mute often stops the capture client; the in-call window hold
+# covers that. Treating Inactive as live would also keep a stale session
+# after the call has actually released the microphone.
+AUDIO_SESSION_STATE_ACTIVE = 1
 
-    `windows` returns WindowInfo items. `mic_in_use` returns bool. Either
-    callable may be a fake in tests. Exceptions are treated as "not in a call"
-    so a flaky probe cannot start a recording.
+_UNSEEN = object()
+
+
+@dataclass(frozen=True)
+class MicStatus:
+    """Result of the registry probe OR-ed with the WASAPI probe.
+
+    `registry` and `wasapi` are ``yes``, ``no``, or ``unavailable``.
+    Empty strings mean the caller used the legacy bool mic probe.
+    `sources` lists the probes that said yes, in stable order.
+    `notice` is a one-shot operator message (missing dependency, probe error).
     """
 
-    def __init__(self, windows, mic_in_use, title_regex=None, process_marker="chrome.exe"):
+    in_use: bool
+    sources: tuple = ()
+    registry: str = ""
+    wasapi: str = ""
+    notice: str = ""
+
+
+def make_mic_status(registry, wasapi, notice=""):
+    """Build a MicStatus from the two probe outcomes."""
+    sources = []
+    if registry == "yes":
+        sources.append("registry")
+    if wasapi == "yes":
+        sources.append("wasapi")
+    return MicStatus(
+        in_use=bool(sources),
+        sources=tuple(sources),
+        registry=registry,
+        wasapi=wasapi,
+        notice=notice,
+    )
+
+
+def mic_in_use_from_capture_sessions(sessions, marker="chrome.exe"):
+    """True when an active WASAPI capture session belongs to `marker`.
+
+    `sessions` is a sequence of ``(process_name, state)``. State ``1`` is
+    ``AudioSessionStateActive``.
+    """
+    needle = (marker or "").lower()
+    if not needle:
+        return False
+    for item in sessions or []:
+        name, state = item[0], item[1]
+        if needle not in str(name).lower():
+            continue
+        try:
+            if int(state) == AUDIO_SESSION_STATE_ACTIVE:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def combine_mic_signals(
+    marker,
+    registry_entries,
+    capture_sessions,
+    registry_available=True,
+    wasapi_available=True,
+    notice="",
+):
+    """OR the consent-store and WASAPI results.
+
+    A probe that did not run (`*_available` false) is ``unavailable`` and
+    does not count as in use. An available probe with no matching entry is
+    ``no``. Either ``yes`` is enough.
+    """
+    if not registry_available:
+        registry = "unavailable"
+    elif mic_in_use_from_entries(registry_entries or [], marker):
+        registry = "yes"
+    else:
+        registry = "no"
+    if not wasapi_available:
+        wasapi = "unavailable"
+    elif mic_in_use_from_capture_sessions(capture_sessions or [], marker):
+        wasapi = "yes"
+    else:
+        wasapi = "no"
+    return make_mic_status(registry, wasapi, notice=notice)
+
+
+def _coerce_mic(value):
+    """Accept a MicStatus or the legacy bool from tests and older callers."""
+    if isinstance(value, MicStatus):
+        return value
+    if (
+        isinstance(value, tuple)
+        and len(value) == 2
+        and isinstance(value[0], bool)
+        and not isinstance(value[1], str)
+    ):
+        in_use, sources = value
+        return MicStatus(bool(in_use), tuple(sources))
+    in_use = bool(value)
+    return MicStatus(in_use, ("probe",) if in_use else ())
+
+
+class ChromeMeetDetector:
+    """Combine a window list and a mic probe.
+
+    Joining requires both: a Meet-titled window of `process_marker` and the
+    microphone in use. `mic_in_use` may return a bool or a MicStatus. Either
+    callable may be a fake in tests. A probe that raises counts as "not
+    detected" so a flaky read cannot start a recording.
+
+    `poll(in_call=True)` is used while a join is arming and for the rest of
+    the call. The first sample still requires the Meet window and the mic
+    together. After that, mute can drop the capture session for longer than
+    the leave debounce, so the Meet window alone keeps the call. Chrome only
+    puts the active tab in the window title, so the microphone alone keeps
+    the same call when the Meet tab is in the background. The call ends when
+    both have been absent long enough for the leave debounce. A Meet tab left
+    open on the post-call page is indistinguishable from a mute; switch away
+    from it (or close it) after leaving so the watcher can stop. When
+    `in_call` is false a stale latch is ignored, so a later Chrome mic use
+    does not resurrect the meeting.
+    """
+
+    def __init__(
+        self,
+        windows,
+        mic_in_use,
+        title_regex=None,
+        process_marker="chrome.exe",
+        log=None,
+    ):
         self.windows = windows
         self.mic_in_use = mic_in_use
         self.title_regex = title_regex or None
         self.process_marker = process_marker or "chrome.exe"
+        self.log = log
+        self._latched = None
+        self._last_mic = _UNSEEN
+        self._last_window = _UNSEEN
+        self._last_notice = ""
+        self._last_window_error = ""
+        self._hold_reason = None
 
-    def poll(self):
+    def poll(self, in_call=False):
+        mic = self._read_mic()
+        window, window_error = self._read_window()
+        self._log_mic(mic)
+        self._log_window(window, window_error)
+        sighting = self._decide(mic, window, bool(in_call))
+        self._log_hold(mic, window, sighting)
+        return sighting
+
+    def _read_mic(self):
         try:
-            mic = bool(self.mic_in_use())
-        except Exception:
-            return None
-        if not mic:
-            return None
+            return _coerce_mic(self.mic_in_use())
+        except Exception as exc:
+            return MicStatus(
+                False,
+                (),
+                notice="Microphone probe failed (%s)" % exc,
+            )
+
+    def _read_window(self):
         try:
             windows = self.windows() or []
-        except Exception:
-            return None
+        except Exception as exc:
+            return None, exc
         marker = self.process_marker.lower()
         for window in windows:
             process_name = (getattr(window, "process_name", "") or "").lower()
             if marker not in process_name:
                 continue
-            parsed = parse_meet_window_title(getattr(window, "title", ""), self.title_regex)
+            parsed = parse_meet_window_title(
+                getattr(window, "title", ""),
+                self.title_regex,
+            )
             if parsed is not None:
-                return parsed
+                return parsed, None
+        return None, None
+
+    def _decide(self, mic, window, in_call):
+        if window is not None and mic.in_use:
+            self._latched = window
+            return window
+        if not in_call or self._latched is None:
+            return None
+        if window is not None and window.key == self._latched.key:
+            self._latched = window
+            return window
+        if mic.in_use:
+            return self._latched
         return None
+
+    def _log_mic(self, mic):
+        current = (mic.in_use, mic.registry, mic.wasapi, mic.sources)
+        if current != self._last_mic:
+            self._last_mic = current
+            self._info(_format_mic(mic))
+        if mic.notice != self._last_notice:
+            self._last_notice = mic.notice
+            if mic.notice:
+                self._warn(mic.notice)
+
+    def _log_window(self, window, window_error):
+        error = "" if window_error is None else "Meet window probe failed (%s)" % window_error
+        if error != self._last_window_error:
+            self._last_window_error = error
+            if error:
+                self._warn(error)
+        current = None if window is None else (window.key, window.window_title)
+        if current == self._last_window:
+            return
+        self._last_window = current
+        if window is None:
+            self._info("Meet window not detected")
+        else:
+            self._info("Meet window detected: %s", window.window_title)
+
+    def _log_hold(self, mic, window, sighting):
+        reason = None
+        if sighting is not None and not (window is not None and mic.in_use):
+            if window is not None and not mic.in_use:
+                reason = "window"
+            elif mic.in_use and window is None:
+                reason = "mic"
+        if reason == self._hold_reason:
+            return
+        self._hold_reason = reason
+        if reason == "window":
+            self._info(
+                "Holding the call because the Meet window is still open; "
+                "the microphone is not in use."
+            )
+        elif reason == "mic":
+            self._info(
+                "Holding the call because the microphone is still in use; "
+                "the Meet tab is not the active Chrome window."
+            )
+
+    def _info(self, msg, *args):
+        if self.log is not None:
+            self.log.info(msg, *args)
+
+    def _warn(self, msg, *args):
+        if self.log is not None:
+            self.log.warning(msg, *args)
+
+
+def _format_mic(status):
+    if status.registry or status.wasapi:
+        detail = "registry=%s, wasapi=%s" % (
+            status.registry or "no",
+            status.wasapi or "no",
+        )
+        if status.in_use:
+            return "Microphone in use (%s)" % detail
+        return "Microphone not in use (%s)" % detail
+    if status.in_use:
+        extra = ", ".join(status.sources)
+        if extra:
+            return "Microphone in use (%s)" % extra
+        return "Microphone in use"
+    return "Microphone not in use"
 
 
 class CallDebouncer:

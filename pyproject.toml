@@ -16,6 +16,13 @@ windows = [
     "PyAudioWPatch",
     "numpy",
     "keyboard",
+    # Meet mic detection. pycaw reads active WASAPI capture sessions.
+    # Releases from 20260926 require Python 3.10; 3.9 stays on the previous line.
+    # psutil resolves the session's process name. Both are optional at runtime:
+    # if they are missing, the watcher uses the consent-store registry only.
+    "psutil",
+    "pycaw>=20251023,<20260926; python_version < '3.10'",
+    "pycaw>=20251023; python_version >= '3.10'",
 ]
 # NVIDIA CUDA runtime libs for GPU transcription. Optional: the transcriber
 # auto-detects a usable GPU and falls back to CPU (int8) when these are absent.
