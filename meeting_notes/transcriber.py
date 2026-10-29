@@ -18,8 +18,6 @@ import glob
 import os
 import sys
 
-from faster_whisper import WhisperModel
-
 _CUDA_DLLS_ADDED = False
 
 
@@ -79,6 +77,10 @@ def _format_segments(segments, total_duration):
 
 
 def _run(audio_path, model_size, language, device, compute_type):
+    # Imported here so CLI commands that never transcribe (list, tests) do not
+    # require the faster-whisper package to be installed.
+    from faster_whisper import WhisperModel
+
     print(f"Loading Whisper model ({model_size}) on {device} [{compute_type}]...")
     model = WhisperModel(model_size, device=device, compute_type=compute_type)
 

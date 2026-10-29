@@ -13,15 +13,31 @@ and the open WAV file.
 import sys
 
 
-if sys.platform == "darwin":
-    from meeting_notes.recorder_mac import record_audio, stop_recording
-elif sys.platform == "win32":
-    from meeting_notes.recorder_windows import record_audio, stop_recording
-else:
-    raise RuntimeError(
-        f"Unsupported platform: {sys.platform}. "
-        "This tool runs on macOS (darwin) and Windows (win32) only."
-    )
+def _backend():
+    """Load the platform recorder on first use.
+
+    Import is deferred so non-recording commands and unit tests can import the
+    package on Linux, where neither audio backend is installed. Calling
+    record_audio / stop_recording on an unsupported platform still fails.
+    """
+    if sys.platform == "darwin":
+        from meeting_notes import recorder_mac as backend
+    elif sys.platform == "win32":
+        from meeting_notes import recorder_windows as backend
+    else:
+        raise RuntimeError(
+            f"Unsupported platform: {sys.platform}. "
+            "This tool runs on macOS (darwin) and Windows (win32) only."
+        )
+    return backend
+
+
+def record_audio(output_path):
+    return _backend().record_audio(output_path)
+
+
+def stop_recording(handle):
+    return _backend().stop_recording(handle)
 
 
 __all__ = ["record_audio", "stop_recording"]
