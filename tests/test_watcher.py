@@ -1,3 +1,4 @@
+import os
 import sys
 from datetime import datetime, timezone
 
@@ -177,6 +178,50 @@ def test_watcher_does_not_start_when_a_human_session_is_running(tmp_path):
     assert launcher.stopped == []
     assert delivered == []
     assert any("already running" in message and "manual" in message for _level, message in log.messages)
+
+
+def test_watcher_copies_device_events_into_its_log(tmp_path):
+    clock = Clock()
+    detector = ScriptDetector(clock, present_until=100)
+    launcher = FakeLauncher()
+    log = ListLog()
+    watcher = MeetWatcher(
+        config=_config(),
+        detector=detector,
+        launcher=launcher,
+        deliver_fn=lambda folder: True,
+        lock_store=Lock(),
+        outbox_retry=lambda: 0,
+        sleep=clock.sleep,
+        monotonic=clock.monotonic,
+        wall_iso=lambda: "2026-10-29T15:04:00+00:00",
+        wall_datetime=lambda: datetime(2026, 10, 29, 15, 4, tzinfo=timezone.utc),
+        output_dir=str(tmp_path),
+        log=log,
+    )
+    watcher.tick()
+    watcher.tick()
+    assert launcher.started
+    folder = launcher.started[0].folder
+    path = os.path.join(folder, "audio-devices.log")
+    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write("capturing microphone 'Headset'\n")
+        handle.write("capturing default output 'Speakers [Loopback]'\n")
+    watcher.tick()
+    text = "\n".join(message for _level, message in log.messages)
+    assert "recorder: capturing microphone 'Headset'" in text
+    assert "recorder: capturing default output 'Speakers [Loopback]'" in text
+    with open(path, "a", encoding="utf-8", newline="\n") as handle:
+        handle.write("default output switched: 'Speakers")
+    watcher.tick()
+    text = "\n".join(message for _level, message in log.messages)
+    assert "default output switched" not in text
+    with open(path, "a", encoding="utf-8", newline="\n") as handle:
+        handle.write(" [Loopback]' -> 'Headphones [Loopback]'\n")
+    watcher.tick()
+    text = "\n".join(message for _level, message in log.messages)
+    assert text.count("recorder: capturing microphone 'Headset'") == 1
+    assert "recorder: default output switched: 'Speakers [Loopback]' -> 'Headphones [Loopback]'" in text
 
 
 def test_build_start_argv_is_hidden_and_transcript_only():

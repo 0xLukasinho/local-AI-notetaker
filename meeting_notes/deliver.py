@@ -5,6 +5,7 @@ and retried later. The auth header value is read from config at send time and
 is never written to the outbox or to status.json.
 """
 
+import hashlib
 import json
 import os
 import time
@@ -43,6 +44,156 @@ def build_payload(status, transcript, folder):
         "language": status.get("language"),
         "transcript": transcript,
     }
+
+
+# One JSON body stays under a typical 8 KB first-read / field limit. Two calls
+# were stored cut off mid-sentence around 7–9 minutes while transcript.txt on
+# disk was intact (~32 KB), which is what a receiver that keeps only the first
+# chunk of a larger body looks like. Each piece is a complete JSON document.
+# 0 disables the limit and sends the transcript in one request.
+DEFAULT_MAX_BODY_BYTES = 6000
+_MIN_BODY_BYTES = 2048
+
+
+def chunk_body_limit(config):
+    """Byte budget for one POST body. ``None`` means send a single body."""
+    raw = getattr(config, "webhook_max_body_bytes", DEFAULT_MAX_BODY_BYTES)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_BODY_BYTES
+    if value <= 0:
+        return None
+    if value < _MIN_BODY_BYTES:
+        return _MIN_BODY_BYTES
+    return value
+
+
+def redact_secret(text, secret):
+    """Remove the webhook credential from an error string before it is stored."""
+    if text is None or not secret or len(str(secret)) < 4:
+        return text
+    return str(text).replace(str(secret), "[redacted]")
+
+
+def split_transcript_to_fit(text, fits):
+    """Split ``text`` so each piece satisfies ``fits``, keeping line breaks.
+
+    ``fits(piece)`` is true when that string is small enough. Pieces join back
+    to ``text``. A line longer than the budget is split mid-line so progress
+    is always made.
+    """
+    if text == "":
+        return [""]
+    if fits(text):
+        return [text]
+    parts = []
+    rest = text
+    while rest:
+        if fits(rest):
+            parts.append(rest)
+            break
+        take = _largest_fitting_prefix(rest, fits)
+        newline = rest.rfind("\n", 0, take)
+        if newline > 0 and fits(rest[: newline + 1]):
+            take = newline + 1
+        if take < 1:
+            take = 1
+        parts.append(rest[:take])
+        rest = rest[take:]
+    return parts
+
+
+def _largest_fitting_prefix(text, fits):
+    if not text:
+        return 0
+    if not fits(text[:1]):
+        return 1
+    best = 1
+    left = 1
+    right = len(text)
+    while left <= right:
+        mid = (left + right) // 2
+        if fits(text[:mid]):
+            best = mid
+            left = mid + 1
+        else:
+            right = mid - 1
+    return best
+
+
+def _estimate_body_bytes(payload, piece, total_chars, digest):
+    """Upper bound on the JSON body size for this transcript piece.
+
+    Chunk indexes are estimated with three digits so the real body (smaller
+    indexes) cannot grow past a piece that passed this check.
+    """
+    trial = dict(payload)
+    trial["transcript"] = piece
+    trial["chunk_index"] = 999
+    trial["chunk_count"] = 999
+    trial["transcript_sha256"] = digest
+    trial["transcript_chars"] = total_chars
+    return len(json.dumps(trial, ensure_ascii=False).encode("utf-8"))
+
+
+def iter_delivery_bodies(payload, max_body_bytes):
+    """Yield POST bodies. ``transcript`` is one piece; the other fields repeat.
+
+    ``chunk_index`` / ``chunk_count`` put the piece back in order.
+    ``transcript_sha256`` and ``transcript_chars`` describe the full transcript.
+    A transcript that already fits is one body with ``chunk_count`` 1.
+    """
+    text = payload.get("transcript")
+    if not isinstance(text, str):
+        text = "" if text is None else str(text)
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    total_chars = len(text)
+
+    def fits(piece):
+        return _estimate_body_bytes(payload, piece, total_chars, digest) <= max_body_bytes
+
+    if max_body_bytes is None:
+        parts = [text]
+    else:
+        parts = split_transcript_to_fit(text, fits)
+    count = len(parts)
+    for index, part in enumerate(parts):
+        body = dict(payload)
+        body["transcript"] = part
+        body["chunk_index"] = index
+        body["chunk_count"] = count
+        body["transcript_sha256"] = digest
+        body["transcript_chars"] = total_chars
+        yield body
+
+
+def send_payload(config, payload, poster, sleep, log=None):
+    """POST every chunk. Returns ``(ok, error)``. The error never contains the key."""
+    limit = chunk_body_limit(config)
+    bodies = list(iter_delivery_bodies(payload, limit))
+    total = len(bodies)
+    chars = bodies[0].get("transcript_chars", 0) if bodies else 0
+    if log is not None:
+        if limit is None:
+            log.info("Posting transcript (%s chars, 1 request)", chars)
+        else:
+            log.info(
+                "Posting transcript (%s chars, %s request(s), max body %s bytes)",
+                chars,
+                total,
+                limit,
+            )
+    for body in bodies:
+        ok, error = post_with_retry(config, body, poster, sleep)
+        if not ok:
+            error = redact_secret(error, getattr(config, "webhook_auth_value", ""))
+            index = int(body.get("chunk_index") or 0) + 1
+            detail = f"chunk {index}/{total}: {error}"
+            if log is not None:
+                log.error("Transcript POST failed: %s", detail)
+            return False, detail
+    return True, None
 
 
 def duration_seconds(joined_at, left_at):
@@ -113,7 +264,7 @@ def post_with_retry(config, payload, poster, sleep, attempts=None, backoff=None)
     return False, last_error or "delivery failed"
 
 
-def deliver_folder(folder, config, poster=None, sleep=None, outbox=None, control_dir=None):
+def deliver_folder(folder, config, poster=None, sleep=None, outbox=None, control_dir=None, log=None):
     """POST the session transcript. On failure, write an outbox entry.
 
     Returns True on success. A missing webhook URL is a skip (False) and is
@@ -134,7 +285,7 @@ def deliver_folder(folder, config, poster=None, sleep=None, outbox=None, control
     payload = build_payload(status, transcript, folder)
     if not config.webhook_url:
         return False
-    ok, error = post_with_retry(config, payload, poster, sleep)
+    ok, error = send_payload(config, payload, poster, sleep, log=log)
     if ok:
         update_status(
             folder,
@@ -206,7 +357,7 @@ def _delete_audio(folder):
         pass
 
 
-def retry_outbox(directory, config, poster=None, sleep=None):
+def retry_outbox(directory, config, poster=None, sleep=None, log=None):
     """Retry every outbox file once (each try still uses post_with_retry).
 
     Returns the number of successful deliveries. Does nothing when no webhook
@@ -229,7 +380,7 @@ def retry_outbox(directory, config, poster=None, sleep=None):
         payload = item.get("payload")
         if not isinstance(payload, dict):
             continue
-        ok, error = post_with_retry(config, payload, poster, sleep)
+        ok, error = send_payload(config, payload, poster, sleep, log=log)
         if ok:
             folder = payload.get("folder_path")
             if folder and os.path.isdir(folder):

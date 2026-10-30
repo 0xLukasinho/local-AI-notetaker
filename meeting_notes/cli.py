@@ -558,6 +558,16 @@ def cmd_stop(_args):
         print("Signaled via stop file.")
 
 
+class _DeliverLog:
+    """Surface delivery progress on the console without the webhook credential."""
+
+    def info(self, message, *args):
+        print(message % args if args else message)
+
+    def error(self, message, *args):
+        print(message % args if args else message, file=sys.stderr)
+
+
 def cmd_deliver(args):
     """POST a finished session's transcript to the configured webhook."""
     try:
@@ -570,7 +580,12 @@ def cmd_deliver(args):
         print(f"Error: Meeting folder not found: {meeting_dir}", file=sys.stderr)
         sys.exit(1)
     try:
-        ok = deliver_folder(meeting_dir, config, control_dir=CONTROL_DIR)
+        ok = deliver_folder(
+            meeting_dir,
+            config,
+            control_dir=CONTROL_DIR,
+            log=_DeliverLog(),
+        )
     except DeliveryError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
