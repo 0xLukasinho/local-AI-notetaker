@@ -7,8 +7,18 @@
 webhook_url = "https://example.invalid/meeting-notes"
 
 # Sent only when both the name and the value are non-empty.
+# The value is the full header, so a bearer token is "Bearer <key>".
 webhook_auth_header = "Authorization"
 webhook_auth_value = "replace-me"
+
+# Max JSON body per POST, in bytes. Long transcripts are split into several
+# requests that stay under this size (a single ~8 KB body was being cut off
+# mid-sentence). 0 sends one request with the whole transcript.
+# Reassemble by sorting on chunk_index. Each body repeats the meeting fields
+# and sets transcript to that piece only. transcript_sha256 and
+# transcript_chars describe the full text. Retries can repeat a chunk;
+# replace on (folder_name, chunk_index) instead of appending twice.
+webhook_max_body_bytes = 6000
 
 # How long the call signal must hold before a recording starts, and how long
 # it must be gone before it stops. The Meet tab and the microphone have to

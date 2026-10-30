@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 
@@ -233,6 +234,151 @@ def test_cmd_deliver_resends(tmp_path, monkeypatch, capsys):
     cli.cmd_deliver(cli.build_parser().parse_args(["deliver", folder.name]))
     assert "Delivered" in capsys.readouterr().out
     assert read_status(str(folder))["delivered"] is True
+
+
+def _long_transcript():
+    line = '[00:01] she said "hello" and the remote side answered\n'
+    return line * 80
+
+
+def test_long_transcript_is_posted_in_sized_chunks_with_the_auth_header(tmp_path):
+    transcript = _long_transcript()
+    folder = _session(tmp_path, transcript)
+    secret = "Bearer " + SECRET
+    seen = []
+    logged = []
+
+    class _Log:
+        def info(self, message, *args):
+            logged.append(message % args if args else message)
+
+        def error(self, message, *args):
+            logged.append(message % args if args else message)
+
+    def poster(url, payload, header, value, timeout):
+        seen.append((header, value, payload))
+        raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        assert len(raw) <= 2500
+        assert secret not in raw.decode("utf-8")
+        return 200
+
+    ok = deliver_folder(
+        str(folder),
+        _config(
+            webhook_auth_header="Authorization",
+            webhook_auth_value=secret,
+            webhook_max_body_bytes=2500,
+        ),
+        poster=poster,
+        sleep=lambda _seconds: None,
+        log=_Log(),
+    )
+    assert ok is True
+    assert len(seen) > 1
+    assert "".join(item[2]["transcript"] for item in seen) == transcript
+    indexes = [item[2]["chunk_index"] for item in seen]
+    assert indexes == list(range(len(seen)))
+    assert {item[2]["chunk_count"] for item in seen} == {len(seen)}
+    assert {item[2]["transcript_chars"] for item in seen} == {len(transcript)}
+    digest = hashlib.sha256(transcript.encode("utf-8")).hexdigest()
+    assert all(item[2]["transcript_sha256"] == digest for item in seen)
+    assert all(item[0] == "Authorization" and item[1] == secret for item in seen)
+    # Short lines stay whole. Every piece but a hard-split ends on a newline.
+    for item in seen[:-1]:
+        assert item[2]["transcript"].endswith("\n")
+    assert secret not in "\n".join(logged)
+    assert f"{len(transcript)} chars" in logged[0]
+    assert f"{len(seen)} request" in logged[0]
+
+
+def test_failed_later_chunk_keeps_the_full_transcript_and_hides_the_key(tmp_path):
+    transcript = _long_transcript()
+    folder = _session(tmp_path, transcript)
+    outbox = tmp_path / "outbox"
+    logged = []
+    calls = {"n": 0}
+
+    class _Log:
+        def info(self, message, *args):
+            logged.append(message % args if args else message)
+
+        def error(self, message, *args):
+            logged.append(message % args if args else message)
+
+    def poster(url, payload, header, value, timeout):
+        calls["n"] += 1
+        if payload["chunk_index"] == 0:
+            return 200
+        raise DeliveryError(f"HTTP 500 token={value}")
+
+    ok = deliver_folder(
+        str(folder),
+        _config(webhook_max_body_bytes=2500, delivery_attempts=1),
+        poster=poster,
+        sleep=lambda _seconds: None,
+        outbox=str(outbox),
+        log=_Log(),
+    )
+    assert ok is False
+    text = (outbox / f"{folder.name}.json").read_text(encoding="utf-8")
+    assert SECRET not in text
+    assert "[redacted]" in text
+    body = json.loads(text)
+    assert body["payload"]["transcript"] == transcript
+    assert "chunk_index" not in body["payload"]
+    assert SECRET not in "\n".join(logged)
+    status = read_status(str(folder))
+    assert SECRET not in (status.get("delivery_error") or "")
+    assert "chunk 2/" in status["delivery_error"]
+
+    resent = []
+
+    def succeed(url, payload, header, value, timeout):
+        resent.append(payload["chunk_index"])
+        assert value == SECRET
+        return 200
+
+    count = retry_outbox(
+        str(outbox),
+        _config(webhook_max_body_bytes=2500, delivery_attempts=1),
+        poster=succeed,
+        sleep=lambda _s: None,
+    )
+    assert count == 1
+    assert resent == list(range(len(resent)))
+    assert len(resent) > 1
+    assert list(outbox.glob("*.json")) == []
+
+
+def test_overlong_line_is_split_and_rejoins():
+    from meeting_notes.deliver import split_transcript_to_fit
+
+    text = ("a" * 50) + "\n" + ("b" * 10) + "\n"
+    parts = split_transcript_to_fit(text, lambda piece: len(piece) <= 30)
+    assert "".join(parts) == text
+    assert parts
+    assert all(len(part) <= 30 for part in parts)
+
+
+def test_zero_body_limit_sends_one_request(tmp_path):
+    transcript = _long_transcript()
+    folder = _session(tmp_path, transcript)
+    seen = []
+
+    def poster(url, payload, header, value, timeout):
+        seen.append(payload)
+        return 200
+
+    assert deliver_folder(
+        str(folder),
+        _config(webhook_max_body_bytes=0),
+        poster=poster,
+        sleep=lambda _seconds: None,
+    )
+    assert len(seen) == 1
+    assert seen[0]["transcript"] == transcript
+    assert seen[0]["chunk_count"] == 1
+    assert seen[0]["chunk_index"] == 0
 
 
 def test_cmd_deliver_requires_a_webhook(tmp_path, monkeypatch, capsys):

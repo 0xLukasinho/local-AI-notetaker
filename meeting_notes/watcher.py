@@ -17,6 +17,7 @@ from dataclasses import dataclass
 
 from meeting_notes.autostart import find_pythonw
 from meeting_notes.deliver import deliver_folder, retry_outbox
+from meeting_notes.device_log import DEVICE_LOG_FILENAME, read_new_device_events
 from meeting_notes.meet_detect import session_name
 from meeting_notes.session import (
     allocate_meeting_dir,
@@ -222,6 +223,7 @@ class MeetWatcher:
         self.delivered = False
         self._last_outbox = None
         self._last_seen_key = None
+        self._device_log_offsets = {}
 
     def run(self, stop_event=None, max_ticks=None):
         self._retry_outbox()
@@ -256,6 +258,8 @@ class MeetWatcher:
             elif event == "leave":
                 self._on_leave()
         self._poll_child()
+        if self.session is not None:
+            self._mirror_device_log(self.session.folder)
 
     def shutdown(self):
         """Stop a recording we started and deliver it before the process exits."""
@@ -334,11 +338,13 @@ class MeetWatcher:
             self.log.info("Call ended; session %s was already delivered.", session.folder)
             return
         self.log.info("Call ended; stopping %s", session.folder)
+        self._mirror_device_log(session.folder)
         try:
             self.launcher.request_stop(session)
         except Exception as exc:
             self.log.error("Failed to signal stop for %s: %s", session.folder, exc)
         state = self._wait_until_finished(session)
+        self._mirror_device_log(session.folder)
         if state in _FINISHED_OK:
             self._deliver(session.folder)
         else:
@@ -360,6 +366,7 @@ class MeetWatcher:
         if state in _RUNNING or state is None:
             return
         if state in _FINISHED_OK:
+            self._mirror_device_log(self.session.folder)
             self.log.info("Recording process finished; delivering %s", self.session.folder)
             self._deliver(self.session.folder)
             self.delivered = True
@@ -383,11 +390,33 @@ class MeetWatcher:
                 return "timeout"
             self.sleep(min(0.5, float(self.config.poll_interval_seconds) or 0.5))
 
+    def _mirror_device_log(self, folder):
+        """Copy new recorder device lines into the watcher log."""
+        if not folder:
+            return
+        path = os.path.join(folder, DEVICE_LOG_FILENAME)
+        offset = self._device_log_offsets.get(folder, 0)
+        try:
+            lines, offset = read_new_device_events(path, offset)
+        except Exception as exc:
+            self.log.error("Could not read the audio device log: %s", exc)
+            return
+        self._device_log_offsets[folder] = offset
+        for line in lines:
+            self.log.info("recorder: %s", line)
+
     def _deliver(self, folder):
         try:
             ok = self.deliver_fn(folder)
         except Exception as exc:
-            self.log.error("Delivery failed for %s: %s", folder, exc)
+            from meeting_notes.deliver import redact_secret
+
+            secret = getattr(self.config, "webhook_auth_value", "")
+            self.log.error(
+                "Delivery failed for %s: %s",
+                folder,
+                redact_secret(str(exc), secret),
+            )
             return
         if ok:
             self.log.info("Delivered %s", folder)
@@ -487,10 +516,10 @@ def serve(config, control_dir, output_dir, sleep=None, monotonic=None):
     box = outbox_dir(control_dir)
 
     def _deliver(folder):
-        return deliver_folder(folder, config, control_dir=control_dir)
+        return deliver_folder(folder, config, control_dir=control_dir, log=logger)
 
     def _retry():
-        return retry_outbox(box, config)
+        return retry_outbox(box, config, log=logger)
 
     watcher = MeetWatcher(
         config=config,

@@ -127,7 +127,7 @@ meeting-notes --help
 
 **macOS:** the first time you run the tool, macOS will prompt you to grant microphone access to Terminal. Accept this — it's required for recording.
 
-**Windows:** no extra permission grant is needed. The tool uses the default speaker (for loopback / system audio) and default microphone configured in *Settings → System → Sound*.
+**Windows:** no extra permission grant is needed. The tool records the default microphone and system audio from every playback device (see below).
 
 ## Audio Device Configuration
 
@@ -139,7 +139,9 @@ ffmpeg -f avfoundation -list_devices true -i ""
 
 Update `device_index` in `meeting_notes/recorder_mac.py` to change.
 
-**Windows** — uses whatever you've set as the default playback and recording devices in Windows Sound settings. To change which apps the tool captures, change your Windows defaults.
+**Windows** — records the default microphone, and a WASAPI loopback of **every** playback device, including ones that are not the Windows default. That covers Meet's own speaker menu, a per-app output device, and headphones that connect or disconnect after recording has already started. A loopback is tied to the endpoint it was opened on, so the recorder refreshes the device list during the call and opens or closes streams as devices appear and disappear. Losing one playback device does not stop the microphone.
+
+The session folder gets `audio-devices.log` with the microphone, each loopback (default or not), device switches, and a warning if system audio stays silent while the microphone is active. During a watched call those lines are copied into `~/.meeting-notes/watch.log` with a `recorder:` prefix. The recorder process also prints them; the watcher saves that stream to `recorder.log` in the session folder.
 
 ## Automation
 
@@ -206,9 +208,13 @@ Logs rotate at `~/.meeting-notes/watch.log`.
 
 When a watcher session finishes, the watcher POSTs JSON:
 
-`folder_name`, `folder_path`, `meet_code`, `window_title`, `joined_at`, `left_at`, `duration_seconds`, `whisper_model`, `language`, `transcript`.
+`folder_name`, `folder_path`, `meet_code`, `window_title`, `joined_at`, `left_at`, `duration_seconds`, `whisper_model`, `language`, `transcript`, `chunk_index`, `chunk_count`, `transcript_sha256`, `transcript_chars`.
 
-The request uses `webhook_auth_header` / `webhook_auth_value` when both are set. Failures retry with exponential backoff. If they still fail, the payload (not the secret) is written to `~/.meeting-notes/outbox/` and retried when the watcher starts and every `outbox_retry_seconds`. A successful delivery sets `delivered` and `delivered_at` in `status.json`. `delete_audio_after_delivery` (default false) removes `audio.wav` only after that success.
+`transcript` in each request is one piece of the file. `chunk_index` starts at 0. `chunk_count` is how many requests make up this delivery. `transcript_sha256` (SHA-256 of the UTF-8 file) and `transcript_chars` describe the **full** transcript and are the same on every piece. Concatenate `transcript` in `chunk_index` order. A short transcript is a single request (`chunk_count` 1) whose `transcript` is the whole file.
+
+Pieces stay under `webhook_max_body_bytes` (default 6000). One JSON body around 8 KB was arriving cut off mid-sentence — about 7 to 9 minutes into the call — even though `transcript.txt` on disk was complete. Set `webhook_max_body_bytes` to `0` to send a single request again.
+
+The request uses `webhook_auth_header` / `webhook_auth_value` when both are set, on every piece. Put the full header value in config (`Bearer <key>` when the header name is `Authorization`). Failures retry with exponential backoff. If they still fail, the payload (the full transcript, not the secret) is written to `~/.meeting-notes/outbox/` and retried when the watcher starts and every `outbox_retry_seconds`. A retry sends every piece again, so a receiver should replace on `(folder_name, chunk_index)` rather than append a duplicate. A successful delivery sets `delivered` and `delivered_at` in `status.json`. `delete_audio_after_delivery` (default false) removes `audio.wav` only after that success. The watcher log records the character count and how many requests were posted. The auth value is never written to the log, the outbox, or `status.json`.
 
 ```bash
 meeting-notes deliver 2026-10-29_abc-defg-hij_1430
@@ -224,7 +230,8 @@ Copy `config.example.toml` to `~/.meeting-notes/config.toml`, or use `config.jso
 | --- | --- | --- |
 | `webhook_url` | empty | POST target. Empty skips delivery and does not fill the outbox. |
 | `webhook_auth_header` | `Authorization` | Header name. Omitted when the value is empty. |
-| `webhook_auth_value` | empty | Header value. Never written to the session or the outbox. |
+| `webhook_auth_value` | empty | Header value, sent as-is (`Bearer <key>` for an Authorization bearer token). Never written to the session, the log, or the outbox. |
+| `webhook_max_body_bytes` | `6000` | Max JSON body per POST. Longer transcripts are several requests. `0` sends one request. |
 | `join_debounce_seconds` | `12` | Hold time before the watcher starts recording. |
 | `leave_debounce_seconds` | `25` | Hold time before the watcher stops recording. |
 | `poll_interval_seconds` | `2` | How often window and microphone state are checked. |
@@ -267,7 +274,13 @@ Install Claude Code from [claude.com/code](https://claude.com/code), then run `c
 
 **"No audio was recorded"**
 On macOS, check that microphone permission is granted and run `ffmpeg -f avfoundation -list_devices true -i ""` to see available devices.
-On Windows, check that you have a default speaker and microphone set in *Settings → System → Sound*.
+On Windows, check that a playback device and a default microphone are enabled in *Settings → System → Sound*. The session's `audio-devices.log` lists the devices the recorder actually opened.
+
+**Transcript contains only your own voice**
+System audio is a WASAPI loopback per playback device. The recorder follows devices that appear, disappear, or become the default during the call, and it also records a device that is not the default (so Meet can play on headphones while speakers stay the Windows default). `audio-devices.log` and `watch.log` (`recorder:` lines) should show the headphones or speakers you were listening through, and a `default output switched` line when that changes. `system audio silent for 60s while the microphone is active` means those loopbacks heard nothing while you were speaking; the recorder reopens them and logs the open devices. Restart the watcher after updating so the next call uses this path.
+
+**Webhook transcript stops after a few minutes**
+`transcript.txt` is the full text. The webhook is several JSON bodies when that file is longer than `webhook_max_body_bytes`. Join `transcript` by `chunk_index`. `watch.log` lines `Posting transcript (N chars, M request(s), max body B bytes)` are the size that was sent. The `Authorization` header is unchanged and is not logged.
 
 **Watcher never notices a Google Meet**
 Open `~/.meeting-notes/watch.log`. `Microphone not in use (registry=no, wasapi=unavailable)` means the WASAPI probe is off (usually `pycaw` is not installed: `pip install pycaw`) and the consent-store registry also did not show Chrome. `Meet window not detected` while you are in the call means the Meet tab is not the active Chrome tab; focus it for the join hold (`join_debounce_seconds`, default 12). After the session has started, a mute or a background tab does not by itself end it.

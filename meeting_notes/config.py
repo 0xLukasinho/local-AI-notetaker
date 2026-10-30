@@ -50,6 +50,9 @@ class Config:
     delivery_attempts: int = 3
     delivery_backoff_seconds: float = 1.0
     delivery_timeout_seconds: float = 30
+    # 0 sends the transcript in one POST. The default keeps each JSON body
+    # under the size that was being truncated in transit (~8 KB).
+    webhook_max_body_bytes: int = 6000
 
 
 _FLOAT_FIELDS = {
@@ -61,7 +64,7 @@ _FLOAT_FIELDS = {
     "delivery_backoff_seconds",
     "delivery_timeout_seconds",
 }
-_INT_FIELDS = {"delivery_attempts"}
+_INT_FIELDS = {"delivery_attempts", "webhook_max_body_bytes"}
 _BOOL_FIELDS = {
     "transcript_only",
     "watcher_transcript_only",
