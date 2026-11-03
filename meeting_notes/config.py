@@ -59,9 +59,10 @@ class Config:
     self_name: str = "You"
     # Loopback port the Chrome extension posts Meet speaker samples to.
     speaker_bridge_port: int = 8765
-    # Split the remote mix into voices when two or more other people are on
-    # the call. False keeps the Meet tile / caption timeline only.
-    diarize_remote: bool = True
+    # Off by default. Captions (then the active-speaker tile) name remote
+    # lines. True also splits the remote mix into voices locally. That path
+    # needs optional packages and is not part of the normal install.
+    diarize: bool = False
     # auto uses pyannote when a token is set and that package is installed,
     # then speechbrain, resemblyzer, then the built-in numpy clusterer.
     # builtin, speechbrain, resemblyzer, pyannote, and off are explicit.
@@ -93,7 +94,7 @@ _BOOL_FIELDS = {
     "watcher_transcript_only",
     "delete_audio_after_delivery",
     "speaker_labels",
-    "diarize_remote",
+    "diarize",
 }
 _DIARIZE_BACKENDS = {"auto", "builtin", "speechbrain", "resemblyzer", "pyannote", "off"}
 _KNOWN = {item.name for item in fields(Config)}

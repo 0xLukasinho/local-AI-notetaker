@@ -217,4 +217,16 @@ try {
 }
 assert(threw === false, "caption parsing stays defensive");
 
+assert(context.activeCaptionSpeaker([]) === "", "no caption rows");
+const bothNew = context.activeCaptionSpeaker([
+  { speaker: "Daniel Bronheim", text: "hello" },
+  { speaker: "Mahmoud Lababidi", text: "earlier" },
+]);
+assert(bothNew === "Mahmoud Lababidi", "the last caption row is the live line");
+const changed = context.activeCaptionSpeaker([
+  { speaker: "Daniel Bronheim", text: "hello there" },
+  { speaker: "Mahmoud Lababidi", text: "earlier" },
+]);
+assert(changed === "Daniel Bronheim", "the caption row that changed is the speaker");
+
 console.log("meet dom checks ok");

@@ -12,7 +12,21 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from meeting_notes.speakers import coerce_event
+from meeting_notes.speakers import clean_name, coerce_event
+
+
+def _body_has_caption(body):
+    if not isinstance(body, dict):
+        return False
+    if clean_name(body.get("caption_speaker") or ""):
+        return True
+    captions = body.get("captions")
+    if not isinstance(captions, list):
+        return False
+    for entry in captions:
+        if isinstance(entry, dict) and clean_name(entry.get("speaker") or entry.get("name")):
+            return True
+    return False
 
 
 # Caption snapshots ride along with the speaker sample. A few Meet lines fit
@@ -30,6 +44,9 @@ class SpeakerBridge:
         self._pending = []
         self.httpd = None
         self._thread = None
+        self._samples = 0
+        self._samples_with_captions = 0
+        self._caption_notice = False
 
     def start(self):
         bridge = self
@@ -118,8 +135,29 @@ class SpeakerBridge:
         with self._lock:
             if self._audio_start is None:
                 self._pending.append((now, dict(body)))
+                self._note_captions(body)
                 return {"queued": True}
-            return self._append(now, body)
+            event = self._append(now, body)
+            self._note_captions(body)
+            return event
+
+    def _note_captions(self, body):
+        """Print once when a call is underway and Meet captions are not on.
+
+        The extension posts about once a second. Waiting for several samples
+        avoids a warning during the second before someone turns captions on.
+        """
+        self._samples += 1
+        if _body_has_caption(body):
+            self._samples_with_captions += 1
+        if self._caption_notice or self._samples < 8 or self._samples_with_captions:
+            return
+        self._caption_notice = True
+        print(
+            "Meet captions are off, so remote speakers cannot be named. "
+            "Press CC in the Meet window. Captions are only shown to you.",
+            flush=True,
+        )
 
     def _append(self, now, body):
         """Write one sample. Caller holds the lock and the audio clock is set."""

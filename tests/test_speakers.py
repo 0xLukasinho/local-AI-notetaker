@@ -41,6 +41,7 @@ def _event(
     self_active=False,
     active_ids=None,
     captions=None,
+    caption_speaker="",
 ):
     body = {
         "t": t,
@@ -53,6 +54,8 @@ def _event(
         body["active_ids"] = active_ids
     if captions:
         body["captions"] = captions
+    if caption_speaker:
+        body["caption_speaker"] = caption_speaker
     return coerce_event(body)
 
 
@@ -137,12 +140,25 @@ def test_words_split_a_remote_segment_across_two_speakers():
     ]
 
 
-def test_overlapping_remote_speakers_are_both_named_when_neither_dominates():
+def test_overlapping_tiles_are_not_merged_into_one_label():
     events = []
     for moment in (0.0, 0.5, 1.0, 1.5):
-        events.append(_event(moment, active=["Ada Lovelace", "Grace Hopper"]))
-    label = speaker_for_interval(0.0, 2.0, events)
-    assert label == "Ada Lovelace / Grace Hopper"
+        events.append(
+            _event(
+                moment,
+                active=["Ada Lovelace", "Grace Hopper"],
+                participants=["You", "Ada Lovelace", "Grace Hopper"],
+                self_name="You",
+            )
+        )
+    labeled = align_tracks(
+        [],
+        [{"start": 0.1, "end": 1.6, "text": "someone spoke"}],
+        events,
+        "You",
+    )
+    assert labeled[0]["speaker"] == "Remote"
+    assert " / " not in labeled[0]["speaker"]
 
 
 def test_a_clear_majority_keeps_one_name():
@@ -293,6 +309,7 @@ def test_produce_transcript_writes_names_participants_and_json_shape(tmp_path):
     assert document["self_name"] == "Alex Chen"
     assert document["meet_self_name"] == "Alex Chen"
     assert document["speaker_source"] == "meet"
+    assert document["captions"] == "off"
     assert document["participants"] == ["Alex Chen", "Ada Lovelace", "Grace Hopper"]
     assert document["segments"][1]["speaker"] == "Ada Lovelace"
     assert document["limits"]
@@ -497,6 +514,85 @@ def test_exclusive_tiles_name_voice_clusters():
     assert [item["speaker"] for item in labeled] == ["Daniel Bronheim", "Mahmoud Lababidi"]
 
 
+def test_caption_speaker_field_names_a_three_person_call():
+    events = []
+    for moment, speaker in (
+        (0.0, "Daniel Bronheim"),
+        (0.8, "Daniel Bronheim"),
+        (1.6, "Mahmoud Lababidi"),
+        (2.4, "Mahmoud Lababidi"),
+    ):
+        events.append(
+            _event(
+                moment,
+                active=["Daniel Bronheim", "Mahmoud Lababidi"],
+                participants=["Lukas", "Daniel Bronheim", "Mahmoud Lababidi"],
+                self_name="Lukas",
+                caption_speaker=speaker,
+            )
+        )
+    labeled = align_tracks(
+        [],
+        [
+            {
+                "start": 0.1,
+                "end": 2.8,
+                "text": "alpha beta gamma",
+                "words": [
+                    {"start": 0.2, "end": 0.6, "text": "alpha"},
+                    {"start": 0.9, "end": 1.3, "text": "beta"},
+                    {"start": 1.8, "end": 2.6, "text": "gamma"},
+                ],
+            }
+        ],
+        events,
+        "Lukas",
+    )
+    assert [(item["speaker"], item["text"]) for item in labeled] == [
+        ("Daniel Bronheim", "alpha beta"),
+        ("Mahmoud Lababidi", "gamma"),
+    ]
+    assert all(" / " not in item["speaker"] for item in labeled)
+    assert events[0]["caption_speaker"] == "Daniel Bronheim"
+
+
+def test_captions_off_uses_one_tile_and_otherwise_remote():
+    exclusive = _hold(
+        0.0,
+        2.0,
+        0.4,
+        active=["Daniel Bronheim"],
+        participants=["Lukas", "Daniel Bronheim", "Mahmoud Lababidi"],
+        self_name="Lukas",
+    ) + _hold(
+        2.0,
+        4.0,
+        0.4,
+        active=["Mahmoud Lababidi"],
+        participants=["Lukas", "Daniel Bronheim", "Mahmoud Lababidi"],
+        self_name="Lukas",
+    )
+    named = align_tracks(
+        [],
+        [
+            {"start": 0.2, "end": 1.4, "text": "from daniel"},
+            {"start": 2.2, "end": 3.4, "text": "from mahmoud"},
+        ],
+        exclusive,
+        "Lukas",
+    )
+    assert [item["speaker"] for item in named] == ["Daniel Bronheim", "Mahmoud Lababidi"]
+
+    ambiguous = [_both_active(moment) for moment in (0.0, 0.5, 1.0, 1.5)]
+    unlabeled = align_tracks(
+        [],
+        [{"start": 0.2, "end": 1.4, "text": "could be either"}],
+        ambiguous,
+        "Lukas",
+    )
+    assert unlabeled[0]["speaker"] == "Remote"
+
+
 def test_captions_label_words_when_diarization_is_unavailable():
     events = [
         _event(
@@ -655,6 +751,7 @@ def test_captions_round_trip_and_drop_garbage():
         }
     )
     assert event["captions"] == [{"speaker": "Ada Lovelace", "text": "ship it"}]
+    assert event["caption_speaker"] == "Ada Lovelace"
 
 
 def test_two_person_produce_does_not_diarize_or_split(tmp_path):
@@ -688,7 +785,8 @@ def test_two_person_produce_does_not_diarize_or_split(tmp_path):
             ]
             for path in paths
         ],
-        diarize=diarize,
+        diarize=True,
+        diarizer=diarize,
     )
     assert text == "[00:00] Lukas: my side\n[00:01] Daniel Bronheim: remote side"
     assert "diarization" not in document
@@ -767,7 +865,8 @@ def test_produce_names_three_people_from_injected_voices(tmp_path):
             ]
             for path in paths
         ],
-        diarize=diarize,
+        diarize=True,
+        diarizer=diarize,
     )
     assert "Daniel Bronheim: alpha beta" in text
     assert "Mahmoud Lababidi: gamma delta" in text

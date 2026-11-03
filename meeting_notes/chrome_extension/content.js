@@ -149,7 +149,7 @@ function captionRoots() {
   } catch (err) {
     // Meet markup we do not understand contributes no captions.
   }
-  const historical = [".a4cQT", "[jsname='dsyhDe']"];
+  const historical = [".a4cQT", ".iOzk7", "[jsname='dsyhDe']"];
   for (const selector of historical) {
     try {
       document.querySelectorAll(selector).forEach(add);
@@ -205,7 +205,7 @@ function readCaptionBlock(block) {
     name = "";
   }
   const nameSelectors = [".KcIKyf", ".NWpY1d", "[data-speaker-name]"];
-  const textSelectors = [".ygicle", ".VbkSUe", "[data-caption-text]"];
+  const textSelectors = [".ygicle", ".VbkSUe", ".bh44bd", "[data-caption-text]"];
   if (!name) {
     for (const selector of nameSelectors) {
       let el = null;
@@ -276,7 +276,7 @@ function readCaptionBlock(block) {
 function blocksIn(root) {
   let blocks = [];
   try {
-    blocks = Array.from(root.querySelectorAll(".nMcdL"));
+    blocks = Array.from(root.querySelectorAll(".nMcdL, .TBMuR"));
   } catch (err) {
     blocks = [];
   }
@@ -334,6 +334,47 @@ function collectCaptions() {
     return found.slice(found.length - 6);
   }
   return found;
+}
+
+const lastCaptionText = {};
+
+function activeCaptionSpeaker(captions) {
+  // The row Meet is updating is the person talking. A single visible row is
+  // that person too. Several stable rows: the last one is the live line.
+  if (!captions || !captions.length) {
+    return "";
+  }
+  const changed = [];
+  for (const row of captions) {
+    if (!row || !row.speaker) {
+      continue;
+    }
+    if (lastCaptionText[row.speaker] !== row.text) {
+      changed.push(row.speaker);
+    }
+  }
+  const still = {};
+  for (const row of captions) {
+    if (row && row.speaker) {
+      still[row.speaker] = row.text || "";
+    }
+  }
+  for (const key of Object.keys(lastCaptionText)) {
+    if (!Object.prototype.hasOwnProperty.call(still, key)) {
+      delete lastCaptionText[key];
+    }
+  }
+  for (const key of Object.keys(still)) {
+    lastCaptionText[key] = still[key];
+  }
+  if (changed.length === 1) {
+    return changed[0];
+  }
+  if (captions.length === 1 && captions[0] && captions[0].speaker) {
+    return captions[0].speaker;
+  }
+  const last = captions[captions.length - 1];
+  return (last && last.speaker) || "";
 }
 
 function selfIdentity() {
@@ -429,12 +470,19 @@ function collect() {
   } catch (err) {
     captions = [];
   }
+  let captionSpeaker = "";
+  try {
+    captionSpeaker = activeCaptionSpeaker(captions);
+  } catch (err) {
+    captionSpeaker = "";
+  }
   return {
     inCall: byId.size > 0 || Boolean(self.name),
     active,
     participants,
     self: self.name || "",
     captions,
+    captionSpeaker,
   };
 }
 
@@ -455,6 +503,7 @@ function sample() {
     active: snapshot.active,
     participants: snapshot.participants,
     self: snapshot.self,
+    caption_speaker: snapshot.captionSpeaker || "",
   };
   if (snapshot.captions && snapshot.captions.length) {
     payload.captions = snapshot.captions;

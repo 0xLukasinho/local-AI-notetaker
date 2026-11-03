@@ -103,6 +103,22 @@ def test_samples_queued_before_audio_start_share_that_clock(tmp_path):
     assert events[0]["active"] == ["Ada Lovelace"]
 
 
+def test_bridge_warns_once_when_captions_stay_off(tmp_path, capsys):
+    path = tmp_path / "speakers.jsonl"
+    bridge = SpeakerBridge(str(path), port=0, clock=lambda: 10.0)
+    bridge.mark_audio_start()
+    for _index in range(7):
+        bridge.record({"active": ["Ada Lovelace"], "participants": ["Ada Lovelace"]})
+    assert "Press CC" not in capsys.readouterr().out
+    bridge.record({"active": ["Ada Lovelace"], "participants": ["Ada Lovelace"]})
+    assert "Press CC" in capsys.readouterr().out
+    bridge.record({"caption_speaker": "Ada Lovelace", "active": ["Ada Lovelace"]})
+    assert capsys.readouterr().out == ""
+    events = load_speaker_events(str(path))
+    assert events[0]["caption_speaker"] == ""
+    assert events[-1]["caption_speaker"] == "Ada Lovelace"
+
+
 def test_speakers_command_prints_the_one_time_chrome_steps(tmp_path, monkeypatch, capsys):
     import meeting_notes.cli as cli
 

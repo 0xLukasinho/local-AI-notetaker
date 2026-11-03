@@ -33,12 +33,6 @@ cuda = [
 app = [
     "PySide6",
 ]
-# Built-in voice clustering. Heavier models (resemblyzer, speechbrain,
-# pyannote) are optional and documented in the README; they are not installed
-# by default because they download PyTorch.
-diarize = [
-    "numpy",
-]
 dev = [
     "pytest",
 ]

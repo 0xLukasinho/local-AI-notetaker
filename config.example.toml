@@ -66,15 +66,17 @@ speaker_labels = true
 # `meeting-notes speakers` copies that port into the extension folder.
 speaker_bridge_port = 8765
 
-# Split the remote mix into separate voices when two or more other people are
-# on the call. A two-person call is unchanged: the one remote name is used.
-# off / false keeps Meet tiles and captions only.
-diarize_remote = true
+# Leave this false. Remote speakers are named from Meet live captions
+# (press CC; only you see them), then from a single active tile.
+# true also tries to split the remote mix by voice. That needs extra
+# packages (numpy, and optionally resemblyzer / speechbrain / pyannote)
+# and is not part of the normal install.
+diarize = false
 
-# auto: pyannote if hf_token or HF_TOKEN is set and pyannote is installed,
-# otherwise speechbrain, otherwise resemblyzer, otherwise the built-in
-# numpy clusterer (no download). Also: builtin, speechbrain, resemblyzer,
-# pyannote, off.
+# Used only when diarize is true. auto: pyannote if hf_token or HF_TOKEN is
+# set and pyannote is installed, otherwise speechbrain, otherwise resemblyzer,
+# otherwise a built-in numpy clusterer. Also: builtin, speechbrain,
+# resemblyzer, pyannote, off.
 diarize_backend = "auto"
 
 # Hint for pyannote. Voices that still sound different are not merged to fit.
