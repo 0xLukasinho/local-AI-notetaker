@@ -51,10 +51,16 @@ Each meeting creates a folder in `~/meeting-notes/`:
 ```
 ~/meeting-notes/
   2026-02-19_weekly-standup/
-    audio.wav         # Raw audio recording
-    transcript.txt    # Timestamped transcript
+    audio.wav         # Mixed microphone + system audio
+    audio-self.wav    # Microphone only (Windows, speaker labels on)
+    audio-others.wav  # Other participants only (Windows, speaker labels on)
+    speakers.jsonl    # Meet names captured during the call, when the extension is loaded
+    transcript.txt    # [MM:SS] Name: text
+    transcript.json   # segments: start, end, speaker, text
     notes.md          # Structured notes (auto-copied to clipboard)
 ```
+
+`audio-self.wav`, `audio-others.wav`, `speakers.jsonl`, and `transcript.json` are written when speaker labels are on. Set `speaker_labels = false` to keep a single `audio.wav` and unlabeled `[MM:SS] text` lines. See [Speaker names](#speaker-names).
 
 ## Installation
 
@@ -147,7 +153,7 @@ The session folder gets `audio-devices.log` with the microphone, each loopback (
 
 Manual use is unchanged. `meeting-notes start "Name"`, `reprocess`, `list`, the tray app, Ctrl+C, and the Ctrl+Alt+Q hotkey behave as before when you do not pass the flags below and you do not set `transcript_only` in the config file. Sessions still land in `~/meeting-notes/YYYY-MM-DD_slug`. The default path still transcribes locally and summarizes with `claude -p`.
 
-What changed for every session, including a manual one, is additive: each folder gets a `status.json` (`recording`, `transcribing`, `done`, or `failed`, plus timestamps, pid, mode, and error), and `transcript.txt` is replaced atomically so a reader never sees a partial file. The transcript lines are still `[MM:SS] text`. A manual `start` will not overwrite an existing `transcript.txt`; pick another name or use `reprocess`.
+What changed for every session, including a manual one, is additive: each folder gets a `status.json` (`recording`, `transcribing`, `done`, or `failed`, plus timestamps, pid, mode, and error), and `transcript.txt` is replaced atomically so a reader never sees a partial file. With the default `speaker_labels = true` on Windows, lines are `[MM:SS] Name: text`. `speaker_labels = false` keeps `[MM:SS] text`. A manual `start` will not overwrite an existing `transcript.txt`; pick another name or use `reprocess`.
 
 ### Transcript-only mode
 
@@ -204,11 +210,54 @@ Logs rotate at `~/.meeting-notes/watch.log`.
 
 `joined_at` is when the join debounce confirms and recording starts. `left_at` is when recording stops (the leave debounce has already elapsed). `duration_seconds` is that interval.
 
+### Speaker names
+
+On Windows the recorder writes three files that share one clock: `audio.wav` (the mix, unchanged), `audio-self.wav` (microphone), and `audio-others.wav` (every WASAPI loopback, summed). Whisper runs on the microphone and on the loopback separately. Microphone lines use `self_name` (default `You`). Loopback lines are other people.
+
+Real names come from Google Meet's active-speaker indicator and the participant display names. A small unpacked Chrome extension reads those from the Meet tab and POSTs them to `127.0.0.1` only while a recording is running. Nothing is injected into the page, so other participants cannot see it. There is no meeting bot and no Meet API.
+
+```bash
+meeting-notes speakers
+```
+
+That copies the extension to `~/.meeting-notes/chrome-extension` with `speaker_bridge_port` (default 8765) baked in, and prints the steps. In Chrome, once:
+
+1. Open `chrome://extensions`
+2. Turn on Developer mode
+3. Load unpacked and choose that folder
+
+Reload the extension if you change the port and run `meeting-notes speakers` again. `meeting-notes speakers --path` prints the folder only.
+
+Without the extension, or when Meet's page structure no longer matches, recording still works. Your lines stay `self_name`. Everyone else is `Them`. If Meet exposes a stable anonymous id but no display name, those become `Speaker A`, `Speaker B`, and so on. The default `self_name` of `You` is replaced by your Meet display name when the extension reports it. Set `self_name` to a real name to keep that label instead.
+
+`transcript.txt` lines look like:
+
+```
+[00:12] Alex Chen: I can take the action item
+[00:18] Ada Lovelace: I will send the deck
+```
+
+`transcript.json` has `self_name`, `participants`, `speaker_source` (`meet`, `tracks`, `diarized`, or `mix`), `limits`, and `segments` (`start`, `end`, `speaker`, `text`, `track`). The webhook keeps every existing field and adds `self_name`, `participants`, `speaker_source`, and `speakers` (`start`, `end`, `speaker`, `text`). `speakers` is split across the same chunks as the transcript lines. `participants` and `self_name` are repeated on every chunk.
+
+Limits, also stored on `transcript.json`:
+
+- Other people in the room with you are on the microphone, so they get `self_name`.
+- Remote audio is one mix. Two people talking at once are not separated inside that mix. The line is named for whoever Meet highlighted, or `Ada / Grace` when neither one dominates the interval.
+- A conference-room speakerphone is a single Meet name.
+- Names are only as good as the Meet tab the extension can see. A background Meet tab, or a Meet UI change, falls back to `Them` or `Speaker A` / `Speaker B`.
+- Loudspeakers can leak remote voices into the microphone. When the wording matches, the named remote line is kept. Headphones avoid that.
+
+macOS still records one device. Speaker labels there are applied only when `speakers.jsonl` exists; otherwise the transcript stays unlabeled. The watcher itself is Windows-only.
+
+`meeting-notes start`, `stop`, Ctrl+C, Ctrl+Alt+Q, the tray app, and `meeting-notes watch` are unchanged. The watcher does not require the extension.
+
 ### Delivery
 
 When a watcher session finishes, the watcher POSTs JSON:
 
 `folder_name`, `folder_path`, `meet_code`, `window_title`, `joined_at`, `left_at`, `duration_seconds`, `whisper_model`, `language`, `transcript`, `chunk_index`, `chunk_count`, `transcript_sha256`, `transcript_chars`.
+
+When the session has `transcript.json`, each body also has `self_name`, `participants`, and `speaker_source`. `speakers` is the segment list for the lines in that body's `transcript` (same order). Older sessions without `transcript.json` omit those fields, so an existing consumer keeps working.
 
 `transcript` in each request is one piece of the file. `chunk_index` starts at 0. `chunk_count` is how many requests make up this delivery. `transcript_sha256` (SHA-256 of the UTF-8 file) and `transcript_chars` describe the **full** transcript and are the same on every piece. Concatenate `transcript` in `chunk_index` order. A short transcript is a single request (`chunk_count` 1) whose `transcript` is the whole file.
 
@@ -243,6 +292,9 @@ Copy `config.example.toml` to `~/.meeting-notes/config.toml`, or use `config.jso
 | `mic_process_marker` | `chrome.exe` | Substring matched against the process using the microphone (registry subkey and WASAPI capture session). |
 | `whisper_model` | `medium` | Whisper size for watcher sessions. |
 | `language` | `en` | Language forced for watcher sessions. |
+| `self_name` | `You` | Label for the microphone. `You` is replaced by the Meet display name when the extension reports one. |
+| `speaker_labels` | `true` | `false` keeps unlabeled `[MM:SS] text` and skips the separate tracks. |
+| `speaker_bridge_port` | `8765` | Loopback port for the optional Meet extension. |
 
 ### Autostart
 
@@ -261,6 +313,7 @@ meeting-notes watch --uninstall
 - Audio recording and Whisper transcription run entirely on your machine
 - The transcript text is sent to Claude via the Claude Code CLI for note generation — this is the only network call on the default `start` / `reprocess` path
 - Transcript-only mode and the Meet watcher do not call Claude. If `webhook_url` is set, the watcher POSTs the transcript to that URL after the session finishes
+- The optional Chrome extension sends participant names to `127.0.0.1` on this computer only. It does not join the call or change what other people see
 - All files (audio, transcript, notes) are stored locally in `~/meeting-notes/`
 - No API key is stored; authentication is whatever your Claude Code login is. Webhook credentials live only in `~/.meeting-notes/config.toml` or the `MEETING_NOTES_WEBHOOK_*` environment variables
 
@@ -275,6 +328,9 @@ Install Claude Code from [claude.com/code](https://claude.com/code), then run `c
 **"No audio was recorded"**
 On macOS, check that microphone permission is granted and run `ffmpeg -f avfoundation -list_devices true -i ""` to see available devices.
 On Windows, check that a playback device and a default microphone are enabled in *Settings → System → Sound*. The session's `audio-devices.log` lists the devices the recorder actually opened.
+
+**Action items are attributed to the wrong person**
+Open the session's `transcript.json` and check `speaker_source`. `tracks` means the extension never reached the bridge: remote lines say `Them`, and your lines say `self_name`. Confirm `meeting-notes speakers` was loaded in Chrome, the Meet tab was in that window, and `speakers.jsonl` grew during the call. `meet` means names were aligned from Meet. Two people talking at the same time can still share a line or be named for the person Meet highlighted. Someone sitting next to you is on the microphone track.
 
 **Transcript contains only your own voice**
 System audio is a WASAPI loopback per playback device. The recorder follows devices that appear, disappear, or become the default during the call, and it also records a device that is not the default (so Meet can play on headphones while speakers stay the Windows default). `audio-devices.log` and `watch.log` (`recorder:` lines) should show the headphones or speakers you were listening through, and a `default output switched` line when that changes. `system audio silent for 60s while the microphone is active` means those loopbacks heard nothing while you were speaking; the recorder reopens them and logs the open devices. Restart the watcher after updating so the next call uses this path.

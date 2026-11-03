@@ -6,7 +6,7 @@ import sys
 import threading
 from datetime import date
 
-from meeting_notes.atomic_io import atomic_write_text
+from meeting_notes.atomic_io import atomic_write_json, atomic_write_text
 from meeting_notes.autostart import autostart_status, install_autostart, uninstall_autostart
 from meeting_notes.config import Config, ConfigError, load_config
 from meeting_notes.deliver import DeliveryError, deliver_folder
@@ -157,13 +157,16 @@ def _maybe_delete_audio(audio_path, notes_path, keep_audio):
         return
     if not os.path.exists(notes_path) or os.path.getsize(notes_path) == 0:
         return
-    if not os.path.exists(audio_path):
-        return
-    try:
-        os.remove(audio_path)
-        print(f"Audio file deleted: {audio_path}")
-    except OSError as e:
-        print(f"Warning: could not delete audio file: {e}", file=sys.stderr)
+    folder = os.path.dirname(audio_path)
+    for name in ("audio.wav", "audio-self.wav", "audio-others.wav"):
+        path = os.path.join(folder, name)
+        if not os.path.exists(path):
+            continue
+        try:
+            os.remove(path)
+            print(f"Audio file deleted: {path}")
+        except OSError as e:
+            print(f"Warning: could not delete audio file: {e}", file=sys.stderr)
 
 
 def _load_config_lenient():
@@ -180,6 +183,91 @@ def _load_config_lenient():
             file=sys.stderr,
         )
         return Config()
+
+
+def _begin_recording(audio_path, separate_tracks):
+    """Windows can write microphone and loopback as their own files.
+
+    Other platforms, and test doubles that only accept a path, keep the
+    single mixed recording.
+    """
+    if separate_tracks and sys.platform == "win32":
+        return record_audio(audio_path, separate_tracks=True)
+    return record_audio(audio_path)
+
+
+def _start_speaker_bridge(meeting_dir, config):
+    """Listen for the Meet extension while this recording is running."""
+    if not getattr(config, "speaker_labels", False) or sys.platform != "win32":
+        return None
+    from meeting_notes.speaker_bridge import SpeakerBridge
+
+    bridge = SpeakerBridge(
+        os.path.join(meeting_dir, "speakers.jsonl"),
+        port=getattr(config, "speaker_bridge_port", 8765),
+    )
+    try:
+        bridge.start()
+    except OSError as exc:
+        print(
+            f"Speaker bridge not started ({exc}). Remote speakers will be labeled Them.",
+            file=sys.stderr,
+        )
+        return None
+    print(
+        f"Speaker bridge: 127.0.0.1:{bridge.bound_port} "
+        "(optional Chrome extension; without it, other people are labeled Them)"
+    )
+    return bridge
+
+
+def _stop_speaker_bridge(bridge):
+    if bridge is None:
+        return
+    try:
+        bridge.stop()
+    except Exception:
+        pass
+
+
+def _write_transcript(meeting_dir, config, whisper_model, language):
+    """Transcribe and, when speaker labels are possible, name each line."""
+    from meeting_notes.speakers import TRANSCRIPT_JSON, produce_transcript
+    from meeting_notes.transcriber import transcribe_paths
+
+    def plain(path):
+        return transcribe(path, model_size=whisper_model, language=language)
+
+    def many(paths):
+        return transcribe_paths(
+            paths,
+            model_size=whisper_model,
+            language=language,
+            word_timestamps=True,
+        )
+
+    text, document = produce_transcript(
+        meeting_dir,
+        self_name=getattr(config, "self_name", "You"),
+        enabled=bool(getattr(config, "speaker_labels", True)),
+        transcribe_plain=plain,
+        transcribe_paths=many,
+    )
+    atomic_write_text(session_transcript_path(meeting_dir), text)
+    if document is not None:
+        atomic_write_json(os.path.join(meeting_dir, TRANSCRIPT_JSON), document)
+        names = ", ".join(document.get("participants") or [])
+        source = document.get("speaker_source") or "tracks"
+        print(f"Speakers ({source}): {names}")
+        update_status(
+            meeting_dir,
+            {
+                "self_name": document.get("self_name"),
+                "speaker_source": source,
+                "participants": document.get("participants") or [],
+            },
+        )
+    return text
 
 
 def _wants_transcript_only(args, config):
@@ -307,13 +395,17 @@ def cmd_start(args):
 
     stop_event = None
     handle = None
+    bridge = None
     try:
         stop_event = _install_stop_signal()
+        bridge = _start_speaker_bridge(meeting_dir, config)
         try:
-            handle = record_audio(audio_path)
+            handle = _begin_recording(audio_path, bool(config.speaker_labels))
         except SystemExit:
             _mark_failed(meeting_dir, "recording failed to start")
             raise
+        if bridge is not None:
+            bridge.mark_audio_start()
 
         try:
             _wait_for_stop(
@@ -328,6 +420,8 @@ def cmd_start(args):
                 except Exception as e:
                     print(f"Recorder error: {e}", file=sys.stderr)
             _release_hotkey()
+            _stop_speaker_bridge(bridge)
+            bridge = None
 
         if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
             _mark_failed(meeting_dir, "No audio was recorded")
@@ -349,9 +443,7 @@ def cmd_start(args):
             },
         )
         print("\n--- Transcription ---")
-        transcript = transcribe(audio_path, model_size=whisper_model, language=language)
-
-        atomic_write_text(transcript_file, transcript)
+        transcript = _write_transcript(meeting_dir, config, whisper_model, language)
         print(f"Transcript saved: {transcript_file}")
 
         if transcript_only:
@@ -397,6 +489,7 @@ def cmd_start(args):
         _mark_failed(meeting_dir, f"{type(exc).__name__}: {exc}")
         raise
     finally:
+        _stop_speaker_bridge(bridge)
         if stop_event is not None:
             _restore_stop_signals(stop_event)
         clear_active(CONTROL_DIR, pid=os.getpid())
@@ -465,8 +558,7 @@ def cmd_reprocess(args):
                 "transcript_only": True,
             },
         )
-        transcript = transcribe(audio_path, model_size=whisper_model, language=language)
-        atomic_write_text(transcript_file, transcript)
+        transcript = _write_transcript(meeting_dir, config, whisper_model, language)
         print(f"Transcript saved: {transcript_file}")
         print("Transcript-only mode: skipping note generation.")
         update_status(
@@ -488,9 +580,7 @@ def cmd_reprocess(args):
         print(f"Reprocessing: {meeting_name}")
 
         print("\n--- Transcription ---")
-        transcript = transcribe(audio_path, model_size=whisper_model, language=language)
-
-        atomic_write_text(transcript_file, transcript)
+        transcript = _write_transcript(meeting_dir, config, whisper_model, language)
         print(f"Transcript saved: {transcript_file}")
 
         print("\n--- Note Generation ---")
@@ -626,6 +716,38 @@ def _print_watch_status():
         print("Watcher process: not running")
     print(f"Config: {config_path} ({'found' if found else 'not found, using defaults'})")
     print(f"Log: {os.path.join(CONTROL_DIR, 'watch.log')}")
+
+
+def cmd_speakers(args):
+    """Copy the unpacked Meet extension and print the one-time Chrome steps."""
+    from meeting_notes.extension_install import install_extension
+
+    config = _load_config_lenient()
+    try:
+        folder = install_extension(CONTROL_DIR, config.speaker_bridge_port)
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    if args.path:
+        print(folder)
+        return
+    print(f"Copied the Meet speaker extension to:\n  {folder}\n")
+    print("One-time setup in Chrome:")
+    print("  1. Open chrome://extensions")
+    print("  2. Turn on Developer mode")
+    print("  3. Click Load unpacked")
+    print("  4. Choose the folder above")
+    print()
+    print(
+        "The extension reads participant names on meet.google.com and sends them"
+    )
+    print(
+        f"to 127.0.0.1:{config.speaker_bridge_port} on this computer while a recording"
+    )
+    print("is running. Other people in the call cannot see it.")
+    print("Run this command again after you change speaker_bridge_port, then click")
+    print("Reload on the extension.")
+    print("Recording works without the extension: you are self_name, everyone else is Them.")
 
 
 def cmd_watch(args):
@@ -806,6 +928,17 @@ def build_parser():
         help="Show autostart and whether the watcher process is running",
     )
     watch_parser.set_defaults(func=cmd_watch)
+
+    speakers_parser = subparsers.add_parser(
+        "speakers",
+        help="Install the Chrome extension that reads Google Meet speaker names",
+    )
+    speakers_parser.add_argument(
+        "--path",
+        action="store_true",
+        help="Print the extension folder and do not print the setup steps",
+    )
+    speakers_parser.set_defaults(func=cmd_speakers)
 
     return parser
 

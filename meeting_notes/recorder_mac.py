@@ -23,12 +23,14 @@ def list_audio_devices():
     return result.stderr
 
 
-def record_audio(output_path, device_index="1"):
+def record_audio(output_path, device_index="1", separate_tracks=False):
     """Start recording audio via ffmpeg AVFoundation.
 
     Returns the running ffmpeg subprocess.Popen, which is treated as an
-    opaque "handle" by the CLI.
+    opaque "handle" by the CLI. `separate_tracks` matches the Windows recorder
+    signature. This backend captures one device, so the flag is ignored.
     """
+    del separate_tracks
     check_ffmpeg()
 
     cmd = [

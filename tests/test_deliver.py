@@ -66,6 +66,18 @@ def test_payload_fields_and_duration(tmp_path):
     assert payload["whisper_model"] == "medium"
     assert payload["language"] == "en"
     assert payload["transcript"] == "[00:01] hello\n[00:02] world"
+    assert set(payload) == {
+        "folder_name",
+        "folder_path",
+        "meet_code",
+        "window_title",
+        "joined_at",
+        "left_at",
+        "duration_seconds",
+        "whisper_model",
+        "language",
+        "transcript",
+    }
 
 
 def test_post_retries_with_backoff_then_succeeds():
@@ -379,6 +391,62 @@ def test_zero_body_limit_sends_one_request(tmp_path):
     assert seen[0]["transcript"] == transcript
     assert seen[0]["chunk_count"] == 1
     assert seen[0]["chunk_index"] == 0
+
+
+def test_speaker_fields_are_added_and_chunked_with_their_lines(tmp_path):
+    from meeting_notes.deliver import iter_delivery_bodies
+
+    lines = [f"[00:{index:02d}] Ada: line {index} about the rollout\n" for index in range(30)]
+    transcript = "".join(lines)
+    speakers = [
+        {"start": float(index), "end": float(index) + 0.5, "speaker": "Ada Lovelace", "text": f"line {index}"}
+        for index in range(30)
+    ]
+    folder = _session(tmp_path, transcript)
+    (folder / "transcript.json").write_text(
+        json.dumps(
+            {
+                "self_name": "Alex",
+                "participants": ["Alex", "Ada Lovelace"],
+                "speaker_source": "meet",
+                "segments": speakers,
+            }
+        ),
+        encoding="utf-8",
+    )
+    payload = build_payload(read_status(str(folder)), transcript, str(folder))
+    assert payload["transcript"] == transcript
+    assert payload["self_name"] == "Alex"
+    assert payload["participants"] == ["Alex", "Ada Lovelace"]
+    assert payload["speaker_source"] == "meet"
+    assert payload["speakers"] == speakers
+    assert payload["meet_code"] == "abc-defg-hij"
+
+    seen = []
+
+    def poster(url, body, header, value, timeout):
+        raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        assert len(raw) <= 2500
+        seen.append(body)
+        return 200
+
+    ok = deliver_folder(
+        str(folder),
+        _config(webhook_max_body_bytes=2500),
+        poster=poster,
+        sleep=lambda _seconds: None,
+    )
+    assert ok is True
+    assert len(seen) > 1
+    assert "".join(item["transcript"] for item in seen) == transcript
+    flat = []
+    for item in seen:
+        assert item["participants"] == ["Alex", "Ada Lovelace"]
+        assert item["self_name"] == "Alex"
+        flat.extend(item["speakers"])
+    assert flat == speakers
+    bodies = list(iter_delivery_bodies(payload, 2500))
+    assert [item["chunk_index"] for item in bodies] == list(range(len(bodies)))
 
 
 def test_cmd_deliver_requires_a_webhook(tmp_path, monkeypatch, capsys):

@@ -32,8 +32,8 @@ def _backend():
     return backend
 
 
-def record_audio(output_path):
-    return _backend().record_audio(output_path)
+def record_audio(output_path, separate_tracks=False):
+    return _backend().record_audio(output_path, separate_tracks=separate_tracks)
 
 
 def stop_recording(handle):

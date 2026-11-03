@@ -53,6 +53,12 @@ class Config:
     # 0 sends the transcript in one POST. The default keeps each JSON body
     # under the size that was being truncated in transit (~8 KB).
     webhook_max_body_bytes: int = 6000
+    # Microphone audio is labeled self_name. Loopback audio is other people.
+    # False keeps the historical "[MM:SS] text" lines.
+    speaker_labels: bool = True
+    self_name: str = "You"
+    # Loopback port the Chrome extension posts Meet speaker samples to.
+    speaker_bridge_port: int = 8765
 
 
 _FLOAT_FIELDS = {
@@ -64,11 +70,12 @@ _FLOAT_FIELDS = {
     "delivery_backoff_seconds",
     "delivery_timeout_seconds",
 }
-_INT_FIELDS = {"delivery_attempts", "webhook_max_body_bytes"}
+_INT_FIELDS = {"delivery_attempts", "webhook_max_body_bytes", "speaker_bridge_port"}
 _BOOL_FIELDS = {
     "transcript_only",
     "watcher_transcript_only",
     "delete_audio_after_delivery",
+    "speaker_labels",
 }
 _KNOWN = {item.name for item in fields(Config)}
 
@@ -215,9 +222,15 @@ def _coerce(key, value):
             return value.strip().lower() in ("1", "true", "yes", "on")
         return bool(value)
     if key in _INT_FIELDS:
-        return int(value)
+        number = int(value)
+        if key == "speaker_bridge_port" and (number < 1 or number > 65535):
+            return 8765
+        return number
     if key in _FLOAT_FIELDS:
         return float(value)
+    if key == "self_name":
+        text = str(value).strip()
+        return text or "You"
     return str(value)
 
 

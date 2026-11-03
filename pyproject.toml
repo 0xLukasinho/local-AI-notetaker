@@ -37,6 +37,9 @@ dev = [
     "pytest",
 ]
 
+[tool.setuptools.package-data]
+meeting_notes = ["chrome_extension/*"]
+
 [project.scripts]
 meeting-notes = "meeting_notes.cli:main"
 

@@ -21,6 +21,7 @@ from meeting_notes.session import (
     transcript_path,
     update_status,
 )
+from meeting_notes.speakers import speaker_webhook_fields
 
 
 class DeliveryError(Exception):
@@ -32,7 +33,7 @@ def build_payload(status, transcript, folder):
     folder = os.path.abspath(folder)
     joined = status.get("joined_at")
     left = status.get("left_at") or status.get("recording_stopped_at") or status.get("finished_at")
-    return {
+    payload = {
         "folder_name": os.path.basename(folder),
         "folder_path": folder,
         "meet_code": status.get("meet_code"),
@@ -44,6 +45,8 @@ def build_payload(status, transcript, folder):
         "language": status.get("language"),
         "transcript": transcript,
     }
+    payload.update(speaker_webhook_fields(folder))
+    return payload
 
 
 # One JSON body stays under a typical 8 KB first-read / field limit. Two calls
@@ -122,19 +125,89 @@ def _largest_fitting_prefix(text, fits):
     return best
 
 
-def _estimate_body_bytes(payload, piece, total_chars, digest):
+def _estimate_body_bytes(payload, piece, total_chars, digest, speakers=None):
     """Upper bound on the JSON body size for this transcript piece.
 
     Chunk indexes are estimated with three digits so the real body (smaller
-    indexes) cannot grow past a piece that passed this check.
+    indexes) cannot grow past a piece that passed this check. `speakers`, when
+    given, is the slice that belongs to this piece rather than the full list.
     """
     trial = dict(payload)
+    trial.pop("speakers", None)
+    trial.pop("speakers_omitted", None)
     trial["transcript"] = piece
     trial["chunk_index"] = 999
     trial["chunk_count"] = 999
     trial["transcript_sha256"] = digest
     trial["transcript_chars"] = total_chars
+    if speakers is not None:
+        trial["speakers"] = speakers
     return len(json.dumps(trial, ensure_ascii=False).encode("utf-8"))
+
+
+def _transcript_lines(text):
+    """Split `text` into lines, keeping the newline on each line that has one."""
+    if text == "":
+        return []
+    lines = []
+    start = 0
+    for index, char in enumerate(text):
+        if char == "\n":
+            lines.append(text[start : index + 1])
+            start = index + 1
+    if start < len(text):
+        lines.append(text[start:])
+    return lines
+
+
+def _pack_transcript_lines(lines, speakers, fits):
+    """Pack whole lines. A line that cannot fit is split, and its speaker
+    stays on the first fragment.
+    """
+    parts = []
+    buf = []
+    buf_speakers = []
+
+    def flush():
+        if not buf:
+            return
+        parts.append(("".join(buf), list(buf_speakers)))
+        buf.clear()
+        buf_speakers.clear()
+
+    for line, speaker in zip(lines, speakers):
+        if buf:
+            trial = "".join(buf) + line
+            if not fits(trial, buf_speakers + [speaker]):
+                flush()
+        if fits(line, [speaker]):
+            buf.append(line)
+            buf_speakers.append(speaker)
+            continue
+        flush()
+        parts.extend(_split_oversized_line(line, speaker, fits))
+    flush()
+    if not parts:
+        parts.append(("", list(speakers) if speakers else []))
+    return parts
+
+
+def _split_oversized_line(line, speaker, fits):
+    pieces = []
+    rest = line
+    first = True
+    while rest:
+        attached = [speaker] if first else []
+        if fits(rest, attached):
+            pieces.append((rest, attached))
+            break
+        take = _largest_fitting_prefix(rest, lambda piece: fits(piece, attached))
+        if take < 1:
+            take = 1
+        pieces.append((rest[:take], attached))
+        rest = rest[take:]
+        first = False
+    return pieces
 
 
 def iter_delivery_bodies(payload, max_body_bytes):
@@ -143,24 +216,55 @@ def iter_delivery_bodies(payload, max_body_bytes):
     ``chunk_index`` / ``chunk_count`` put the piece back in order.
     ``transcript_sha256`` and ``transcript_chars`` describe the full transcript.
     A transcript that already fits is one body with ``chunk_count`` 1.
+
+    When ``speakers`` has one entry per transcript line, each body gets only
+    the speakers for its lines so a long meeting still fits the body budget.
     """
+    payload = dict(payload)
+    speakers = payload.pop("speakers", None)
     text = payload.get("transcript")
     if not isinstance(text, str):
         text = "" if text is None else str(text)
+        payload["transcript"] = text
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
     total_chars = len(text)
+    lines = _transcript_lines(text)
+    aligned = isinstance(speakers, list) and len(lines) > 0 and len(speakers) == len(lines)
 
-    def fits(piece):
-        return _estimate_body_bytes(payload, piece, total_chars, digest) <= max_body_bytes
+    def fits(piece, speaker_slice):
+        if max_body_bytes is None:
+            return True
+        return (
+            _estimate_body_bytes(payload, piece, total_chars, digest, speakers=speaker_slice)
+            <= max_body_bytes
+        )
 
     if max_body_bytes is None:
-        parts = [text]
+        body = dict(payload)
+        body["transcript"] = text
+        if isinstance(speakers, list):
+            body["speakers"] = speakers
+        body["chunk_index"] = 0
+        body["chunk_count"] = 1
+        body["transcript_sha256"] = digest
+        body["transcript_chars"] = total_chars
+        yield body
+        return
+
+    if aligned:
+        parts = _pack_transcript_lines(lines, speakers, fits)
     else:
-        parts = split_transcript_to_fit(text, fits)
+        if isinstance(speakers, list) and speakers:
+            payload["speakers_omitted"] = True
+        text_parts = split_transcript_to_fit(text, lambda piece: fits(piece, None))
+        parts = [(part, None) for part in text_parts]
+
     count = len(parts)
-    for index, part in enumerate(parts):
+    for index, (part, speaker_slice) in enumerate(parts):
         body = dict(payload)
         body["transcript"] = part
+        if speaker_slice is not None:
+            body["speakers"] = speaker_slice
         body["chunk_index"] = index
         body["chunk_count"] = count
         body["transcript_sha256"] = digest
@@ -350,11 +454,12 @@ def _remove_outbox_entry(directory, folder_name):
 
 
 def _delete_audio(folder):
-    path = os.path.join(folder, "audio.wav")
-    try:
-        os.remove(path)
-    except OSError:
-        pass
+    for name in ("audio.wav", "audio-self.wav", "audio-others.wav"):
+        path = os.path.join(folder, name)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 def retry_outbox(directory, config, poster=None, sleep=None, log=None):
