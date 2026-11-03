@@ -136,8 +136,19 @@ def generate_notes(transcript, meeting_name, date, model=None):
 
     if result.returncode != 0:
         print(f"Error: Claude Code exited with code {result.returncode}.", file=sys.stderr)
-        if result.stderr:
-            print(result.stderr.strip(), file=sys.stderr)
+        # claude -p reports errors (including auth failures) on stdout.
+        detail = "\n".join(
+            s.strip() for s in (result.stdout, result.stderr) if s and s.strip()
+        )
+        if detail:
+            print(detail, file=sys.stderr)
+        if re.search(r"api key|login|authentication|oauth", detail, re.IGNORECASE):
+            print(
+                "Your Claude subscription login may have expired. "
+                "Run 'claude /login' to re-authenticate, then retry with "
+                "'meeting-notes reprocess <folder> --notes-only'.",
+                file=sys.stderr,
+            )
         return None
 
     notes_body = (result.stdout or "").strip()
