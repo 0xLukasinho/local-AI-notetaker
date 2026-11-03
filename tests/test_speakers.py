@@ -2,8 +2,11 @@
 
 import array
 import json
+import os
 import sys
 import wave
+
+import pytest
 
 from meeting_notes.speakers import (
     THEM,
@@ -30,7 +33,15 @@ def _wav(path, amplitude, n=1600):
         handle.writeframes(frames.tobytes())
 
 
-def _event(t, active=None, participants=None, self_name="", self_active=False, active_ids=None):
+def _event(
+    t,
+    active=None,
+    participants=None,
+    self_name="",
+    self_active=False,
+    active_ids=None,
+    captions=None,
+):
     body = {
         "t": t,
         "active": active or [],
@@ -40,6 +51,8 @@ def _event(t, active=None, participants=None, self_name="", self_active=False, a
     }
     if active_ids:
         body["active_ids"] = active_ids
+    if captions:
+        body["captions"] = captions
     return coerce_event(body)
 
 
@@ -327,7 +340,437 @@ def test_labels_off_keeps_the_plain_transcript(tmp_path):
     assert document is None
 
 
+def test_meet_dom_heuristic_and_captions():
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not installed")
+    script = os.path.join(os.path.dirname(__file__), "meet_dom_check.js")
+    result = subprocess.run([node, script], capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_gap_in_speaker_samples_falls_back_to_them():
     events = [_event(0.0, active=["Ada Lovelace"])]
     assert speaker_for_interval(10.0, 12.0, events) == THEM
     assert speaker_for_interval(0.2, 1.0, events) == "Ada Lovelace"
+
+
+def _both_active(moment):
+    return _event(
+        moment,
+        active=["Daniel Bronheim", "Mahmoud Lababidi"],
+        participants=["Lukas", "Daniel Bronheim", "Mahmoud Lababidi"],
+        self_name="Lukas",
+    )
+
+
+def test_three_voices_are_not_merged_when_tiles_flag_everyone():
+    events = [_both_active(moment) for moment in (0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5)]
+    voices = [
+        {"start": 0.0, "end": 1.8, "cluster": "0"},
+        {"start": 2.0, "end": 3.8, "cluster": "1"},
+    ]
+    labeled = align_tracks(
+        [],
+        [
+            {
+                "start": 0.1,
+                "end": 1.6,
+                "text": "budget approved",
+                "words": [
+                    {"start": 0.1, "end": 0.6, "text": "budget"},
+                    {"start": 0.8, "end": 1.5, "text": "approved"},
+                ],
+            },
+            {
+                "start": 2.1,
+                "end": 3.4,
+                "text": "timeline friday",
+                "words": [
+                    {"start": 2.1, "end": 2.6, "text": "timeline"},
+                    {"start": 2.8, "end": 3.3, "text": "friday"},
+                ],
+            },
+        ],
+        events,
+        "Lukas",
+        voice_segments=voices,
+    )
+    speakers = [item["speaker"] for item in labeled]
+    assert speakers == ["Speaker 2", "Speaker 3"]
+    assert all(" / " not in speaker for speaker in speakers)
+    assert [item["text"] for item in labeled] == ["budget approved", "timeline friday"]
+
+
+def test_captions_name_voice_clusters():
+    events = [
+        _event(
+            0.2,
+            active=["Daniel Bronheim", "Mahmoud Lababidi"],
+            participants=["Lukas", "Daniel Bronheim", "Mahmoud Lababidi"],
+            self_name="Lukas",
+            captions=[{"speaker": "Daniel Bronheim", "text": "budget"}],
+        ),
+        _event(
+            1.0,
+            active=["Daniel Bronheim", "Mahmoud Lababidi"],
+            participants=["Lukas", "Daniel Bronheim", "Mahmoud Lababidi"],
+            self_name="Lukas",
+            captions=[{"speaker": "Daniel Bronheim", "text": "budget approved"}],
+        ),
+        _event(
+            2.2,
+            active=["Daniel Bronheim", "Mahmoud Lababidi"],
+            participants=["Lukas", "Daniel Bronheim", "Mahmoud Lababidi"],
+            self_name="Lukas",
+            captions=[
+                {"speaker": "Daniel Bronheim", "text": "budget approved"},
+                {"speaker": "Mahmoud Lababidi", "text": "timeline"},
+            ],
+        ),
+        _event(
+            3.1,
+            active=["Daniel Bronheim", "Mahmoud Lababidi"],
+            participants=["Lukas", "Daniel Bronheim", "Mahmoud Lababidi"],
+            self_name="Lukas",
+            captions=[
+                {"speaker": "Daniel Bronheim", "text": "budget approved"},
+                {"speaker": "Mahmoud Lababidi", "text": "timeline friday"},
+            ],
+        ),
+    ]
+    voices = [
+        {"start": 0.0, "end": 1.9, "cluster": "0"},
+        {"start": 2.1, "end": 3.8, "cluster": "1"},
+    ]
+    labeled = align_tracks(
+        [],
+        [
+            {"start": 0.2, "end": 1.6, "text": "budget approved"},
+            {"start": 2.3, "end": 3.4, "text": "timeline friday"},
+        ],
+        events,
+        "Lukas",
+        voice_segments=voices,
+    )
+    assert [(item["speaker"], item["text"]) for item in labeled] == [
+        ("Daniel Bronheim", "budget approved"),
+        ("Mahmoud Lababidi", "timeline friday"),
+    ]
+
+
+def test_exclusive_tiles_name_voice_clusters():
+    events = []
+    events += _hold(
+        0.0,
+        2.0,
+        0.4,
+        active=["Daniel Bronheim"],
+        participants=["Lukas", "Daniel Bronheim", "Mahmoud Lababidi"],
+        self_name="Lukas",
+    )
+    events += _hold(
+        2.0,
+        4.0,
+        0.4,
+        active=["Mahmoud Lababidi"],
+        participants=["Lukas", "Daniel Bronheim", "Mahmoud Lababidi"],
+        self_name="Lukas",
+    )
+    voices = [
+        {"start": 0.0, "end": 1.8, "cluster": "0"},
+        {"start": 2.1, "end": 3.8, "cluster": "1"},
+    ]
+    labeled = align_tracks(
+        [],
+        [
+            {"start": 0.2, "end": 1.5, "text": "from daniel"},
+            {"start": 2.2, "end": 3.5, "text": "from mahmoud"},
+        ],
+        events,
+        "Lukas",
+        voice_segments=voices,
+    )
+    assert [item["speaker"] for item in labeled] == ["Daniel Bronheim", "Mahmoud Lababidi"]
+
+
+def test_captions_label_words_when_diarization_is_unavailable():
+    events = [
+        _event(
+            0.0,
+            active=["Daniel Bronheim", "Mahmoud Lababidi"],
+            participants=["Lukas", "Daniel Bronheim", "Mahmoud Lababidi"],
+            self_name="Lukas",
+            captions=[{"speaker": "Daniel Bronheim", "text": "ship"}],
+        ),
+        _event(
+            1.2,
+            active=["Daniel Bronheim", "Mahmoud Lababidi"],
+            participants=["Lukas", "Daniel Bronheim", "Mahmoud Lababidi"],
+            self_name="Lukas",
+            captions=[{"speaker": "Daniel Bronheim", "text": "ship friday"}],
+        ),
+        _event(
+            2.6,
+            active=["Daniel Bronheim", "Mahmoud Lababidi"],
+            participants=["Lukas", "Daniel Bronheim", "Mahmoud Lababidi"],
+            self_name="Lukas",
+            captions=[{"speaker": "Mahmoud Lababidi", "text": "agreed"}],
+        ),
+        _event(
+            3.6,
+            active=["Daniel Bronheim", "Mahmoud Lababidi"],
+            participants=["Lukas", "Daniel Bronheim", "Mahmoud Lababidi"],
+            self_name="Lukas",
+            captions=[{"speaker": "Mahmoud Lababidi", "text": "agreed today"}],
+        ),
+    ]
+    labeled = align_tracks(
+        [],
+        [
+            {
+                "start": 0.1,
+                "end": 3.8,
+                "text": "ship friday agreed today",
+                "words": [
+                    {"start": 0.2, "end": 0.7, "text": "ship"},
+                    {"start": 0.9, "end": 1.6, "text": "friday"},
+                    {"start": 2.7, "end": 3.2, "text": "agreed"},
+                    {"start": 3.3, "end": 3.8, "text": "today"},
+                ],
+            }
+        ],
+        events,
+        "Lukas",
+    )
+    assert [(item["speaker"], item["text"]) for item in labeled] == [
+        ("Daniel Bronheim", "ship friday"),
+        ("Mahmoud Lababidi", "agreed today"),
+    ]
+    assert all(" / " not in item["speaker"] for item in labeled)
+
+
+def test_crosstalk_keeps_whole_turns_and_short_interjections():
+    events = _hold(
+        0.0,
+        4.0,
+        0.5,
+        active=["Mahmoud Lababidi"],
+        participants=["Lukas", "Mahmoud Lababidi", "Daniel Bronheim"],
+        self_name="Lukas",
+    )
+    labeled = align_tracks(
+        [
+            {
+                "start": 0.0,
+                "end": 2.2,
+                "text": "been working on it",
+                "words": [
+                    {"start": 0.05, "end": 0.3, "text": "been"},
+                    {"start": 0.7, "end": 1.05, "text": "working"},
+                    {"start": 1.7, "end": 2.1, "text": "on"},
+                ],
+            }
+        ],
+        [
+            {
+                "start": 0.2,
+                "end": 2.4,
+                "text": "said it already",
+                "words": [
+                    {"start": 0.35, "end": 0.6, "text": "said"},
+                    {"start": 1.1, "end": 1.4, "text": "it"},
+                    {"start": 2.15, "end": 2.4, "text": "already"},
+                ],
+            }
+        ],
+        events,
+        "Lukas",
+    )
+    assert [(item["speaker"], item["text"]) for item in labeled] == [
+        ("Lukas", "been working on"),
+        ("Mahmoud Lababidi", "said it already"),
+    ]
+
+    interjection = align_tracks(
+        [{"start": 1.15, "end": 1.45, "text": "yeah"}],
+        [
+            {
+                "start": 0.0,
+                "end": 3.2,
+                "text": "we should ship the notes friday",
+                "words": [
+                    {"start": 0.0, "end": 0.3, "text": "we"},
+                    {"start": 0.4, "end": 0.8, "text": "should"},
+                    {"start": 0.9, "end": 1.1, "text": "ship"},
+                    {"start": 1.5, "end": 1.8, "text": "the"},
+                    {"start": 1.9, "end": 2.2, "text": "notes"},
+                    {"start": 2.4, "end": 2.9, "text": "friday"},
+                ],
+            }
+        ],
+        events,
+        "Lukas",
+    )
+    assert [(item["speaker"], item["text"]) for item in interjection] == [
+        ("Mahmoud Lababidi", "we should ship the notes friday"),
+        ("Lukas", "yeah"),
+    ]
+
+
+def test_two_person_call_keeps_one_remote_name_without_the_speaking_ring():
+    events = _hold(
+        0.0,
+        3.0,
+        0.5,
+        active=[],
+        participants=["Lukas", "Daniel Bronheim"],
+        self_name="Lukas",
+    )
+    labeled = align_tracks(
+        [{"start": 0.1, "end": 0.8, "text": "hello"}],
+        [{"start": 1.0, "end": 2.2, "text": "hi Lukas"}],
+        events,
+        "Lukas",
+    )
+    assert [(item["speaker"], item["text"]) for item in labeled] == [
+        ("Lukas", "hello"),
+        ("Daniel Bronheim", "hi Lukas"),
+    ]
+
+
+def test_captions_round_trip_and_drop_garbage():
+    event = coerce_event(
+        {
+            "t": 1.5,
+            "captions": [
+                "nope",
+                {"speaker": "Ada Lovelace", "text": "ship it"},
+                {"text": "missing speaker"},
+                {"speaker": "Grace Hopper", "text": "   "},
+            ],
+        }
+    )
+    assert event["captions"] == [{"speaker": "Ada Lovelace", "text": "ship it"}]
+
+
+def test_two_person_produce_does_not_diarize_or_split(tmp_path):
+    folder = tmp_path / "session"
+    folder.mkdir()
+    _wav(folder / "audio-self.wav", 8000)
+    _wav(folder / "audio-others.wav", 8000)
+    events = _hold(
+        0.0,
+        2.0,
+        0.5,
+        active=["Daniel Bronheim"],
+        participants=["Lukas", "Daniel Bronheim"],
+        self_name="Lukas",
+    )
+    with open(folder / "speakers.jsonl", "w", encoding="utf-8") as handle:
+        for event in events:
+            handle.write(json.dumps(event) + "\n")
+
+    def diarize(_path):
+        raise AssertionError("a two-person call must not be diarized")
+
+    text, document = produce_transcript(
+        str(folder),
+        self_name="Lukas",
+        enabled=True,
+        transcribe_plain=lambda _path: "",
+        transcribe_paths=lambda paths: [
+            [{"start": 0.2, "end": 0.8, "text": "my side"}] if path.endswith("audio-self.wav") else [
+                {"start": 1.0, "end": 1.8, "text": "remote side"}
+            ]
+            for path in paths
+        ],
+        diarize=diarize,
+    )
+    assert text == "[00:00] Lukas: my side\n[00:01] Daniel Bronheim: remote side"
+    assert "diarization" not in document
+    assert document["speaker_source"] == "meet"
+
+
+def test_produce_names_three_people_from_injected_voices(tmp_path):
+    folder = tmp_path / "session"
+    folder.mkdir()
+    _wav(folder / "audio-self.wav", 8000)
+    _wav(folder / "audio-others.wav", 8000)
+    events = [
+        _event(
+            0.2,
+            active=["Daniel Bronheim", "Mahmoud Lababidi"],
+            participants=["Lukas", "Daniel Bronheim", "Mahmoud Lababidi"],
+            self_name="Lukas",
+            captions=[{"speaker": "Daniel Bronheim", "text": "alpha"}],
+        ),
+        _event(
+            1.1,
+            active=["Daniel Bronheim", "Mahmoud Lababidi"],
+            participants=["Lukas", "Daniel Bronheim", "Mahmoud Lababidi"],
+            self_name="Lukas",
+            captions=[{"speaker": "Daniel Bronheim", "text": "alpha beta"}],
+        ),
+        _event(
+            2.2,
+            active=["Daniel Bronheim", "Mahmoud Lababidi"],
+            participants=["Lukas", "Daniel Bronheim", "Mahmoud Lababidi"],
+            self_name="Lukas",
+            captions=[{"speaker": "Mahmoud Lababidi", "text": "gamma"}],
+        ),
+        _event(
+            3.0,
+            active=["Daniel Bronheim", "Mahmoud Lababidi"],
+            participants=["Lukas", "Daniel Bronheim", "Mahmoud Lababidi"],
+            self_name="Lukas",
+            captions=[{"speaker": "Mahmoud Lababidi", "text": "gamma delta"}],
+        ),
+    ]
+    with open(folder / "speakers.jsonl", "w", encoding="utf-8") as handle:
+        for event in events:
+            handle.write(json.dumps(event) + "\n")
+
+    def diarize(path):
+        assert path.endswith("audio-others.wav")
+        return {
+            "backend": "test",
+            "segments": [
+                {"start": 0.0, "end": 1.8, "cluster": "voice-a"},
+                {"start": 2.0, "end": 3.6, "cluster": "voice-b"},
+            ],
+        }
+
+    text, document = produce_transcript(
+        str(folder),
+        self_name="Lukas",
+        enabled=True,
+        transcribe_plain=lambda _path: "",
+        transcribe_paths=lambda paths: [
+            [{"start": 0.1, "end": 0.4, "text": "checking"}]
+            if path.endswith("audio-self.wav")
+            else [
+                {
+                    "start": 0.2,
+                    "end": 3.4,
+                    "text": "alpha beta gamma delta",
+                    "words": [
+                        {"start": 0.3, "end": 0.8, "text": "alpha"},
+                        {"start": 1.0, "end": 1.5, "text": "beta"},
+                        {"start": 2.2, "end": 2.7, "text": "gamma"},
+                        {"start": 2.9, "end": 3.4, "text": "delta"},
+                    ],
+                }
+            ]
+            for path in paths
+        ],
+        diarize=diarize,
+    )
+    assert "Daniel Bronheim: alpha beta" in text
+    assert "Mahmoud Lababidi: gamma delta" in text
+    assert " / " not in text
+    assert document["diarization"] == {"backend": "test", "clusters": 2}
+    assert document["segments"][0]["speaker"] == "Lukas"

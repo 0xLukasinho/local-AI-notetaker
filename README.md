@@ -214,7 +214,11 @@ Logs rotate at `~/.meeting-notes/watch.log`.
 
 On Windows the recorder writes three files that share one clock: `audio.wav` (the mix, unchanged), `audio-self.wav` (microphone), and `audio-others.wav` (every WASAPI loopback, summed). Whisper runs on the microphone and on the loopback separately. Microphone lines use `self_name` (default `You`). Loopback lines are other people.
 
-Real names come from Google Meet's active-speaker indicator and the participant display names. A small unpacked Chrome extension reads those from the Meet tab and POSTs them to `127.0.0.1` only while a recording is running. Nothing is injected into the page, so other participants cannot see it. There is no meeting bot and no Meet API.
+Real names come from Google Meet. A small unpacked Chrome extension reads the participant list, the active-speaker ring, and live captions (only if you turn captions on) from the Meet tab and POSTs them to `127.0.0.1` only while a recording is running. Nothing is injected into the page, so other participants cannot see it. There is no meeting bot and no Meet API.
+
+Remote audio is still one mix. On a call with two or more other people, that mix is split into voices on this PC. A voice is labeled with a Meet name only when captions or the tile highlight point at exactly one person in that stretch. If that evidence is missing or contradicts itself, the line stays `Speaker 2`, `Speaker 3`, and so on. Two different voices are never written as `Daniel Bronheim / Mahmoud Lababidi`. A two-person call (you and one other person) does not go through that split: the remote track keeps that one name.
+
+People talking over each other stay whole sentences. A turn is built for each person on each track before the tracks are merged, so a short "yeah" is its own line and does not chop the other sentence into single words.
 
 ```bash
 meeting-notes speakers
@@ -230,6 +234,46 @@ Reload the extension if you change the port and run `meeting-notes speakers` aga
 
 Without the extension, or when Meet's page structure no longer matches, recording still works. Your lines stay `self_name`. Everyone else is `Them`. If Meet exposes a stable anonymous id but no display name, those become `Speaker A`, `Speaker B`, and so on. The default `self_name` of `You` is replaced by your Meet display name when the extension reports it. Set `self_name` to a real name to keep that label instead.
 
+Captions are optional. Leave them off and naming falls back to the active-speaker ring, then to `Speaker 2` when several remote people are talking and the ring cannot tell them apart. Turn captions on (the CC button in Meet; they are shown only to you) when you want the stronger name signal. If Meet changes its page and the reader no longer finds caption rows, samples simply omit them and the recording continues.
+
+#### Voices on the Windows PC
+
+Separation runs after the call, on the same machine as Whisper. Nothing is sent to a diarization service.
+
+The default backend is `auto`:
+
+1. `pyannote`, only when `pyannote.audio` is installed and a Hugging Face token is available. That model is gated. Create a token at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens), accept the terms on [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1) (and the segmentation model it asks for), and set `HF_TOKEN` or `hf_token` in `~/.meeting-notes/config.toml`. The first call downloads the weights. The token is not written into the session, the log, or the transcript.
+2. `speechbrain`, if that package is installed. The first run downloads the public ECAPA model into `~/.meeting-notes/models/spkrec-ecapa-voxceleb`. CPU is fine.
+3. `resemblyzer`, if that package is installed. The first run downloads its small voice encoder. CPU is fine.
+4. `builtin`, always available once `numpy` is installed (it already is in the Windows extra). No download. It separates voices that sound different and would rather leave an extra `Speaker N` than glue two people into one label. Similar voices are the case for installing one of the models above.
+
+Set `diarize_backend` to `builtin`, `speechbrain`, `resemblyzer`, `pyannote`, or `off`. `diarize_remote = false` skips the split and uses captions and tiles only. `diarize_max_speakers` (default 8) is a hint for pyannote. Voices that still measure as different are not merged just to fit that number.
+
+Install, from the repo, in the same environment `meeting-notes` uses:
+
+```bash
+pip install -e ".[windows,diarize]"
+```
+
+Optional, pick one if the built-in split is not enough. These pull PyTorch and are large:
+
+```bash
+pip install resemblyzer
+# or
+pip install torch torchaudio speechbrain
+# or, after the Hugging Face token and model terms above:
+pip install pyannote.audio
+```
+
+After upgrading this repo on the PC:
+
+1. Pull the update and reinstall (`pip install -e ".[windows,diarize]"`).
+2. Leave `diarize_remote` on. Set `diarize_backend` only if you installed a heavier model. Put `HF_TOKEN` in the environment if you chose pyannote. Do not commit that token.
+3. Run `meeting-notes speakers` again, then in `chrome://extensions` click Reload on Meeting Notes Speaker Tags. Captions and the tighter speaking ring are in that extension.
+4. In Meet, turn captions on with the CC button for the calls you want named. Other people do not see your captions.
+5. In the window where `meeting-notes watch` is running, press Ctrl+C, then start `meeting-notes watch` again so it loads this code. `meeting-notes stop` ends a recording only.
+6. On the next call with two guests, `transcript.json` should show separate names. `diarization.backend` says which splitter ran. `speaker_source` is `meet` when a real name was attached and `diarized` when a voice stayed `Speaker 2`.
+
 `transcript.txt` lines look like:
 
 ```
@@ -237,14 +281,15 @@ Without the extension, or when Meet's page structure no longer matches, recordin
 [00:18] Ada Lovelace: I will send the deck
 ```
 
-`transcript.json` has `self_name`, `participants`, `speaker_source` (`meet`, `tracks`, `diarized`, or `mix`), `limits`, and `segments` (`start`, `end`, `speaker`, `text`, `track`). The webhook keeps every existing field and adds `self_name`, `participants`, `speaker_source`, and `speakers` (`start`, `end`, `speaker`, `text`). `speakers` is split across the same chunks as the transcript lines. `participants` and `self_name` are repeated on every chunk.
+`transcript.json` has `self_name`, `participants`, `speaker_source` (`meet`, `tracks`, `diarized`, or `mix`), `limits`, and `segments` (`start`, `end`, `speaker`, `text`, `track`). When the remote mix was split, it also has `diarization` (`backend`, `clusters`, and `reason` if the split did not run). The webhook keeps every existing field and adds `self_name`, `participants`, `speaker_source`, and `speakers` (`start`, `end`, `speaker`, `text`). `speakers` is split across the same chunks as the transcript lines. `participants` and `self_name` are repeated on every chunk.
 
 Limits, also stored on `transcript.json`:
 
 - Other people in the room with you are on the microphone, so they get `self_name`.
-- Remote audio is one mix. Two people talking at once are not separated inside that mix. The line is named for whoever Meet highlighted, or `Ada / Grace` when neither one dominates the interval.
+- Remote audio is one mix. With two or more remote people it is split into voice clusters locally. A cluster gets a Meet name only from a moment when captions or the tile show exactly one person. Otherwise the line is `Speaker 2`, `Speaker 3`, and so on. Distinct voices are not merged into one combined label.
+- A two-person call keeps the single remote name on the whole remote track.
 - A conference-room speakerphone is a single Meet name.
-- Names are only as good as the Meet tab the extension can see. A background Meet tab, or a Meet UI change, falls back to `Them` or `Speaker A` / `Speaker B`.
+- Names are only as good as the Meet tab the extension can see. Captions can be off. A background Meet tab, or a Meet UI change, falls back to `Them`, `Speaker 2`, or `Speaker A` / `Speaker B`.
 - Loudspeakers can leak remote voices into the microphone. When the wording matches, the named remote line is kept. Headphones avoid that.
 
 macOS still records one device. Speaker labels there are applied only when `speakers.jsonl` exists; otherwise the transcript stays unlabeled. The watcher itself is Windows-only.
@@ -295,6 +340,10 @@ Copy `config.example.toml` to `~/.meeting-notes/config.toml`, or use `config.jso
 | `self_name` | `You` | Label for the microphone. `You` is replaced by the Meet display name when the extension reports one. |
 | `speaker_labels` | `true` | `false` keeps unlabeled `[MM:SS] text` and skips the separate tracks. |
 | `speaker_bridge_port` | `8765` | Loopback port for the optional Meet extension. |
+| `diarize_remote` | `true` | Split the remote mix when two or more other people are on the call. |
+| `diarize_backend` | `auto` | `auto`, `builtin`, `speechbrain`, `resemblyzer`, `pyannote`, or `off`. |
+| `diarize_max_speakers` | `8` | Hint for pyannote. Distant voices are not merged to fit it. |
+| `hf_token` | empty | Optional Hugging Face token for pyannote. Prefer `HF_TOKEN`. Never commit it. |
 
 ### Autostart
 
@@ -313,7 +362,8 @@ meeting-notes watch --uninstall
 - Audio recording and Whisper transcription run entirely on your machine
 - The transcript text is sent to Claude via the Claude Code CLI for note generation — this is the only network call on the default `start` / `reprocess` path
 - Transcript-only mode and the Meet watcher do not call Claude. If `webhook_url` is set, the watcher POSTs the transcript to that URL after the session finishes
-- The optional Chrome extension sends participant names to `127.0.0.1` on this computer only. It does not join the call or change what other people see
+- The optional Chrome extension sends participant names, the active-speaker highlight, and caption lines (only when you have captions on) to `127.0.0.1` on this computer only. It does not join the call or change what other people see
+- Voice separation runs locally. The built-in splitter does not download anything. `resemblyzer`, `speechbrain`, and `pyannote` each download a model the first time they run. A Hugging Face token, if you set one, is used only for that download and is not stored in the session
 - All files (audio, transcript, notes) are stored locally in `~/meeting-notes/`
 - No API key is stored; authentication is whatever your Claude Code login is. Webhook credentials live only in `~/.meeting-notes/config.toml` or the `MEETING_NOTES_WEBHOOK_*` environment variables
 
@@ -330,7 +380,7 @@ On macOS, check that microphone permission is granted and run `ffmpeg -f avfound
 On Windows, check that a playback device and a default microphone are enabled in *Settings → System → Sound*. The session's `audio-devices.log` lists the devices the recorder actually opened.
 
 **Action items are attributed to the wrong person**
-Open the session's `transcript.json` and check `speaker_source`. `tracks` means the extension never reached the bridge: remote lines say `Them`, and your lines say `self_name`. Confirm `meeting-notes speakers` was loaded in Chrome, the Meet tab was in that window, and `speakers.jsonl` grew during the call. `meet` means names were aligned from Meet. Two people talking at the same time can still share a line or be named for the person Meet highlighted. Someone sitting next to you is on the microphone track.
+Open the session's `transcript.json` and check `speaker_source` and `diarization`. `tracks` means the extension never reached the bridge: remote lines say `Them`, and your lines say `self_name`. Confirm `meeting-notes speakers` was reloaded in Chrome, the Meet tab was in that window, and `speakers.jsonl` grew during the call. `meet` means a voice or a caption/tile interval was tied to a real name. `diarized` means a remote voice stayed `Speaker 2` (or `Speaker A`) because no single name won. A line is not labeled `Ada / Grace`. Two people talking at once should be two lines. Someone sitting next to you is on the microphone track. Turn Meet captions on and restart `meeting-notes watch` after upgrading.
 
 **Transcript contains only your own voice**
 System audio is a WASAPI loopback per playback device. The recorder follows devices that appear, disappear, or become the default during the call, and it also records a device that is not the default (so Meet can play on headphones while speakers stay the Windows default). `audio-devices.log` and `watch.log` (`recorder:` lines) should show the headphones or speakers you were listening through, and a `default output switched` line when that changes. `system audio silent for 60s while the microphone is active` means those loopbacks heard nothing while you were speaking; the recorder reopens them and logs the open devices. Restart the watcher after updating so the next call uses this path.

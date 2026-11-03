@@ -10,5 +10,7 @@ def _isolate_meeting_notes_env(monkeypatch):
         "MEETING_NOTES_WEBHOOK_AUTH_HEADER",
         "MEETING_NOTES_WEBHOOK_AUTH_VALUE",
         "MEETING_NOTES_MODEL",
+        "HF_TOKEN",
+        "HUGGING_FACE_HUB_TOKEN",
     ):
         monkeypatch.delenv(key, raising=False)

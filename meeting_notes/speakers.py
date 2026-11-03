@@ -1,10 +1,19 @@
 """Attribute transcript lines to people.
 
 The microphone track is the local user (`self_name`). System-audio loopback is
-everyone else. Google Meet display names, when the Chrome extension posted
-them during the call, are aligned onto the remote track by time. Without
-those names the remote track is "Them". Stable anonymous ids become
-"Speaker A", "Speaker B", and so on.
+everyone else, mixed into one file. On a call with two or more remote people
+that mix is split into voice clusters locally (`diarize.py`). A cluster is
+named only from a moment when Meet captions or the active-speaker tile point
+at exactly one remote person. A cluster without that evidence stays
+"Speaker 2", "Speaker 3", and so on. Distinct voices are never glued into one
+"Ada / Grace" label.
+
+With one remote person the whole loopback track uses that name, which is the
+two-person call. Without names the remote track is "Them". Stable anonymous
+ids still become "Speaker A", "Speaker B", and so on.
+
+Turns are built per track and speaker before the tracks are interleaved, so
+overlapping speech stays whole sentences instead of alternating single words.
 
 This module does not open devices or load Whisper. Callers pass transcript
 segments and speaker samples in.
@@ -36,9 +45,10 @@ BLEED_SIMILARITY = 0.84
 
 SPEAKER_LIMITS = [
     "The microphone track is labeled with self_name. Other people in the same room share that label.",
-    "Remote audio is one system-loopback mix. When two people talk at once, the line is named for whoever Meet showed as the active speaker, or both names when neither dominates.",
+    "Remote audio is one system-loopback mix. With two or more remote people it is split into voice clusters on this machine. A cluster is named only when captions or the Meet tile point at exactly one person; otherwise it stays Speaker 2, Speaker 3, and so on. Distinct voices are not merged into one combined label.",
+    "A two-person call (one remote person) keeps that person's name on the whole remote track.",
     "A conference-room speakerphone is a single Meet name, not each person around it.",
-    "Names are read from the Meet tab while it is open. A background tab, no Chrome extension, or a Meet UI change falls back to Them or Speaker A/B.",
+    "Names are read from the Meet tab while it is open, including live captions when the user has turned them on. Captions being off is normal. A background tab, no Chrome extension, or a Meet UI change falls back to Them, Speaker 2, or Speaker A/B.",
     "Loudspeakers can leak remote voices into the microphone. Matching wording is kept on the named remote line. Headphones avoid that leak.",
 ]
 
@@ -174,6 +184,17 @@ def coerce_event(item):
             if ident and name:
                 named_ids[ident] = name
 
+    captions = []
+    raw_captions = item.get("captions")
+    if isinstance(raw_captions, list):
+        for entry in raw_captions[:8]:
+            if not isinstance(entry, dict):
+                continue
+            speaker = clean_name(entry.get("speaker") or entry.get("name"))[:80]
+            text = clean_text(entry.get("text"))[:600]
+            if speaker and text:
+                captions.append({"speaker": speaker, "text": text})
+
     return {
         "t": moment,
         "active": _unique(active),
@@ -182,6 +203,7 @@ def coerce_event(item):
         "self_active": self_active,
         "participants": _unique(participants),
         "named_ids": named_ids,
+        "captions": captions,
     }
 
 
@@ -320,6 +342,305 @@ def speaker_for_interval(start, end, events, ignore_names=None, id_labels=None, 
     return top_name
 
 
+def _ignore_names(events, self_label):
+    ignore = {"", "You", THEM}
+    label = clean_name(self_label)
+    if label:
+        ignore.add(label)
+    observed = meet_self_name(events)
+    if observed:
+        ignore.add(observed)
+    return ignore
+
+
+def _event_bounds(events):
+    ordered = sorted(events or [], key=lambda event: event["t"])
+    bounds = []
+    for index, event in enumerate(ordered):
+        begin = float(event["t"])
+        if index + 1 < len(ordered):
+            finish = float(ordered[index + 1]["t"])
+        else:
+            finish = begin + SAMPLE_COVER_SECONDS
+        if finish - begin > SAMPLE_COVER_SECONDS:
+            finish = begin + SAMPLE_COVER_SECONDS
+        if finish <= begin:
+            finish = begin + 0.01
+        bounds.append((begin, finish))
+    return ordered, bounds
+
+
+def remote_parties(events, self_label):
+    """Remote display names, then anonymous Meet ids, excluding the local user.
+
+    Caption speakers count as names. They are how a call is recognized as
+    having two or more remote people when the tile highlight is wrong.
+    """
+    ignore = _ignore_names(events, self_label)
+    names = []
+    for event in events or []:
+        seen = []
+        seen.extend(event.get("participants") or [])
+        seen.extend(event.get("active") or [])
+        for caption in event.get("captions") or []:
+            seen.append(caption.get("speaker"))
+        for name in seen:
+            if name and name not in ignore and name not in names:
+                names.append(name)
+    id_labels = _id_labels(events)
+    anons = []
+    named_ids = set()
+    for event in events or []:
+        named_ids.update((event.get("named_ids") or {}).keys())
+    for event in events or []:
+        for ident in event.get("active_ids") or []:
+            if ident in named_ids:
+                continue
+            label = id_labels.get(ident) or ""
+            if not label or label in ignore or label in names or label in anons:
+                continue
+            anons.append(label)
+    return names, anons
+
+
+def single_remote_name(events, self_label):
+    """The one other person on a two-person call, or "" when that is not known."""
+    names, anons = remote_parties(events, self_label)
+    if len(names) == 1 and not anons:
+        return names[0]
+    return ""
+
+
+def _interval_overlap(start, end, begin, finish):
+    lo = max(float(start), float(begin))
+    hi = min(float(end), float(finish))
+    if hi <= lo:
+        return 0.0
+    return hi - lo
+
+
+def live_caption_intervals(events, self_label):
+    """Time ranges where exactly one remote caption line was changing.
+
+    Meet rewrites the current caption in place and often leaves the previous
+    line on screen. The line whose text changed is the person talking. Samples
+    where two lines change at once are ignored. Captions being absent yields
+    an empty list.
+    """
+    ignore = _ignore_names(events, self_label)
+    ordered, bounds = _event_bounds(events)
+    last_text = {}
+    raw = []
+    for event, (begin, finish) in zip(ordered, bounds):
+        changed = []
+        for caption in event.get("captions") or []:
+            speaker = caption.get("speaker") or ""
+            text = caption.get("text") or ""
+            if not speaker or not text or speaker in ignore:
+                continue
+            previous = last_text.get(speaker)
+            if previous is None or text != previous:
+                changed.append(speaker)
+            last_text[speaker] = text
+        changed = _unique(changed)
+        if len(changed) != 1:
+            continue
+        raw.append({"start": begin, "end": finish, "speaker": changed[0]})
+    return _merge_named_intervals(raw)
+
+
+def exclusive_tile_intervals(events, self_label):
+    """Ranges where Meet marked exactly one remote participant as speaking."""
+    ignore = _ignore_names(events, self_label)
+    id_labels = _id_labels(events)
+    ordered, bounds = _event_bounds(events)
+    raw = []
+    for event, (begin, finish) in zip(ordered, bounds):
+        names = _names_at(event, ignore, id_labels)
+        if len(names) != 1:
+            continue
+        raw.append({"start": begin, "end": finish, "speaker": names[0]})
+    return _merge_named_intervals(raw)
+
+
+def _merge_named_intervals(raw):
+    merged = []
+    for item in raw:
+        if (
+            merged
+            and merged[-1]["speaker"] == item["speaker"]
+            and float(item["start"]) <= float(merged[-1]["end"]) + 0.35
+        ):
+            merged[-1]["end"] = max(float(merged[-1]["end"]), float(item["end"]))
+            continue
+        merged.append(
+            {"start": float(item["start"]), "end": float(item["end"]), "speaker": item["speaker"]}
+        )
+    return merged
+
+
+def _score_clusters(cluster_segments, intervals):
+    scores = {}
+    for segment in cluster_segments:
+        cluster = segment["cluster"]
+        bucket = scores.setdefault(cluster, {})
+        for interval in intervals:
+            overlap = _interval_overlap(
+                segment["start"], segment["end"], interval["start"], interval["end"]
+            )
+            if overlap <= 0:
+                continue
+            name = interval["speaker"]
+            bucket[name] = bucket.get(name, 0.0) + overlap
+    return scores
+
+
+def _confident_name(score_map, minimum):
+    if not score_map:
+        return None
+    ranked = sorted(score_map.items(), key=lambda item: (-item[1], item[0]))
+    name, best = ranked[0]
+    second = ranked[1][1] if len(ranked) > 1 else 0.0
+    if best < minimum:
+        return None
+    if second and best < 2.0 * second:
+        return None
+    if " / " in name:
+        return None
+    return name, best
+
+
+def name_voice_clusters(voice_segments, events, self_label):
+    """Map each voice cluster to one person, or to Speaker 2, Speaker 3, ...
+
+    Captions are trusted over tiles. A name is used for at most one cluster.
+    Nothing is guessed from the roster when two people could fit: an unnamed
+    cluster stays Speaker N instead of becoming "Ada / Grace".
+    """
+    self_label = clean_name(self_label) or "You"
+    clusters = []
+    first_start = {}
+    for segment in voice_segments or []:
+        cluster = str(segment.get("cluster"))
+        if cluster not in first_start:
+            first_start[cluster] = float(segment["start"])
+            clusters.append(cluster)
+        else:
+            first_start[cluster] = min(first_start[cluster], float(segment["start"]))
+    if not clusters:
+        return {}
+    caption_scores = _score_clusters(voice_segments, live_caption_intervals(events, self_label))
+    tile_scores = _score_clusters(voice_segments, exclusive_tile_intervals(events, self_label))
+    candidates = []
+    caption_hits = set()
+    for cluster in clusters:
+        picked = _confident_name(caption_scores.get(cluster), 0.45)
+        if picked is None:
+            continue
+        name, score = picked
+        candidates.append((0, -score, cluster, name))
+        caption_hits.add(cluster)
+    for cluster in clusters:
+        if cluster in caption_hits:
+            continue
+        picked = _confident_name(tile_scores.get(cluster), 0.8)
+        if picked is None:
+            continue
+        name, score = picked
+        candidates.append((1, -score, cluster, name))
+    candidates.sort()
+    assigned = {}
+    used = set()
+    roster, _anons = remote_parties(events, self_label)
+    for _priority, _score, cluster, name in candidates:
+        canonical = name
+        for item in roster:
+            if item.casefold() == name.casefold():
+                canonical = item
+                break
+        if cluster in assigned or canonical in used or canonical in _ignore_names(events, self_label):
+            continue
+        assigned[cluster] = canonical
+        used.add(canonical)
+    unnamed = [cluster for cluster in clusters if cluster not in assigned]
+    unnamed.sort(key=lambda cluster: (first_start[cluster], cluster))
+    number = 2
+    for cluster in unnamed:
+        while f"Speaker {number}" in used:
+            number += 1
+        label = f"Speaker {number}"
+        assigned[cluster] = label
+        used.add(label)
+        number += 1
+    return assigned
+
+
+def cluster_for_interval(start, end, voice_segments, snap=0.45):
+    """Cluster id with the greatest overlap, else the nearest within `snap`."""
+    if not voice_segments:
+        return None
+    start = float(start)
+    end = float(end)
+    if end <= start:
+        end = start + 0.01
+    best = None
+    best_overlap = 0.0
+    for segment in voice_segments:
+        overlap = _interval_overlap(start, end, segment["start"], segment["end"])
+        if overlap > best_overlap or (
+            overlap == best_overlap
+            and overlap > 0
+            and best is not None
+            and float(segment["start"]) < float(best["start"])
+        ):
+            best = segment
+            best_overlap = overlap
+    if best is not None and best_overlap > 0:
+        return str(best["cluster"])
+    midpoint = (start + end) / 2.0
+    nearest = None
+    distance = float(snap) + 1.0
+    limit = float(snap)
+    for segment in voice_segments:
+        if midpoint < float(segment["start"]):
+            gap = float(segment["start"]) - midpoint
+        elif midpoint > float(segment["end"]):
+            gap = midpoint - float(segment["end"])
+        else:
+            gap = 0.0
+        if gap > limit:
+            continue
+        if nearest is None or gap < distance or (
+            gap == distance and float(segment["start"]) < float(nearest["start"])
+        ):
+            distance = gap
+            nearest = segment
+    if nearest is None:
+        return None
+    return str(nearest["cluster"])
+
+
+def caption_speaker_for_interval(start, end, intervals, minimum=0.05):
+    """Remote caption speaker covering this span, when one person dominates."""
+    totals = {}
+    for interval in intervals or []:
+        overlap = _interval_overlap(start, end, interval["start"], interval["end"])
+        if overlap <= 0:
+            continue
+        name = interval["speaker"]
+        totals[name] = totals.get(name, 0.0) + overlap
+    if not totals:
+        return ""
+    ranked = sorted(totals.items(), key=lambda item: (-item[1], item[0]))
+    name, best = ranked[0]
+    second = ranked[1][1] if len(ranked) > 1 else 0.0
+    if best < minimum:
+        return ""
+    if second and best < 2.0 * second:
+        return ""
+    return name
+
+
 def _overlap_fraction(left, right):
     lo = max(float(left["start"]), float(right["start"]))
     hi = min(float(left["end"]), float(right["end"]))
@@ -415,36 +736,49 @@ def _segment_tokens(segment, speaker, track):
 
 
 def group_turns(tokens, gap=TURN_GAP_SECONDS):
-    """Merge consecutive tokens from the same speaker on the same track."""
-    ordered = sorted(
-        tokens,
-        key=lambda item: (item["start"], 0 if item.get("track") == "self" else 1, item["end"]),
-    )
+    """Build one turn per track and speaker, then order the turns by time.
+
+    Someone else talking does not split a sentence. A turn breaks only when
+    that same speaker on that same track has been silent for longer than
+    `gap`. A short interjection from the other person stays its own line, and
+    the sentence underneath stays intact.
+    """
+    buckets = {}
+    for token in tokens or []:
+        key = (token.get("track") or "", token.get("speaker") or "")
+        buckets.setdefault(key, []).append(token)
     groups = []
-    current = None
-    for token in ordered:
-        if (
-            current is not None
-            and current["speaker"] == token["speaker"]
-            and current.get("track") == token.get("track")
-            and float(token["start"]) - float(current["end"]) <= gap
-        ):
-            current["end"] = max(float(current["end"]), float(token["end"]))
-            current["text"] = (current["text"] + " " + token["text"]).strip()
-            continue
-        current = {
-            "start": float(token["start"]),
-            "end": float(token["end"]),
-            "text": token["text"],
-            "speaker": token["speaker"],
-            "track": token.get("track") or "",
-        }
-        groups.append(current)
+    for items in buckets.values():
+        items.sort(key=lambda item: (float(item["start"]), float(item["end"])))
+        current = None
+        for token in items:
+            start = float(token["start"])
+            end = float(token["end"])
+            if current is not None and start - float(current["end"]) <= gap:
+                current["end"] = max(float(current["end"]), end)
+                current["text"] = (current["text"] + " " + token["text"]).strip()
+                continue
+            current = {
+                "start": start,
+                "end": end,
+                "text": token["text"],
+                "speaker": token.get("speaker") or "",
+                "track": token.get("track") or "",
+            }
+            groups.append(current)
+    groups.sort(
+        key=lambda item: (item["start"], 0 if item.get("track") == "self" else 1, item["end"])
+    )
     return groups
 
 
-def align_tracks(self_segments, remote_segments, events, self_label):
-    """Label microphone segments as `self_label` and remote segments from Meet."""
+def align_tracks(self_segments, remote_segments, events, self_label, voice_segments=None):
+    """Label microphone segments as `self_label` and remote segments from voices.
+
+    `voice_segments` are `{start, end, cluster}` from local diarization. Each
+    cluster gets one name. Without them, a two-person call uses the single
+    remote name, then caption text that was changing, then the Meet tile.
+    """
     self_label = clean_name(self_label) or "You"
     ignore = set()
     observed = meet_self_name(events)
@@ -453,6 +787,32 @@ def align_tracks(self_segments, remote_segments, events, self_label):
     if self_label:
         ignore.add(self_label)
     id_labels = _id_labels(events)
+    voice_names = None
+    if voice_segments:
+        voice_names = name_voice_clusters(voice_segments, events, self_label)
+    solo = "" if voice_names else single_remote_name(events, self_label)
+    caption_intervals = [] if solo or voice_names else live_caption_intervals(events, self_label)
+
+    def name_remote(start, end):
+        if voice_names:
+            cluster = cluster_for_interval(start, end, voice_segments)
+            if cluster is not None and voice_names.get(cluster):
+                return voice_names[cluster]
+            # A gap between clusters is not a reason to glue two names together.
+            label = speaker_for_interval(
+                start, end, events, ignore_names=ignore, id_labels=id_labels
+            )
+            if " / " in str(label):
+                return THEM
+            return label
+        if solo:
+            return solo
+        caption = caption_speaker_for_interval(start, end, caption_intervals)
+        if caption:
+            return caption
+        return speaker_for_interval(
+            start, end, events, ignore_names=ignore, id_labels=id_labels
+        )
 
     remote_labeled = []
     for segment in remote_segments or []:
@@ -471,20 +831,15 @@ def align_tracks(self_segments, remote_segments, events, self_label):
                         "start": start,
                         "end": end,
                         "text": word_text,
-                        "speaker": speaker_for_interval(
-                            start, end, events, ignore_names=ignore, id_labels=id_labels
-                        ),
+                        "speaker": name_remote(start, end),
                     }
                 )
             if not named_words:
                 continue
             # Majority name is what cross-talk compares; words keep their own.
-            speaker = speaker_for_interval(
+            speaker = name_remote(
                 float(segment.get("start", named_words[0]["start"])),
                 float(segment.get("end", named_words[-1]["end"])),
-                events,
-                ignore_names=ignore,
-                id_labels=id_labels,
             )
             remote_labeled.append(
                 {
@@ -506,9 +861,7 @@ def align_tracks(self_segments, remote_segments, events, self_label):
                 "start": start,
                 "end": end,
                 "text": text,
-                "speaker": speaker_for_interval(
-                    start, end, events, ignore_names=ignore, id_labels=id_labels
-                ),
+                "speaker": name_remote(start, end),
                 "track": "others",
             }
         )
@@ -674,7 +1027,7 @@ def classify_source(segments, events, used_tracks, used_mix, self_label=""):
     return "plain"
 
 
-def build_document(segments, events, self_label, source):
+def build_document(segments, events, self_label, source, diarization=None):
     rounded = []
     for segment in segments or []:
         rounded.append(
@@ -687,7 +1040,7 @@ def build_document(segments, events, self_label, source):
             }
         )
     observed = meet_self_name(events)
-    return {
+    document = {
         "self_name": self_label,
         "meet_self_name": observed or None,
         "participants": participant_list(self_label, rounded, events),
@@ -695,6 +1048,9 @@ def build_document(segments, events, self_label, source):
         "limits": list(SPEAKER_LIMITS),
         "segments": rounded,
     }
+    if diarization:
+        document["diarization"] = diarization
+    return document
 
 
 def speaker_webhook_fields(folder):
@@ -755,7 +1111,88 @@ def _existing_track(folder, name):
     return path
 
 
-def produce_transcript(folder, self_name, enabled, transcribe_plain, transcribe_paths):
+def _needs_remote_diarization(events, self_label):
+    names, anons = remote_parties(events, self_label)
+    return len(names) + len(anons) >= 2
+
+
+def _voice_timeline(folder, events, self_label, diarize_remote, diarize_backend, diarize_max_speakers, hf_token, diarize):
+    """Cluster the remote mix when more than one other person is in the call.
+
+    A two-person call (one remote name) does not go through this. Splitting
+    that single voice would risk labeling it as two people.
+    """
+    if not diarize_remote:
+        return None, None
+    if not _needs_remote_diarization(events, self_label):
+        return None, None
+    others = _existing_track(folder, OTHERS_TRACK)
+    if not others:
+        return None, {
+            "backend": None,
+            "clusters": 0,
+            "reason": "no remote audio track",
+        }
+    if diarize is None:
+        from meeting_notes.diarize import diarize_wav
+
+        def diarize(path):
+            return diarize_wav(
+                path,
+                backend=diarize_backend,
+                hf_token=hf_token,
+                max_speakers=diarize_max_speakers,
+            )
+
+    try:
+        result = diarize(others)
+    except Exception as exc:
+        text = " ".join(str(exc).split())
+        token = str(hf_token or "").strip()
+        if token and token in text:
+            text = text.replace(token, "***")
+        return None, {"backend": None, "clusters": 0, "reason": text[:180] or "diarization failed"}
+    segments = []
+    backend = "custom"
+    reason = ""
+    if isinstance(result, dict):
+        backend = result.get("backend") or "custom"
+        reason = str(result.get("reason") or "")
+        result = result.get("segments") or []
+    if result:
+        for item in result:
+            if not isinstance(item, dict):
+                continue
+            try:
+                start = float(item["start"])
+                end = float(item["end"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            cluster = str(item.get("cluster") if item.get("cluster") is not None else "")
+            if cluster and end > start:
+                segments.append({"start": start, "end": end, "cluster": cluster})
+    if not segments:
+        return None, {
+            "backend": None,
+            "clusters": 0,
+            "reason": reason or "diarization unavailable",
+        }
+    clusters = sorted({segment["cluster"] for segment in segments})
+    return segments, {"backend": str(backend), "clusters": len(clusters)}
+
+
+def produce_transcript(
+    folder,
+    self_name,
+    enabled,
+    transcribe_plain,
+    transcribe_paths,
+    diarize_remote=True,
+    diarize_backend="auto",
+    diarize_max_speakers=8,
+    hf_token="",
+    diarize=None,
+):
     """Return `(text, document_or_none)`.
 
     With labeling off, or with nothing but a mixed file and no speaker log,
@@ -785,16 +1222,27 @@ def produce_transcript(folder, self_name, enabled, transcribe_plain, transcribe_
         by_role = {}
         for role, segments in zip(roles, detailed):
             by_role[role] = segments or []
+        voice_segments, diarization = _voice_timeline(
+            folder,
+            events,
+            self_label,
+            diarize_remote,
+            diarize_backend,
+            diarize_max_speakers,
+            hf_token,
+            diarize,
+        )
         labeled = align_tracks(
             by_role.get("self") or [],
             by_role.get("others") or [],
             events,
             self_label,
+            voice_segments=voice_segments,
         )
         source = classify_source(
             labeled, events, used_tracks=True, used_mix=False, self_label=self_label
         )
-        document = build_document(labeled, events, self_label, source)
+        document = build_document(labeled, events, self_label, source, diarization=diarization)
         return render_transcript(labeled, labeled=True), document
 
     if events:

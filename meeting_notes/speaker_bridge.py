@@ -1,9 +1,10 @@
 """Localhost receiver for Meet speaker samples.
 
-The Chrome extension POSTs the active speaker and the participant roster here
-while a recording is running. Nothing is accepted from any address other than
-the loopback bind. Samples are stamped with server time, in seconds since
-`mark_audio_start`, and appended to speakers.jsonl.
+The Chrome extension POSTs the active speaker, the participant roster, and
+any live-caption lines here while a recording is running. Nothing is accepted
+from any address other than the loopback bind. Samples are stamped with
+server time, in seconds since `mark_audio_start`, and appended to
+speakers.jsonl.
 """
 
 import json
@@ -14,7 +15,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from meeting_notes.speakers import coerce_event
 
 
-_MAX_BODY = 65536
+# Caption snapshots ride along with the speaker sample. A few Meet lines fit
+# well under this; the cap is what stops a hostile page from filling the disk.
+_MAX_BODY = 262144
 
 
 class SpeakerBridge:

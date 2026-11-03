@@ -65,3 +65,23 @@ speaker_labels = true
 # Loopback port the optional Meet extension posts speaker samples to.
 # `meeting-notes speakers` copies that port into the extension folder.
 speaker_bridge_port = 8765
+
+# Split the remote mix into separate voices when two or more other people are
+# on the call. A two-person call is unchanged: the one remote name is used.
+# off / false keeps Meet tiles and captions only.
+diarize_remote = true
+
+# auto: pyannote if hf_token or HF_TOKEN is set and pyannote is installed,
+# otherwise speechbrain, otherwise resemblyzer, otherwise the built-in
+# numpy clusterer (no download). Also: builtin, speechbrain, resemblyzer,
+# pyannote, off.
+diarize_backend = "auto"
+
+# Hint for pyannote. Voices that still sound different are not merged to fit.
+diarize_max_speakers = 8
+
+# Only the optional pyannote model needs this. Leave it empty and set
+# HF_TOKEN (or HUGGING_FACE_HUB_TOKEN) in the environment instead if you can.
+# Accept the model terms at huggingface.co/pyannote/speaker-diarization-3.1
+# before the first run. Never commit a real token.
+hf_token = ""
