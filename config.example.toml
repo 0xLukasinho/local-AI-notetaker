@@ -52,3 +52,16 @@ mic_process_marker = "chrome.exe"
 # Whisper settings for sessions started by the watcher.
 whisper_model = "medium"
 language = "en"
+
+# Name the microphone track with this label. The default "You" is replaced
+# by your Google Meet display name when the Chrome extension reports it.
+# Set a real name here to always use that, even if Meet shows something else.
+self_name = "You"
+
+# false keeps the historical "[MM:SS] text" lines and does not write
+# audio-self.wav, audio-others.wav, or transcript.json.
+speaker_labels = true
+
+# Loopback port the optional Meet extension posts speaker samples to.
+# `meeting-notes speakers` copies that port into the extension folder.
+speaker_bridge_port = 8765

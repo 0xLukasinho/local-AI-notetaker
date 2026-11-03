@@ -16,6 +16,9 @@ def test_missing_file_keeps_manual_summary_and_watcher_transcript_only(tmp_path)
     assert config.leave_debounce_seconds == 25
     assert config.mic_process_marker == "chrome.exe"
     assert config.webhook_max_body_bytes == 6000
+    assert config.speaker_labels is True
+    assert config.self_name == "You"
+    assert config.speaker_bridge_port == 8765
 
 
 def test_toml_and_env_override(tmp_path):
@@ -86,5 +89,8 @@ def test_example_config_loads(tmp_path):
     assert config.webhook_auth_header == "Authorization"
     assert config.webhook_auth_value == "replace-me"
     assert config.webhook_max_body_bytes == 6000
+    assert config.speaker_labels is True
+    assert config.self_name == "You"
+    assert config.speaker_bridge_port == 8765
     assert "replace-me" in example
     assert "sk-" not in example

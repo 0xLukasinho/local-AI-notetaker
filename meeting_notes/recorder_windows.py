@@ -124,6 +124,7 @@ class WindowsRecorderHandle:
         self.reopen_loopbacks = threading.Event()
         self.threads = []
         self.wav_file = None
+        self.extra_wavs = []
         self.error = None
         self._error_lock = threading.Lock()
         self._silence_lock = threading.Lock()
@@ -392,12 +393,29 @@ def _drain_sink(sink):
     return np.concatenate(chunks)
 
 
-def _mixer(spk_sinks, mic_sink, wav_file, handle, log):
+def _pcm16(samples):
+    clipped = np.clip(samples, -1.0, 1.0)
+    return (clipped * 32767.0).astype(np.int16).tobytes()
+
+
+def _open_wav(path):
+    wav_file = wave.open(path, "wb")
+    wav_file.setnchannels(1)
+    wav_file.setsampwidth(2)
+    wav_file.setframerate(SAMPLE_RATE)
+    return wav_file
+
+
+def _mixer(spk_sinks, mic_sink, wav_file, handle, log, self_wav=None, others_wav=None):
     """Mix every loopback over the microphone timeline, writing PCM16 to the WAV.
 
     The microphone is the master clock (continuous). Each output endpoint keeps
     its own buffer. A block with no samples from an endpoint is silence on that
     endpoint, not a delay of the others. System audio is summed and clipped.
+
+    When `self_wav` and `others_wav` are set, the same block count is written
+    to each: microphone only, and the summed loopback only. Those files stay
+    sample-aligned with the mix so transcript timestamps match.
     """
     spk_bufs = {}
     mic_buf = np.zeros(0, dtype=np.float32)
@@ -437,6 +455,10 @@ def _mixer(spk_sinks, mic_sink, wav_file, handle, log):
                 mix = acc + MIC_GAIN * mic_part
                 np.clip(mix, -1.0, 1.0, out=mix)
                 wav_file.writeframes((mix * 32767.0).astype(np.int16).tobytes())
+                if self_wav is not None:
+                    self_wav.writeframes(_pcm16(mic_part))
+                if others_wav is not None:
+                    others_wav.writeframes(_pcm16(acc))
                 wrote = True
                 sum_sq_mic += float(np.dot(mic_part, mic_part))
                 sum_sq_spk += float(np.dot(acc, acc))
@@ -724,12 +746,16 @@ def _fail_startup(message, hint):
     sys.exit(1)
 
 
-def record_audio(output_path):
+def record_audio(output_path, separate_tracks=False):
     """Start a background capture of system audio (every loopback) + microphone.
 
     Returns a WindowsRecorderHandle. Recording continues until stop_recording()
     is called. Output devices that appear or become default while recording are
     picked up; disappearing devices are dropped without stopping the take.
+
+    `separate_tracks` also writes audio-self.wav (microphone) and
+    audio-others.wav (loopback mix) next to `output_path`. The mixed
+    audio.wav is unchanged either way.
     """
     # Probe devices up front (on the calling thread) so we can fail fast with a
     # clear message before opening the WAV / spawning threads.
@@ -753,17 +779,35 @@ def record_audio(output_path):
             "(Settings -> System -> Sound).",
         )
 
-    wav_file = wave.open(output_path, "wb")
-    wav_file.setnchannels(1)
-    wav_file.setsampwidth(2)
-    wav_file.setframerate(SAMPLE_RATE)
+    wav_file = _open_wav(output_path)
 
     handle = WindowsRecorderHandle()
     handle.wav_file = wav_file
 
+    folder = os.path.dirname(os.path.abspath(output_path))
+    log = DeviceLog(folder)
+    self_wav = None
+    others_wav = None
+    if separate_tracks:
+        try:
+            self_wav = _open_wav(os.path.join(folder, "audio-self.wav"))
+            others_wav = _open_wav(os.path.join(folder, "audio-others.wav"))
+        except OSError as exc:
+            print(f"Separate speaker tracks were not opened ({exc}).", file=sys.stderr)
+            for extra in (self_wav, others_wav):
+                if extra is not None:
+                    try:
+                        extra.close()
+                    except Exception:
+                        pass
+            self_wav = None
+            others_wav = None
+        else:
+            handle.extra_wavs = [self_wav, others_wav]
+            log.event("writing separate tracks audio-self.wav and audio-others.wav")
+
     spk_sinks = _SinkMap()
     mic_sink = deque()
-    log = DeviceLog(os.path.dirname(os.path.abspath(output_path)))
 
     threads = [
         threading.Thread(
@@ -774,7 +818,7 @@ def record_audio(output_path):
         ),
         threading.Thread(
             target=_mixer,
-            args=(spk_sinks, mic_sink, wav_file, handle, log),
+            args=(spk_sinks, mic_sink, wav_file, handle, log, self_wav, others_wav),
             daemon=True,
             name="mixer",
         ),
@@ -795,11 +839,14 @@ def stop_recording(handle):
     handle.stop_event.set()
     for thread in handle.threads:
         thread.join(timeout=15)
-    if handle.wav_file is not None:
+    for wav in [handle.wav_file] + list(getattr(handle, "extra_wavs", None) or []):
+        if wav is None:
+            continue
         try:
-            handle.wav_file.close()
+            wav.close()
         except Exception:
             pass
-        handle.wav_file = None
+    handle.wav_file = None
+    handle.extra_wavs = []
     if handle.error is not None:
         raise handle.error
