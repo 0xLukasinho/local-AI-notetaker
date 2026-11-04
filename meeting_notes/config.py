@@ -59,6 +59,19 @@ class Config:
     self_name: str = "You"
     # Loopback port the Chrome extension posts Meet speaker samples to.
     speaker_bridge_port: int = 8765
+    # Off by default. Captions (then the active-speaker tile) name remote
+    # lines. True also splits the remote mix into voices locally. That path
+    # needs optional packages and is not part of the normal install.
+    diarize: bool = False
+    # auto uses pyannote when a token is set and that package is installed,
+    # then speechbrain, resemblyzer, then the built-in numpy clusterer.
+    # builtin, speechbrain, resemblyzer, pyannote, and off are explicit.
+    diarize_backend: str = "auto"
+    # Hint for neural diarizers. Distant voices are not merged to fit this.
+    diarize_max_speakers: int = 8
+    # Optional. Only pyannote's gated model needs it. Prefer HF_TOKEN in the
+    # environment. Never commit a real token.
+    hf_token: str = ""
 
 
 _FLOAT_FIELDS = {
@@ -70,13 +83,20 @@ _FLOAT_FIELDS = {
     "delivery_backoff_seconds",
     "delivery_timeout_seconds",
 }
-_INT_FIELDS = {"delivery_attempts", "webhook_max_body_bytes", "speaker_bridge_port"}
+_INT_FIELDS = {
+    "delivery_attempts",
+    "webhook_max_body_bytes",
+    "speaker_bridge_port",
+    "diarize_max_speakers",
+}
 _BOOL_FIELDS = {
     "transcript_only",
     "watcher_transcript_only",
     "delete_audio_after_delivery",
     "speaker_labels",
+    "diarize",
 }
+_DIARIZE_BACKENDS = {"auto", "builtin", "speechbrain", "resemblyzer", "pyannote", "off"}
 _KNOWN = {item.name for item in fields(Config)}
 
 
@@ -225,12 +245,19 @@ def _coerce(key, value):
         number = int(value)
         if key == "speaker_bridge_port" and (number < 1 or number > 65535):
             return 8765
+        if key == "diarize_max_speakers" and (number < 1 or number > 12):
+            return 8
         return number
     if key in _FLOAT_FIELDS:
         return float(value)
     if key == "self_name":
         text = str(value).strip()
         return text or "You"
+    if key == "diarize_backend":
+        text = str(value).strip().lower()
+        return text if text in _DIARIZE_BACKENDS else "auto"
+    if key == "hf_token":
+        return str(value).strip()
     return str(value)
 
 
@@ -238,3 +265,9 @@ def _apply_env(config, environ):
     for env_name, field in ENV_OVERRIDES.items():
         if env_name in environ:
             setattr(config, field, environ[env_name])
+    # A Hugging Face token stays out of the repo. Empty vars do not wipe a
+    # value already set in the config file.
+    token = environ.get("HF_TOKEN") or environ.get("HUGGING_FACE_HUB_TOKEN") or ""
+    token = str(token).strip()
+    if token:
+        config.hf_token = token

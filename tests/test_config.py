@@ -19,6 +19,10 @@ def test_missing_file_keeps_manual_summary_and_watcher_transcript_only(tmp_path)
     assert config.speaker_labels is True
     assert config.self_name == "You"
     assert config.speaker_bridge_port == 8765
+    assert config.diarize is False
+    assert config.diarize_backend == "auto"
+    assert config.diarize_max_speakers == 8
+    assert config.hf_token == ""
 
 
 def test_toml_and_env_override(tmp_path):
@@ -92,5 +96,38 @@ def test_example_config_loads(tmp_path):
     assert config.speaker_labels is True
     assert config.self_name == "You"
     assert config.speaker_bridge_port == 8765
+    assert config.diarize is False
+    assert config.diarize_backend == "auto"
+    assert config.diarize_max_speakers == 8
+    assert config.hf_token == ""
     assert "replace-me" in example
     assert "sk-" not in example
+    assert 'hf_token = ""' in example
+
+
+def test_diarize_settings_and_hf_token(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "\n".join(
+            [
+                "diarize = true",
+                'diarize_backend = "builtin"',
+                "diarize_max_speakers = 4",
+                'hf_token = "from-file"',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    config = load_config(path=str(path), environ={})
+    assert config.diarize is True
+    assert config.diarize_backend == "builtin"
+    assert config.diarize_max_speakers == 4
+    assert config.hf_token == "from-file"
+
+    overridden = load_config(path=str(path), environ={"HF_TOKEN": "from-env"})
+    assert overridden.hf_token == "from-env"
+
+    path.write_text('diarize_backend = "not-a-backend"\ndiarize_max_speakers = 0\n', encoding="utf-8")
+    fallback = load_config(path=str(path), environ={})
+    assert fallback.diarize_backend == "auto"
+    assert fallback.diarize_max_speakers == 8

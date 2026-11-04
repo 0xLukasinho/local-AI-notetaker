@@ -252,6 +252,10 @@ def _write_transcript(meeting_dir, config, whisper_model, language):
         enabled=bool(getattr(config, "speaker_labels", True)),
         transcribe_plain=plain,
         transcribe_paths=many,
+        diarize=bool(getattr(config, "diarize", False)),
+        diarize_backend=getattr(config, "diarize_backend", "auto"),
+        diarize_max_speakers=int(getattr(config, "diarize_max_speakers", 8) or 8),
+        hf_token=getattr(config, "hf_token", "") or "",
     )
     atomic_write_text(session_transcript_path(meeting_dir), text)
     if document is not None:
@@ -259,6 +263,17 @@ def _write_transcript(meeting_dir, config, whisper_model, language):
         names = ", ".join(document.get("participants") or [])
         source = document.get("speaker_source") or "tracks"
         print(f"Speakers ({source}): {names}")
+        info = document.get("diarization") or {}
+        if info.get("backend") and info.get("clusters"):
+            print(f"Remote voices: {info['clusters']} via {info['backend']}.")
+        elif info.get("reason"):
+            print(f"Remote diarization skipped ({info['reason']}).")
+        if document.get("captions") == "off":
+            print(
+                "Meet captions were off, so remote speakers could not be named "
+                "from captions. Press CC in the Meet window next time. "
+                "Captions are only shown to you."
+            )
         update_status(
             meeting_dir,
             {
@@ -739,12 +754,15 @@ def cmd_speakers(args):
     print("  4. Choose the folder above")
     print()
     print(
-        "The extension reads participant names on meet.google.com and sends them"
+        "The extension reads participant names and, if you turn captions on,"
     )
+    print("the caption speaker on meet.google.com, and sends them")
     print(
         f"to 127.0.0.1:{config.speaker_bridge_port} on this computer while a recording"
     )
     print("is running. Other people in the call cannot see it.")
+    print("Turn on captions with the CC button in Meet. That is what names")
+    print("each remote speaker. Captions are only shown to you.")
     print("Run this command again after you change speaker_bridge_port, then click")
     print("Reload on the extension.")
     print("Recording works without the extension: you are self_name, everyone else is Them.")
