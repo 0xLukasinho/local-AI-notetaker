@@ -25,6 +25,7 @@ def test_missing_file_keeps_manual_summary_and_watcher_transcript_only(tmp_path)
     assert config.diarize_backend == "auto"
     assert config.diarize_max_speakers == 8
     assert config.hf_token == ""
+    assert config.watcher_health_ping is False
 
 
 def test_toml_and_env_override(tmp_path):
@@ -102,6 +103,7 @@ def test_example_config_loads(tmp_path):
     assert config.diarize_backend == "auto"
     assert config.diarize_max_speakers == 8
     assert config.hf_token == ""
+    assert config.watcher_health_ping is False
     assert config.watch_google_meet is True
     assert config.watch_slack_huddle is True
     assert "replace-me" in example

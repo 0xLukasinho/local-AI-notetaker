@@ -429,6 +429,54 @@ def test_build_windows_detector_keeps_the_registry_when_pycaw_is_missing(monkeyp
     assert any("registry=yes" in message and "wasapi=unavailable" in message for _level, message in log.messages)
 
 
+def test_heartbeat_stays_recording_while_transcription_finishes(tmp_path):
+    clock = Clock()
+    beats = []
+
+    class RememberHeartbeat:
+        def beat(self, force=False, state=None):
+            beats.append(state)
+
+    class SlowFinish(FakeLauncher):
+        def __init__(self):
+            super().__init__()
+            self.polls = 0
+
+        def request_stop(self, session):
+            self.stopped.append(session.folder)
+
+        def state(self, _session):
+            self.polls += 1
+            if self.polls < 3:
+                return "transcribing"
+            return "done"
+
+    watcher = MeetWatcher(
+        config=_config(),
+        detector=ScriptDetector(clock, present_until=-1),
+        launcher=SlowFinish(),
+        deliver_fn=lambda _folder: True,
+        lock_store=Lock(),
+        outbox_retry=lambda: 0,
+        sleep=clock.sleep,
+        monotonic=clock.monotonic,
+        wall_iso=lambda: "2026-10-29T15:04:00+00:00",
+        wall_datetime=lambda: datetime(2026, 10, 29, 15, 4, tzinfo=timezone.utc),
+        output_dir=str(tmp_path),
+        log=ListLog(),
+        heartbeat=RememberHeartbeat(),
+    )
+    folder = str(tmp_path / "session")
+    os.makedirs(folder, exist_ok=True)
+    watcher.activity = "recording"
+    watcher.session = RunningSession(folder=folder, pid=1)
+    watcher._on_leave()
+    assert beats
+    assert beats[-1] == "idle"
+    assert "idle" not in beats[:-1]
+    assert "recording" in beats
+
+
 def test_outbox_is_retried_when_the_watcher_starts(tmp_path):
     clock = Clock()
     retries = []

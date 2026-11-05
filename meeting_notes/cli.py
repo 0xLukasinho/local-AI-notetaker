@@ -7,8 +7,13 @@ import threading
 from datetime import date
 
 from meeting_notes.atomic_io import atomic_write_json, atomic_write_text
+from meeting_notes.autostart import (
+    AutostartError,
+    autostart_status,
+    install_autostart,
+    uninstall_autostart,
+)
 from meeting_notes.call_sources import SOURCE_GOOGLE_MEET
-from meeting_notes.autostart import autostart_status, install_autostart, uninstall_autostart
 from meeting_notes.config import Config, ConfigError, load_config
 from meeting_notes.deliver import DeliveryError, deliver_folder
 from meeting_notes.recorder import record_audio, stop_recording
@@ -34,7 +39,8 @@ from meeting_notes.session import (
 )
 from meeting_notes.summarizer import generate_notes
 from meeting_notes.transcriber import transcribe
-from meeting_notes.watcher import serve
+from meeting_notes.watcher import configure_watch_logging, serve
+from meeting_notes.watch_guard import describe_heartbeat, ensure_until_running
 
 OUTPUT_DIR = os.path.expanduser("~/meeting-notes")
 CONTROL_DIR = os.path.expanduser("~/.meeting-notes")
@@ -726,10 +732,7 @@ def cmd_deliver(args):
     print(f"Delivered {meeting_dir}")
 
 
-def _print_watch_status():
-    status = autostart_status(CONTROL_DIR)
-    pid = read_watcher_pid(CONTROL_DIR)
-    running = bool(pid) and pid_alive(pid)
+def _config_status_line():
     toml_path = os.path.join(CONTROL_DIR, "config.toml")
     json_path = os.path.join(CONTROL_DIR, "config.json")
     if os.path.exists(toml_path):
@@ -738,14 +741,113 @@ def _print_watch_status():
         config_path, found = json_path, True
     else:
         config_path, found = toml_path, False
+    return f"Config: {config_path} ({'found' if found else 'not found, using defaults'})"
+
+
+def _print_watch_status():
+    status = autostart_status(CONTROL_DIR)
+    pid = read_watcher_pid(CONTROL_DIR)
+    running = bool(pid) and pid_alive(pid)
     installed = "installed" if status["installed"] else "not installed"
     print(f"Autostart: {installed} ({status['detail']})")
     if running:
         print(f"Watcher process: running (pid {pid})")
     else:
         print("Watcher process: not running")
-    print(f"Config: {config_path} ({'found' if found else 'not found, using defaults'})")
+    print(describe_heartbeat(CONTROL_DIR))
+    print(_config_status_line())
     print(f"Log: {os.path.join(CONTROL_DIR, 'watch.log')}")
+
+
+def _log_watch(message, *args):
+    try:
+        logger, _path = configure_watch_logging(CONTROL_DIR)
+        logger.error(message, *args)
+    except Exception:
+        pass
+
+
+def _print_autostart_result(meta):
+    removed = meta.get("removed_startup") or []
+    if removed:
+        print("Removed the old Startup-folder shortcut:")
+        for path in removed:
+            print(f"  {path}")
+        print("The scheduled task replaces it.")
+    print(f"Installed scheduled task {meta.get('task_name')}.")
+    if meta.get("startup_trigger"):
+        print("It runs hidden at system startup and at logon.")
+    else:
+        print("It runs hidden at logon.")
+        print("System startup could not be registered without admin. Logon still runs it.")
+        if meta.get("startup_error"):
+            print(f"  {meta['startup_error']}")
+    print("It also runs when the session unlocks.")
+    if meta.get("resume_trigger"):
+        print("It also runs on resume from sleep.")
+    else:
+        print("Resume-from-sleep could not be registered. Logon and unlock still run.")
+        if meta.get("resume_error"):
+            print(f"  {meta['resume_error']}")
+    print("Each run starts a hidden watcher only when one is not already healthy.")
+    print("If that start fails, it retries after 30 seconds, 60 seconds, and 120 seconds.")
+
+
+def _cmd_install_autostart():
+    if sys.platform != "win32":
+        print("Autostart install is supported on Windows only.", file=sys.stderr)
+        sys.exit(1)
+    try:
+        meta = install_autostart(CONTROL_DIR)
+    except AutostartError as exc:
+        _log_watch("autostart install failed: %s", exc)
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    _print_autostart_result(meta)
+    try:
+        logger, _path = configure_watch_logging(CONTROL_DIR)
+        logger.info(
+            "autostart install: task %s triggers %s",
+            meta.get("task_name"),
+            ", ".join(meta.get("triggers") or []),
+        )
+    except Exception:
+        pass
+    result = ensure_until_running(CONTROL_DIR)
+    print(result.user_message)
+    if not result.ok:
+        sys.exit(1)
+
+
+def _cmd_uninstall_autostart():
+    removed = uninstall_autostart(CONTROL_DIR)
+    if removed:
+        print("Removed login autostart:")
+        for item in removed:
+            print(f"  {item}")
+    else:
+        print("Login autostart was not installed.")
+    try:
+        logger, _path = configure_watch_logging(CONTROL_DIR)
+        logger.info("autostart uninstall: removed %s", ", ".join(removed) or "nothing")
+    except Exception:
+        pass
+
+
+def cmd_autostart(args):
+    """Install, remove, or inspect the Windows scheduled task."""
+    command = args.autostart_command
+    if command == "install":
+        _cmd_install_autostart()
+        return
+    if command == "uninstall":
+        _cmd_uninstall_autostart()
+        return
+    if command == "status":
+        _print_watch_status()
+        return
+    print("Error: expected install, uninstall, or status.", file=sys.stderr)
+    sys.exit(2)
 
 
 def cmd_speakers(args):
@@ -785,34 +887,34 @@ def cmd_speakers(args):
 
 def cmd_watch(args):
     """Detect Google Meet calls and record transcript-only sessions."""
-    selected = sum(bool(flag) for flag in (args.install, args.uninstall, args.status))
+    selected = sum(
+        bool(flag) for flag in (args.install, args.uninstall, args.status, args.ensure)
+    )
     if selected > 1:
-        print("Error: pass only one of --install, --uninstall, or --status.", file=sys.stderr)
+        print(
+            "Error: pass only one of --ensure, --install, --uninstall, or --status.",
+            file=sys.stderr,
+        )
         sys.exit(2)
     if args.status:
         _print_watch_status()
         return
     if args.uninstall:
-        removed = uninstall_autostart(CONTROL_DIR)
-        if removed:
-            print("Removed login autostart:")
-            for item in removed:
-                print(f"  {item}")
-        else:
-            print("Login autostart was not installed.")
+        _cmd_uninstall_autostart()
         return
     if args.install:
-        if sys.platform != "win32":
-            print("Autostart install is supported on Windows only.", file=sys.stderr)
-            sys.exit(1)
-        meta = install_autostart(CONTROL_DIR)
-        method = meta.get("method")
-        if method == "schtasks":
-            print(f"Installed Task Scheduler task {meta.get('task_name')}.")
-        else:
-            print(f"Installed Startup script: {meta.get('path')}")
-        print("It will start at the next login. Run `meeting-notes watch` to start it now.")
+        _cmd_install_autostart()
         return
+    if args.ensure:
+        if sys.platform != "win32":
+            print(
+                "meeting-notes watch --ensure requires Windows.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        result = ensure_until_running(CONTROL_DIR)
+        print(result.user_message)
+        sys.exit(0 if result.ok else 1)
     if sys.platform != "win32":
         print(
             "meeting-notes watch requires Windows "
@@ -826,7 +928,13 @@ def cmd_watch(args):
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
     log_path = os.path.join(CONTROL_DIR, WATCH_LOG_FILENAME)
-    print(f"Watching for Google Meet calls. Log: {log_path}")
+    sources = []
+    if config.watch_google_meet:
+        sources.append("Google Meet")
+    if config.watch_slack_huddle:
+        sources.append("Slack Huddle")
+    watching = " and ".join(sources) if sources else "no call sources"
+    print(f"Watching for {watching}. Log: {log_path}")
     print("Press Ctrl+C to stop the watcher.")
     try:
         serve(config, CONTROL_DIR, OUTPUT_DIR)
@@ -950,21 +1058,48 @@ def build_parser():
         help="Watch for a Google Meet or Slack Huddle and record a transcript",
     )
     watch_parser.add_argument(
+        "--ensure",
+        action="store_true",
+        help=(
+            "If no healthy watcher is running, start one hidden and exit. "
+            "A healthy watcher makes this return immediately."
+        ),
+    )
+    watch_parser.add_argument(
         "--install",
         action="store_true",
-        help="Run the watcher at Windows login (Task Scheduler, else Startup script)",
+        help="Same as `meeting-notes autostart install`",
     )
     watch_parser.add_argument(
         "--uninstall",
         action="store_true",
-        help="Remove the login autostart entry",
+        help="Same as `meeting-notes autostart uninstall`",
     )
     watch_parser.add_argument(
         "--status",
         action="store_true",
-        help="Show autostart and whether the watcher process is running",
+        help="Show the scheduled task, the watcher process, and the heartbeat",
     )
     watch_parser.set_defaults(func=cmd_watch)
+
+    autostart_parser = subparsers.add_parser(
+        "autostart",
+        help="Start the watcher at logon, unlock, and resume (Windows)",
+    )
+    autostart_subs = autostart_parser.add_subparsers(dest="autostart_command", required=True)
+    autostart_subs.add_parser(
+        "install",
+        help="Register a per-user scheduled task that runs watch --ensure",
+    )
+    autostart_subs.add_parser(
+        "uninstall",
+        help="Remove the scheduled task and any Startup-folder shortcut",
+    )
+    autostart_subs.add_parser(
+        "status",
+        help="Show the scheduled task, the watcher process, and the heartbeat",
+    )
+    autostart_parser.set_defaults(func=cmd_autostart)
 
     speakers_parser = subparsers.add_parser(
         "speakers",
