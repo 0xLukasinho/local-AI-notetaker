@@ -15,6 +15,8 @@ def test_missing_file_keeps_manual_summary_and_watcher_transcript_only(tmp_path)
     assert config.join_debounce_seconds == 12
     assert config.leave_debounce_seconds == 25
     assert config.mic_process_marker == "chrome.exe"
+    assert config.watch_google_meet is True
+    assert config.watch_slack_huddle is True
     assert config.webhook_max_body_bytes == 6000
     assert config.speaker_labels is True
     assert config.self_name == "You"
@@ -102,9 +104,23 @@ def test_example_config_loads(tmp_path):
     assert config.diarize_max_speakers == 8
     assert config.hf_token == ""
     assert config.watcher_health_ping is False
+    assert config.watch_google_meet is True
+    assert config.watch_slack_huddle is True
     assert "replace-me" in example
     assert "sk-" not in example
     assert 'hf_token = ""' in example
+
+
+def test_watcher_source_flags(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "watch_google_meet = false\nwatch_slack_huddle = true\n",
+        encoding="utf-8",
+    )
+    config = load_config(control_dir=str(tmp_path), environ={})
+    assert config.watch_google_meet is False
+    assert config.watch_slack_huddle is True
+    assert config.transcript_only is False
 
 
 def test_diarize_settings_and_hf_token(tmp_path):

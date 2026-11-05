@@ -1,10 +1,11 @@
-"""Long-running Google Meet watcher.
+"""Long-running call watcher (Google Meet and Slack Huddle).
 
 The loop is platform-neutral: detectors, the session launcher, and delivery
-are injected. On Windows, `serve` wires the real Chrome/mic probes and a
+are injected. On Windows, `serve` wires the real window and mic probes and a
 hidden recorder subprocess. The mic probe ORs the consent-store registry with
-WASAPI capture sessions. A human session that is already recording blocks a
-second start for the rest of that call.
+WASAPI capture sessions. One session records at a time. A call that is already
+in progress keeps going if the other source appears; a manual session blocks
+a watcher start for the rest of that call.
 """
 
 import logging
@@ -64,6 +65,7 @@ class SessionSpec:
     transcript_only: bool
     whisper_model: str
     language: str
+    source: str = ""
 
 
 @dataclass
@@ -100,6 +102,8 @@ def build_start_argv(spec, executable=None):
         argv.extend(["--meet-code", spec.meet_code])
     if spec.window_title:
         argv.extend(["--window-title", spec.window_title])
+    if getattr(spec, "source", ""):
+        argv.extend(["--source", spec.source])
     return argv
 
 
@@ -321,9 +325,11 @@ class MeetWatcher:
         if active is not None:
             self.suppressed = True
             self.session = None
+            pending = getattr(self.debouncer.active, "source", "") or "call"
             self.log.warning(
-                "Not starting a recording: a session is already running "
+                "Not starting a %s recording: a session is already running "
                 "(pid %s, mode %s, folder %s).",
+                pending,
                 active.get("pid"),
                 active.get("mode"),
                 active.get("folder"),
@@ -332,12 +338,13 @@ class MeetWatcher:
         sighting = self.debouncer.active
         if sighting is None:
             return
-        name = session_name(sighting)
+        when = self.wall_datetime()
+        name = session_name(sighting, when=when)
         folder = allocate_meeting_dir(
             self.output_dir,
             name,
             unique=True,
-            when=self.wall_datetime(),
+            when=when,
         )
         spec = SessionSpec(
             name=name,
@@ -348,6 +355,7 @@ class MeetWatcher:
             transcript_only=bool(self.config.watcher_transcript_only),
             whisper_model=self.config.whisper_model,
             language=self.config.language,
+            source=getattr(sighting, "source", "") or "",
         )
         try:
             self.session = self.launcher.start(spec)
@@ -359,7 +367,12 @@ class MeetWatcher:
         self.delivered = False
         self.suppressed = False
         self.activity = "recording"
-        self.log.info("Started transcript session %s (%s)", folder, name)
+        self.log.info(
+            "Started transcript session %s (%s, source %s)",
+            folder,
+            name,
+            spec.source or "unspecified",
+        )
         self._beat()
 
     def _on_leave(self):
@@ -510,19 +523,13 @@ def configure_watch_logging(control_dir, max_bytes=1_000_000, backup_count=3):
 
 
 def build_windows_detector(config, log=None):
-    from meeting_notes.meet_detect import ChromeMeetDetector
+    from meeting_notes.call_sources import build_call_detector
     from meeting_notes.meet_detect_windows import list_top_level_windows, probe_microphone
 
-    marker = config.mic_process_marker or "chrome.exe"
-
-    def mic():
-        return probe_microphone(marker)
-
-    return ChromeMeetDetector(
+    return build_call_detector(
+        config,
         windows=list_top_level_windows,
-        mic_in_use=mic,
-        title_regex=config.window_title_regex or None,
-        process_marker=marker,
+        probe_microphone=probe_microphone,
         log=log,
     )
 
@@ -654,7 +661,8 @@ def serve(config, control_dir, output_dir, sleep=None, monotonic=None):
             heartbeat=heartbeat,
         )
         logger.info(
-            "Watching for Google Meet in Chrome (join %.0fs, leave %.0fs). Ctrl+C to stop.",
+            "Watching for %s (join %.0fs, leave %.0fs). Ctrl+C to stop.",
+            _watched_sources(config),
             config.join_debounce_seconds,
             config.leave_debounce_seconds,
         )
@@ -682,6 +690,20 @@ def serve(config, control_dir, output_dir, sleep=None, monotonic=None):
         clear_instance(control_dir, pid=os.getpid())
         logger.info("Watcher stopped: pid=%s reason=%s", os.getpid(), stop_reason)
         lock.release()
+
+
+def _watched_sources(config):
+    """Human list of enabled sources, for the startup log line."""
+    enabled = []
+    if getattr(config, "watch_google_meet", True):
+        enabled.append("Google Meet")
+    if getattr(config, "watch_slack_huddle", True):
+        enabled.append("Slack Huddle")
+    if not enabled:
+        return "no call sources (both are disabled in config)"
+    if len(enabled) == 1:
+        return enabled[0]
+    return "%s and %s" % (enabled[0], enabled[1])
 
 
 def _wall_datetime():

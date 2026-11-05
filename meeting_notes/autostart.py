@@ -1,4 +1,4 @@
-"""Register the Meet watcher with Windows Task Scheduler.
+"""Register the call watcher with Windows Task Scheduler.
 
 ``meeting-notes autostart install`` creates one per-user task (no admin). The
 task runs ``meeting-notes watch --ensure`` at system startup when that trigger
