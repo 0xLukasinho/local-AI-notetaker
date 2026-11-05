@@ -46,8 +46,14 @@ window_title_regex = ""
 
 # Substring matched against the process using the microphone: the consent-store
 # subkey and, when pycaw is installed, the WASAPI capture-session process name.
-# Chrome is unpackaged, so the default looks for chrome.exe.
+# Chrome is unpackaged, so the default looks for chrome.exe. This applies to
+# Google Meet. Slack Huddle detection uses slack.exe and chrome.exe itself.
 mic_process_marker = "chrome.exe"
+
+# Watcher sources. Omit either line to leave it on. A manual
+# `meeting-notes start` never uses these and does not deliver to the webhook.
+watch_google_meet = true
+watch_slack_huddle = true
 
 # Whisper settings for sessions started by the watcher.
 whisper_model = "medium"

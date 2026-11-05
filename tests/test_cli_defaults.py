@@ -75,6 +75,7 @@ def test_parser_defaults_match_the_historical_commands():
     assert start.no_summary is False
     assert start.automated is False
     assert start.output_dir is None
+    assert start.source is None
 
     reprocess = parser.parse_args(["reprocess", "2026-02-19_weekly-standup"])
     assert reprocess.notes_only is False
@@ -123,6 +124,78 @@ def test_default_start_still_summarizes_and_uses_the_plain_folder_name(tmp_path,
     assert status["transcript_only"] is False
     assert status["error"] is None
     assert status["pid"] == os.getpid()
+    assert "source" not in status
+    assert status["delivered"] is False
+
+
+def test_manual_start_does_not_deliver_even_when_a_webhook_is_configured(tmp_path, monkeypatch):
+    meetings, _control = _dirs(monkeypatch, tmp_path)
+    _patch_pipeline(monkeypatch)
+    bridge = []
+
+    def refuse_delivery(*_args, **_kwargs):
+        raise AssertionError("manual start tried to deliver")
+
+    from meeting_notes.config import Config
+
+    monkeypatch.setattr(cli, "deliver_folder", refuse_delivery)
+    monkeypatch.setattr(
+        cli,
+        "load_config",
+        lambda control_dir=None: Config(
+            webhook_url="https://example.invalid/hook",
+            webhook_auth_value="secret-token",
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_start_speaker_bridge",
+        lambda *_args, **_kwargs: bridge.append("bridge") or None,
+    )
+    args = cli.build_parser().parse_args(["start", "Weekly Standup"])
+    cli.cmd_start(args)
+    status = read_status(str(meetings / "2026-10-29_weekly-standup"))
+    assert status["mode"] == "manual"
+    assert "source" not in status
+    assert status["delivered"] is False
+    assert bridge == ["bridge"]
+
+
+def test_huddle_source_skips_the_meet_speaker_bridge_and_still_does_not_deliver(
+    tmp_path, monkeypatch
+):
+    meetings, _control = _dirs(monkeypatch, tmp_path)
+    _patch_pipeline(monkeypatch)
+    bridge = []
+
+    def refuse_delivery(*_args, **_kwargs):
+        raise AssertionError("start tried to deliver")
+
+    monkeypatch.setattr(cli, "deliver_folder", refuse_delivery)
+    monkeypatch.setattr(
+        cli,
+        "_start_speaker_bridge",
+        lambda *_args, **_kwargs: bridge.append("bridge") or None,
+    )
+    args = cli.build_parser().parse_args(
+        [
+            "start",
+            "#engineering",
+            "--transcript-only",
+            "--source",
+            "slack-huddle",
+            "--window-title",
+            "Huddle | #engineering | Acme - Slack",
+        ]
+    )
+    cli.cmd_start(args)
+    status = read_status(str(meetings / "2026-10-29_engineering"))
+    assert status["mode"] == "manual"
+    assert status["source"] == "slack-huddle"
+    assert status["window_title"] == "Huddle | #engineering | Acme - Slack"
+    assert status["delivered"] is False
+    assert bridge == []
+    assert not (meetings / "2026-10-29_engineering" / "notes.md").exists()
 
 
 def test_keep_audio_still_retains_the_wav(tmp_path, monkeypatch):

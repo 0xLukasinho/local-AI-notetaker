@@ -66,6 +66,8 @@ def test_payload_fields_and_duration(tmp_path):
     assert payload["whisper_model"] == "medium"
     assert payload["language"] == "en"
     assert payload["transcript"] == "[00:01] hello\n[00:02] world"
+    assert "source" not in payload
+    assert "meeting_name" not in payload
     assert set(payload) == {
         "folder_name",
         "folder_path",
@@ -78,6 +80,19 @@ def test_payload_fields_and_duration(tmp_path):
         "language",
         "transcript",
     }
+
+
+def test_payload_includes_watcher_source_and_meeting_name(tmp_path):
+    folder = _session(tmp_path)
+    status = read_status(str(folder))
+    status["source"] = "slack-huddle"
+    status["meeting_name"] = "Slack Huddle 15:04"
+    status["meet_code"] = None
+    write_status(str(folder), status)
+    payload = build_payload(read_status(str(folder)), "[00:01] hello", str(folder))
+    assert payload["source"] == "slack-huddle"
+    assert payload["meeting_name"] == "Slack Huddle 15:04"
+    assert payload["meet_code"] is None
 
 
 def test_post_retries_with_backoff_then_succeeds():

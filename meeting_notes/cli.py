@@ -7,6 +7,7 @@ import threading
 from datetime import date
 
 from meeting_notes.atomic_io import atomic_write_json, atomic_write_text
+from meeting_notes.call_sources import SOURCE_GOOGLE_MEET
 from meeting_notes.autostart import autostart_status, install_autostart, uninstall_autostart
 from meeting_notes.config import Config, ConfigError, load_config
 from meeting_notes.deliver import DeliveryError, deliver_folder
@@ -194,6 +195,16 @@ def _begin_recording(audio_path, separate_tracks):
     if separate_tracks and sys.platform == "win32":
         return record_audio(audio_path, separate_tracks=True)
     return record_audio(audio_path)
+
+
+def _uses_meet_speaker_bridge(source):
+    """The Chrome extension only understands Google Meet.
+
+    Manual recordings and Meet watch sessions keep it. Slack Huddles (and any
+    later source) use the microphone / loopback split and do not collect Meet
+    names.
+    """
+    return source in (None, "", SOURCE_GOOGLE_MEET)
 
 
 def _start_speaker_bridge(meeting_dir, config):
@@ -389,6 +400,7 @@ def cmd_start(args):
         sys.exit(1)
 
     mode = "watch" if automated else "manual"
+    source = _optional_text(getattr(args, "source", None))
     begin_session(
         meeting_dir,
         CONTROL_DIR,
@@ -402,6 +414,7 @@ def cmd_start(args):
         joined_at=_optional_text(getattr(args, "joined_at", None)),
         break_ok=automated and sys.platform == "win32",
         honor_existing_stop=bool(automated or output_dir),
+        source=source,
     )
 
     # --- Recording ---
@@ -413,7 +426,9 @@ def cmd_start(args):
     bridge = None
     try:
         stop_event = _install_stop_signal()
-        bridge = _start_speaker_bridge(meeting_dir, config)
+        bridge = None
+        if _uses_meet_speaker_bridge(source):
+            bridge = _start_speaker_bridge(meeting_dir, config)
         try:
             handle = _begin_recording(audio_path, bool(config.speaker_labels))
         except SystemExit:
@@ -876,6 +891,10 @@ def build_parser():
         "--joined-at",
         help="ISO 8601 join time with offset, stored in status.json",
     )
+    start_parser.add_argument(
+        "--source",
+        help="Call source stored in status.json (used by meeting-notes watch)",
+    )
     start_parser.set_defaults(func=cmd_start)
 
     # reprocess
@@ -928,7 +947,7 @@ def build_parser():
 
     watch_parser = subparsers.add_parser(
         "watch",
-        help="Watch for a Google Meet call in Chrome and record a transcript",
+        help="Watch for a Google Meet or Slack Huddle and record a transcript",
     )
     watch_parser.add_argument(
         "--install",

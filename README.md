@@ -179,13 +179,19 @@ meeting-notes stop
 
 `stop` writes both of those and, when the recorder was started as its own Windows process group, also sends `CTRL_BREAK_EVENT`. The recorder flushes the WAV, then transcribes. It does not need a console attached.
 
-### Google Meet watcher
+### Google Meet and Slack Huddle watcher
 
 ```bash
 meeting-notes watch
 ```
 
-On Windows this loops until Ctrl+C. A call **starts** only when both are true:
+On Windows this loops until Ctrl+C. It records **one call at a time** and, when the call ends, delivers that session the same way a Meet watch session already does. `meeting-notes start` is not part of that path: it does not watch for calls, and it does not POST the webhook.
+
+Google Meet and Slack Huddle can both be turned off in config (`watch_google_meet`, `watch_slack_huddle`). When a config file omits them, both stay on.
+
+#### Google Meet
+
+A Meet **starts** only when both are true:
 
 1. A top-level Chrome window is titled like `Meet - <code or title>` (the ` - Google Chrome` suffix is ignored). Chrome puts only the **active tab** in the window title, so a Meet in a background tab is invisible until that tab is focused.
 2. `chrome.exe` is using the microphone. Two probes are OR-ed, and either one is enough:
@@ -202,13 +208,42 @@ That choice has a limit. A Meet tab left open on the post-call page looks the sa
 
 The log (`~/.meeting-notes/watch.log`) records an INFO line whenever the microphone signal or the Meet-window signal changes, including which microphone probe said yes (`registry=yes/no/unavailable`, `wasapi=yes/no/unavailable`). A probe that cannot run is logged once with the reason.
 
-If a session is already recording, the watcher does not start a second one and logs that. A manual `meeting-notes start` while the watcher is recording prints a warning and does not start either. Stop the current session with `meeting-notes stop` first.
+If a session is already recording — a Meet, a Huddle, or a manual `meeting-notes start` — the watcher does not start a second one and logs that. A manual `meeting-notes start` while the watcher is recording prints a warning and does not start either. Stop the current session with `meeting-notes stop` first.
+
+If a Meet and a Huddle are both visible before any recording has started, the Meet is the one that is recorded. The Huddle is logged and ignored until the Meet session has ended (its own leave rule, then the leave debounce). The reverse is the same: a Huddle that is already recording keeps going when a Meet starts, and the Meet is not recorded until the Huddle has ended. A Meet tab left open on the call or the post-call page still counts as the Meet, so a Huddle will not start until you switch away from that tab or close it.
 
 Watcher sessions use a unique folder. The first one that day is still `YYYY-MM-DD_slug`. If that folder exists, the next is `YYYY-MM-DD_slug_HHMM`, then `YYYY-MM-DD_slug_HHMM_2`, and so on. Manual `start` keeps the unsuffixed name.
 
 Logs rotate at `~/.meeting-notes/watch.log`.
 
 `joined_at` is when the join debounce confirms and recording starts. `left_at` is when recording stops (the leave debounce has already elapsed). `duration_seconds` is that interval.
+
+#### Slack Huddle
+
+A Huddle uses the same join and leave timers as Meet. It **starts** only when both are true:
+
+1. A top-level window is a Huddle window.
+2. The process that owns that window is using the microphone. The same two probes as Meet are OR-ed (`slack.exe` for the desktop app, `chrome.exe` when the Huddle is a Chrome window).
+
+**Desktop app (`slack.exe`).** The window title has to be a Huddle title, not the normal channel title. Any of these count:
+
+- It starts with `Huddle` (`Huddle`, `Huddle | #engineering | Acme - Slack`, `Huddle - #engineering - Acme - Slack`, `Huddle with Jane Doe`, `Huddle in #design-review`).
+- A `|` or ` - ` segment is the Huddle label (`Slack | Huddle | #engineering`, `Slack Huddle - #engineering`).
+- It starts with the headphones mark Slack has used on the call window (`🎧 #engineering - Acme - Slack`).
+
+A channel named `#huddle`, a voice message (the title stays on the channel), and the microphone test in Preferences do not match, so they do not start a recording. The microphone has to be seen together with that window once. Joining muted waits until you unmute. After that, mute alone does not end the session while the Huddle window is still open, and losing the title does not end it while `slack.exe` still holds the microphone. Both have to be gone for `leave_debounce_seconds`.
+
+**Slack in Chrome.** Same title rules, plus the title has to look like Slack: it ends with `Slack`, it is the bare popout (`Huddle` or `Huddle | Huddle`), or it is a short `Huddle with` / `Huddle in` / `Huddle |` title. A search page or an article that mentions huddles does not. Chrome uses one microphone for every tab, so a Meet-titled Chrome window and a Huddle-titled Chrome window at the same time are ambiguous. Meet wins when nothing is recording yet. The desktop app does not have that ambiguity: `slack.exe` on the microphone is the Huddle even if Chrome is open.
+
+The session name is the channel or DM from the title (`#engineering`, `Jane Doe`) when the title includes one. A bare `Huddle` window is named `Slack Huddle` plus the time the join is confirmed, for example `Slack Huddle 15:04`. `status.json` and the webhook body include `source` `slack-huddle` (Meet watch sessions use `google-meet`).
+
+**Limitations.**
+
+- If Slack keeps the Huddle inside the main window and never puts `Huddle` on a top-level title, the watcher cannot see it. Pop the Huddle out, or focus the window whose title contains `Huddle`, and leave it that way at least for the join hold (default 12 seconds).
+- After you leave, a Huddle window that stays open with a Huddle title looks like a mute. Switch that window away or close it so the session can stop. If the window closes but Slack keeps the microphone (a voice message started immediately, for example), the session continues until the microphone is released, then the leave debounce.
+- A title that starts as `Huddle` and later shows the channel stays one session. Switching to a different channel's Huddle is a different call: the current session ends after the leave debounce, then the new one can start.
+- Participant names are not read from Slack. The transcript is your microphone against everyone else (`speaker_labels`). The Meet Chrome extension is not started for a Huddle, so a Meet tab that is also open does not rename these lines. A future source could supply names the way that extension does; this watcher does not.
+- One recording at a time, shared with Meet and with manual `meeting-notes start`.
 
 ### Speaker names
 
@@ -271,13 +306,13 @@ Limits, also stored on `transcript.json`:
 
 macOS still records one device. Speaker labels there are applied only when `speakers.jsonl` exists; otherwise the transcript stays unlabeled. The watcher itself is Windows-only.
 
-`meeting-notes start`, `stop`, Ctrl+C, Ctrl+Alt+Q, the tray app, and `meeting-notes watch` are unchanged. The watcher does not require the extension.
+`meeting-notes start`, `stop`, Ctrl+C, Ctrl+Alt+Q, and the tray app are unchanged. `meeting-notes watch` records Slack Huddles as well as Google Meet. The watcher does not require the extension.
 
 ### Delivery
 
 When a watcher session finishes, the watcher POSTs JSON:
 
-`folder_name`, `folder_path`, `meet_code`, `window_title`, `joined_at`, `left_at`, `duration_seconds`, `whisper_model`, `language`, `transcript`, `chunk_index`, `chunk_count`, `transcript_sha256`, `transcript_chars`.
+`folder_name`, `folder_path`, `meet_code`, `window_title`, `joined_at`, `left_at`, `duration_seconds`, `whisper_model`, `language`, `transcript`, `chunk_index`, `chunk_count`, `transcript_sha256`, `transcript_chars`. Watcher sessions also send `source` (`google-meet` or `slack-huddle`) and `meeting_name` (the Meet code, the Huddle channel or DM, or `Slack Huddle` plus the time). Manual sessions and older watcher sessions omit those two.
 
 When the session has `transcript.json`, each body also has `self_name`, `participants`, and `speaker_source`. `speakers` is the segment list for the lines in that body's `transcript` (same order). Older sessions without `transcript.json` omit those fields, so an existing consumer keeps working.
 
@@ -311,7 +346,9 @@ Copy `config.example.toml` to `~/.meeting-notes/config.toml`, or use `config.jso
 | `watcher_transcript_only` | `true` | Watcher sessions skip Claude notes. |
 | `delete_audio_after_delivery` | `false` | Remove `audio.wav` after a successful POST. |
 | `window_title_regex` | empty | Replaces the built-in `Meet - ...` pattern. |
-| `mic_process_marker` | `chrome.exe` | Substring matched against the process using the microphone (registry subkey and WASAPI capture session). |
+| `watch_google_meet` | `true` | Watcher records Google Meet. `false` ignores Meet. |
+| `watch_slack_huddle` | `true` | Watcher records Slack Huddles. `false` ignores Huddles. |
+| `mic_process_marker` | `chrome.exe` | Substring matched against the process using the microphone for Google Meet (registry subkey and WASAPI capture session). |
 | `whisper_model` | `medium` | Whisper size for watcher sessions. |
 | `language` | `en` | Language forced for watcher sessions. |
 | `self_name` | `You` | Label for the microphone. `You` is replaced by the Meet display name when the extension reports one. |
@@ -338,7 +375,7 @@ meeting-notes watch --uninstall
 
 - Audio recording and Whisper transcription run entirely on your machine
 - The transcript text is sent to Claude via the Claude Code CLI for note generation — this is the only network call on the default `start` / `reprocess` path
-- Transcript-only mode and the Meet watcher do not call Claude. If `webhook_url` is set, the watcher POSTs the transcript to that URL after the session finishes
+- Transcript-only mode and the watcher do not call Claude. If `webhook_url` is set, the watcher POSTs the transcript to that URL after a Meet or a Huddle session finishes. A manual `meeting-notes start` does not POST it
 - The optional Chrome extension sends participant names, the active-speaker highlight, and caption lines (only when you have captions on) to `127.0.0.1` on this computer only. It does not join the call or change what other people see
 - Naming remote speakers uses those local caption lines. No extra model is downloaded for that
 - All files (audio, transcript, notes) are stored locally in `~/meeting-notes/`
@@ -366,7 +403,10 @@ System audio is a WASAPI loopback per playback device. The recorder follows devi
 `transcript.txt` is the full text. The webhook is several JSON bodies when that file is longer than `webhook_max_body_bytes`. Join `transcript` by `chunk_index`. `watch.log` lines `Posting transcript (N chars, M request(s), max body B bytes)` are the size that was sent. The `Authorization` header is unchanged and is not logged.
 
 **Watcher never notices a Google Meet**
-Open `~/.meeting-notes/watch.log`. `Microphone not in use (registry=no, wasapi=unavailable)` means the WASAPI probe is off (usually `pycaw` is not installed: `pip install pycaw`) and the consent-store registry also did not show Chrome. `Meet window not detected` while you are in the call means the Meet tab is not the active Chrome tab; focus it for the join hold (`join_debounce_seconds`, default 12). After the session has started, a mute or a background tab does not by itself end it.
+Open `~/.meeting-notes/watch.log`. `Microphone not in use (registry=no, wasapi=unavailable)` means the WASAPI probe is off (usually `pycaw` is not installed: `pip install pycaw`) and the consent-store registry also did not show Chrome. `Meet window not detected` while you are in the call means the Meet tab is not the active Chrome tab; focus it for the join hold (`join_debounce_seconds`, default 12). After the session has started, a mute or a background tab does not by itself end it. `watch_google_meet = false` turns Meet detection off.
+
+**Watcher never notices a Slack Huddle**
+In `~/.meeting-notes/watch.log`, `Slack Huddle window not detected` means no top-level title looked like a Huddle. Pop the Huddle out or focus the Huddle window so the title contains `Huddle`, and leave it there for the join hold. `Slack microphone not in use (slack.exe, ...)` means that window was seen but `slack.exe` was not on the microphone (you are muted, or the call is in Chrome — then the line is `chrome.exe`). A voice message or the Preferences mic test will not match the title. If a Meet is already being recorded, the Huddle waits until that session ends. `watch_slack_huddle = false` turns Huddle detection off.
 
 **"global hotkey unavailable" on Windows**
 The `keyboard` library couldn't install its low-level hook (often due to AV software). The tool falls back to Ctrl+C in the terminal. To use the hotkey, try running the terminal as administrator.
