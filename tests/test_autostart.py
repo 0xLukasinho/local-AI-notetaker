@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 
 import pytest
 
@@ -32,6 +33,56 @@ def test_find_pythonw_prefers_sibling(tmp_path):
     other = lonely / "python.exe"
     other.write_text("", encoding="utf-8")
     assert find_pythonw(str(other)) == os.path.abspath(str(other))
+
+
+def _touch(path, body=b"MZ"):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(body)
+
+
+def test_find_pythonw_skips_the_windowsapps_alias(tmp_path, monkeypatch):
+    alias_dir = (
+        tmp_path
+        / "AppData"
+        / "Local"
+        / "Microsoft"
+        / "WindowsApps"
+        / "PythonSoftwareFoundation.Python.3.10_qbz5n2kfra8p0"
+    )
+    _touch(alias_dir / "python.exe", b"")
+    _touch(alias_dir / "pythonw.exe", b"")
+    real_dir = tmp_path / "Program Files" / "WindowsApps" / "PythonSoftwareFoundation.Python.3.10_x64"
+    _touch(real_dir / "python.exe")
+    _touch(real_dir / "pythonw.exe")
+    monkeypatch.setattr(sys, "executable", str(alias_dir / "python.exe"))
+    monkeypatch.setattr(sys, "_base_executable", str(real_dir / "python.exe"), raising=False)
+    assert find_pythonw() == str(real_dir / "pythonw.exe")
+
+
+def test_find_pythonw_uses_base_prefix_when_executable_and_base_are_aliases(tmp_path, monkeypatch):
+    alias_dir = tmp_path / "AppData" / "Local" / "Microsoft" / "WindowsApps"
+    _touch(alias_dir / "python.exe", b"")
+    _touch(alias_dir / "pythonw.exe", b"")
+    prefix = tmp_path / "LocalCache" / "Python310"
+    _touch(prefix / "python.exe")
+    _touch(prefix / "pythonw.exe")
+    monkeypatch.setattr(sys, "executable", str(alias_dir / "python.exe"))
+    monkeypatch.setattr(sys, "_base_executable", str(alias_dir / "python.exe"), raising=False)
+    monkeypatch.setattr(sys, "base_prefix", str(prefix))
+    assert find_pythonw() == str(prefix / "pythonw.exe")
+
+
+def test_find_pythonw_keeps_a_venv_interpreter(tmp_path, monkeypatch):
+    venv = tmp_path / "venv"
+    base = tmp_path / "base"
+    _touch(venv / "python.exe")
+    _touch(venv / "pythonw.exe")
+    _touch(base / "python.exe")
+    _touch(base / "pythonw.exe")
+    monkeypatch.setattr(sys, "executable", str(venv / "python.exe"))
+    monkeypatch.setattr(sys, "_base_executable", str(base / "python.exe"), raising=False)
+    monkeypatch.setattr(sys, "base_prefix", str(base))
+    assert find_pythonw() == str(venv / "pythonw.exe")
 
 
 def test_task_xml_runs_ensure_at_startup_logon_unlock_and_resume():
@@ -98,6 +149,7 @@ def test_install_registers_task_and_removes_startup_shortcut(tmp_path):
         pythonw=r"C:\Python\pythonw.exe",
         startup_dir=str(startup),
         run=run,
+        elevated=True,
     )
     assert meta["method"] == "schtasks"
     assert meta["resume_trigger"] is True
@@ -140,6 +192,7 @@ def test_install_drops_the_boot_trigger_when_startup_needs_admin(tmp_path):
         pythonw=r"C:\Python\pythonw.exe",
         startup_dir=str(tmp_path / "startup"),
         run=run,
+        elevated=True,
     )
     assert len(calls) == 2
     assert meta["startup_trigger"] is False
@@ -171,6 +224,7 @@ def test_install_can_drop_boot_and_resume(tmp_path):
         pythonw=r"C:\Python\pythonw.exe",
         startup_dir=str(tmp_path / "startup"),
         run=run,
+        elevated=True,
     )
     assert len(calls) == 4
     assert meta["startup_trigger"] is False
@@ -181,6 +235,93 @@ def test_install_can_drop_boot_and_resume(tmp_path):
     assert "Kernel-Power" not in xml
     assert "<LogonTrigger>" in xml
     assert "SessionUnlock" in xml
+
+
+def test_install_skips_startup_when_the_shell_is_not_elevated(tmp_path):
+    calls = []
+    control = tmp_path / "control"
+
+    def run(_argv, check, capture_output, text):
+        calls.append((control / "MeetingNotesWatch.xml").read_text(encoding="utf-16"))
+        return None
+
+    meta = install_autostart(
+        str(control),
+        pythonw=r"C:\Python\pythonw.exe",
+        startup_dir=str(tmp_path / "startup"),
+        run=run,
+        elevated=False,
+    )
+    assert len(calls) == 1
+    assert "<BootTrigger>" not in calls[0]
+    assert "Kernel-Power" in calls[0]
+    assert "SessionUnlock" in calls[0]
+    assert meta["startup_trigger"] is False
+    assert meta["startup_skipped"] is True
+    assert meta["resume_trigger"] is True
+    assert meta["triggers"] == ["logon", "unlock", "resume"]
+    assert "skipped" in meta["startup_error"].lower()
+    assert "Administrator PowerShell" in meta["startup_error"]
+
+
+def test_install_falls_back_when_startup_returns_access_denied(tmp_path):
+    calls = []
+    control = tmp_path / "control"
+
+    def run(_argv, check, capture_output, text):
+        calls.append(True)
+        xml = (control / "MeetingNotesWatch.xml").read_text(encoding="utf-16")
+        if "<BootTrigger>" in xml:
+            raise OSError("ERROR: Access is denied.")
+        return None
+
+    meta = install_autostart(
+        str(control),
+        pythonw=r"C:\Python\pythonw.exe",
+        startup_dir=str(tmp_path / "startup"),
+        run=run,
+        elevated=None,
+    )
+    assert len(calls) == 2
+    assert meta["startup_trigger"] is False
+    assert "logon" in meta["triggers"]
+    assert "unlock" in meta["triggers"]
+    assert "resume" in meta["triggers"]
+    assert "Access is denied" in meta["startup_error"]
+
+
+def test_install_tells_the_user_to_open_an_administrator_powershell(tmp_path):
+    def run(_argv, check, capture_output, text):
+        raise OSError("ERROR: Access is denied.")
+
+    with pytest.raises(AutostartError) as exc:
+        install_autostart(
+            str(tmp_path / "control"),
+            pythonw=r"C:\Python\pythonw.exe",
+            startup_dir=str(tmp_path / "startup"),
+            run=run,
+            elevated=True,
+        )
+    message = str(exc.value)
+    assert "Access is denied" in message
+    assert "Administrator PowerShell" in message
+    assert "Startup-folder shortcut was not created" in message
+
+
+def test_print_says_startup_was_skipped_without_the_raw_access_denied(capsys):
+    cli._print_autostart_result(
+        {
+            "task_name": "MeetingNotesWatch",
+            "startup_trigger": False,
+            "resume_trigger": True,
+            "startup_error": "ERROR: Access is denied.",
+            "removed_startup": [],
+        }
+    )
+    out = capsys.readouterr().out
+    assert "startup was skipped" in out.lower() or "System startup was skipped" in out
+    assert "Administrator PowerShell" in out
+    assert "ERROR: Access is denied." not in out
 
 
 def test_install_does_not_fall_back_to_a_startup_script(tmp_path):
@@ -194,6 +335,7 @@ def test_install_does_not_fall_back_to_a_startup_script(tmp_path):
             pythonw=r"C:\Python\pythonw.exe",
             startup_dir=str(startup),
             run=run,
+            elevated=True,
         )
     assert "Startup-folder shortcut was not created" in str(exc.value)
     assert "schtasks unavailable" in str(exc.value)
@@ -209,6 +351,7 @@ def test_uninstall_removes_task_xml_and_startup_script(tmp_path):
         pythonw=r"C:\Python\pythonw.exe",
         startup_dir=str(startup),
         run=_ok_run,
+        elevated=True,
     )
     shortcut = startup / "MeetingNotesWatch.vbs"
     shortcut.parent.mkdir(parents=True, exist_ok=True)

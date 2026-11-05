@@ -29,16 +29,102 @@ class AutostartError(RuntimeError):
     """The scheduled task could not be registered."""
 
 
-def find_pythonw(executable=None):
-    """Prefer pythonw.exe next to this interpreter so login starts headless."""
-    exe = os.path.abspath(executable or sys.executable)
+def _is_app_exec_alias(path):
+    """True for the per-user WindowsApps app-execution alias.
+
+    ``Win32_Process.Create`` cannot launch that alias (ReturnValue 8). The real
+    Store interpreter lives under ``Program Files\\WindowsApps`` and is a
+    normal executable, so that directory is not an alias.
+    """
+    if not path:
+        return False
+    parts = [part.casefold() for part in os.path.normpath(str(path)).split(os.sep)]
+    for index in range(len(parts) - 1):
+        if parts[index] == "microsoft" and parts[index + 1] == "windowsapps":
+            return True
+    return False
+
+
+def _first_real_interpreter(paths):
+    for item in paths:
+        if not item:
+            continue
+        path = os.path.abspath(item)
+        if os.path.isfile(path) and not _is_app_exec_alias(path):
+            return path
+    return None
+
+
+def _resolve_real_interpreter():
+    """An interpreter path CreateProcess and WMI can launch.
+
+    Prefer ``sys.executable`` when it is a real file (a venv keeps its own
+    interpreter). Microsoft Store Python reports the WindowsApps alias there;
+    ``sys._base_executable`` or ``python.exe`` under ``sys.base_prefix`` is
+    the real binary in that case.
+    """
+    executable = getattr(sys, "executable", None)
+    base_executable = getattr(sys, "_base_executable", None)
+    real = _first_real_interpreter((executable, base_executable))
+    if real:
+        return real
+    prefix = getattr(sys, "base_prefix", None) or ""
+    if prefix:
+        real = _first_real_interpreter(
+            (
+                os.path.join(prefix, "python.exe"),
+                os.path.join(prefix, "pythonw.exe"),
+            )
+        )
+        if real:
+            return real
+    fallback = executable or base_executable or sys.executable
+    return os.path.abspath(fallback)
+
+
+def _pythonw_beside(exe):
+    """``pythonw.exe`` next to ``exe`` when that file is a real interpreter."""
+    exe = os.path.abspath(exe)
     base = os.path.basename(exe).lower()
     directory = os.path.dirname(exe)
     if base in ("python.exe", "pythonw.exe"):
         candidate = os.path.join(directory, "pythonw.exe")
-        if os.path.isfile(candidate):
+        if os.path.isfile(candidate) and not _is_app_exec_alias(candidate):
             return candidate
     return exe
+
+
+def find_pythonw(executable=None):
+    """Prefer pythonw.exe next to a real interpreter so login starts headless.
+
+    An explicit path is used as given. With no path, Store app-execution
+    aliases under ``WindowsApps`` are replaced by ``sys._base_executable`` or
+    by ``pythonw.exe`` next to the real ``python.exe``.
+    """
+    if executable and not _is_app_exec_alias(executable):
+        return _pythonw_beside(executable)
+    return _pythonw_beside(_resolve_real_interpreter())
+
+
+def _windows_elevation():
+    """True when this process is elevated, False when it is not, None off Windows."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return None
+
+
+def _is_access_denied(detail):
+    text = str(detail or "").lower()
+    return "access is denied" in text or "access denied" in text
+
+
+# Omitted ``elevated`` asks Windows. None means unknown, so startup is attempted.
+_DETECT_ELEVATION = object()
 
 
 def watcher_module_args():
@@ -271,12 +357,14 @@ def install_autostart(
     task_name=TASK_NAME,
     include_resume=True,
     include_boot=True,
+    elevated=_DETECT_ELEVATION,
 ):
     """Create or replace the per-user task. Removes a legacy Startup shortcut.
 
     Raises AutostartError when schtasks cannot register the task. A Startup
     shortcut is never created as a fallback. If a boot trigger is rejected,
-    install retries with logon in its place.
+    install retries with logon in its place. A shell that is not elevated
+    skips the startup trigger and registers logon, unlock, and resume.
     """
     import subprocess
 
@@ -285,9 +373,15 @@ def install_autostart(
     pythonw = pythonw or find_pythonw()
     startup_dir = startup_dir if startup_dir is not None else default_startup_dir()
     run = run or subprocess.run
+    if elevated is _DETECT_ELEVATION:
+        elevated = _windows_elevation()
+    # False: this PowerShell is not an Administrator, so do not ask schtasks
+    # for the startup trigger (that call returns "Access is denied").
+    # None: elevation is unknown, so try startup and drop it if Windows rejects it.
+    try_boot = bool(include_boot) and elevated is not False
     os.makedirs(control_dir, exist_ok=True)
     xml_path = task_xml_path(control_dir)
-    plans = registration_plans(include_boot=include_boot, include_resume=include_resume)
+    plans = registration_plans(include_boot=try_boot, include_resume=include_resume)
     last_error = None
     chosen = None
     for plan in plans:
@@ -312,11 +406,17 @@ def install_autostart(
         chosen = plan
         break
     else:
-        raise AutostartError(
+        message = (
             "Could not register the scheduled task "
             f"'{task_name}'. A Startup-folder shortcut was not created. "
             f"schtasks said: {last_error}"
         )
+        if _is_access_denied(last_error):
+            message += (
+                " Open an Administrator PowerShell and rerun "
+                "`meeting-notes autostart install`."
+            )
+        raise AutostartError(message)
 
     removed = remove_legacy_startup(control_dir, startup_dir)
     triggers = ["logon", "unlock"]
@@ -336,7 +436,16 @@ def install_autostart(
         "removed_startup": removed,
     }
     if include_boot and not chosen["boot"]:
-        meta["startup_error"] = last_error or "startup trigger was rejected"
+        if elevated is False:
+            meta["startup_error"] = (
+                "System startup was skipped because this shell is not an "
+                "Administrator PowerShell. The task was registered without the "
+                "startup trigger. Rerun `meeting-notes autostart install` from an "
+                "Administrator PowerShell to add it."
+            )
+        else:
+            meta["startup_error"] = last_error or "startup trigger was rejected"
+        meta["startup_skipped"] = True
     if include_resume and not chosen["resume"]:
         meta["resume_error"] = last_error or "resume trigger was rejected"
     atomic_write_json(autostart_meta_path(control_dir), meta)

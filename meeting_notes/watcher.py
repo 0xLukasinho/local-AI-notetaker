@@ -27,6 +27,7 @@ from meeting_notes.watch_guard import (
     package_version,
     read_heartbeat,
     read_instance,
+    read_watcher_recording,
     write_instance,
 )
 from meeting_notes.deliver import deliver_folder, retry_outbox
@@ -232,6 +233,8 @@ class MeetWatcher:
         self.heartbeat = heartbeat if heartbeat is not None else None
         self.activity = "idle"
         self._last_beat_state = None
+        self._last_session_folder = None
+        self._last_session_pid = None
         from meeting_notes.meet_detect import CallDebouncer
 
         self.debouncer = CallDebouncer(
@@ -282,8 +285,35 @@ class MeetWatcher:
             self._mirror_device_log(self.session.folder)
         self._beat()
 
+    def _active_watch_recording(self):
+        """Live watcher session from the lock, or None.
+
+        The recorder is a child process. Its ``active.json`` (mode ``watch``)
+        is what makes the heartbeat say recording when this process's own
+        activity flag is still idle.
+        """
+        current_fn = getattr(self.lock_store, "current", None)
+        if current_fn is None:
+            return None
+        try:
+            current = current_fn()
+        except Exception:
+            return None
+        if not isinstance(current, dict) or current.get("mode") != "watch":
+            return None
+        return current
+
+    def _recording_marker(self):
+        active = self._active_watch_recording()
+        if active is not None:
+            return active.get("folder") or active.get("folder_name"), active.get("pid")
+        if self.activity == "recording" and self.session is not None:
+            return self.session.folder, self.session.pid
+        return None, None
+
     def health_state(self):
-        if self.activity == "recording":
+        folder, pid = self._recording_marker()
+        if folder or pid or self.activity == "recording":
             return "recording"
         return "idle"
 
@@ -292,10 +322,24 @@ class MeetWatcher:
         if heartbeat is None:
             return
         state = self.health_state()
-        force = state != self._last_beat_state
+        folder, pid = (None, None)
+        if state == "recording":
+            folder, pid = self._recording_marker()
+        force = (
+            state != self._last_beat_state
+            or folder != self._last_session_folder
+            or pid != self._last_session_pid
+        )
         self._last_beat_state = state
+        self._last_session_folder = folder
+        self._last_session_pid = pid
         try:
-            heartbeat.beat(force=force, state=state)
+            heartbeat.beat(
+                force=force,
+                state=state,
+                session_folder=folder,
+                session_pid=pid,
+            )
         except Exception as exc:
             self.log.error("Could not write the heartbeat: %s", exc)
 
@@ -598,7 +642,16 @@ def serve(config, control_dir, output_dir, sleep=None, monotonic=None):
     stop_reason = "stopped before the loop started"
     try:
         try:
-            heartbeat.beat(force=True, state="idle")
+            active = read_watcher_recording(control_dir)
+            if active:
+                heartbeat.beat(
+                    force=True,
+                    state="recording",
+                    session_folder=active.get("folder") or active.get("folder_name"),
+                    session_pid=active.get("pid"),
+                )
+            else:
+                heartbeat.beat(force=True, state="idle")
         except Exception:
             logger.exception("Could not write the heartbeat")
         logger.info(

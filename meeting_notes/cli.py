@@ -779,9 +779,15 @@ def _print_autostart_result(meta):
         print("It runs hidden at system startup and at logon.")
     else:
         print("It runs hidden at logon.")
-        print("System startup could not be registered without admin. Logon still runs it.")
-        if meta.get("startup_error"):
-            print(f"  {meta['startup_error']}")
+        print(
+            "System startup was skipped because registering it needs an "
+            "Administrator PowerShell. Logon still runs it. Rerun "
+            "`meeting-notes autostart install` from an Administrator PowerShell "
+            "to add the startup trigger."
+        )
+        detail = meta.get("startup_error") or ""
+        if detail and "access is denied" not in detail.lower() and "Administrator PowerShell" not in detail:
+            print(f"  {detail}")
     print("It also runs when the session unlocks.")
     if meta.get("resume_trigger"):
         print("It also runs on resume from sleep.")
