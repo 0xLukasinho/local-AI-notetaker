@@ -87,3 +87,11 @@ diarize_max_speakers = 8
 # Accept the model terms at huggingface.co/pyannote/speaker-diarization-3.1
 # before the first run. Never commit a real token.
 hf_token = ""
+
+# Off by default. When true, and webhook_url is set, the watcher POSTs one
+# small JSON object if it starts after being down for more than 15 minutes
+# on the same local day. The body is {"type": "watcher-health", "down_seconds": ...}
+# and is not a transcript. Receivers can ignore that type. It is not written
+# to the transcript outbox, and a gap that crosses local midnight (the computer
+# was off overnight) does not send one.
+watcher_health_ping = false

@@ -206,7 +206,14 @@ If a session is already recording, the watcher does not start a second one and l
 
 Watcher sessions use a unique folder. The first one that day is still `YYYY-MM-DD_slug`. If that folder exists, the next is `YYYY-MM-DD_slug_HHMM`, then `YYYY-MM-DD_slug_HHMM_2`, and so on. Manual `start` keeps the unsuffixed name.
 
-Logs rotate at `~/.meeting-notes/watch.log`.
+The watcher rewrites `~/.meeting-notes/heartbeat.json` about every 30 seconds with the time, pid, version, and state (`idle` or `recording`). State stays `recording` through transcription, so a long transcript is not treated as a hang. `~/.meeting-notes/watch.log` records why the watcher started, why it stopped, any unhandled exception (with the traceback), and any hang-kill or restart. The log rotates at 1 MB and keeps 3 older files.
+
+```bash
+meeting-notes watch --ensure
+meeting-notes watch --status
+```
+
+`--ensure` exits immediately when a healthy watcher is already running. When none is running, or the heartbeat is older than 3 minutes, it starts one hidden `pythonw` process and exits. A heartbeat that still says `recording` is left alone until it is older than 10 minutes, and a pid that does not hold the watcher lock is never killed. Two watchers cannot run at once: the live process holds a lock that disappears if that process crashes.
 
 `joined_at` is when the join debounce confirms and recording starts. `left_at` is when recording stops (the leave debounce has already elapsed). `duration_seconds` is that interval.
 
@@ -245,7 +252,7 @@ No new packages. From the repo:
 1. `git pull`
 2. `meeting-notes speakers` (refreshes the extension copy), then in `chrome://extensions` click Reload on Meeting Notes Speaker Tags
 3. In Meet, press CC so live captions are on. Other people do not see them
-4. Press Ctrl+C in the `meeting-notes watch` window and start `meeting-notes watch` again
+4. End the running watcher and start it again so it loads this code. If it is the hidden autostart process, end that `pythonw` in Task Manager and run `meeting-notes watch --ensure`. A watcher that is already healthy keeps the code it started with.
 
 On the next call with two guests, each remote sentence should carry that person's name. `speakers.jsonl` shows `caption_speaker` on each sample. If you forget CC, `watch.log` and the transcript step say to press it, and unnamed remote lines say `Remote`.
 
@@ -321,24 +328,57 @@ Copy `config.example.toml` to `~/.meeting-notes/config.toml`, or use `config.jso
 | `diarize_backend` | `auto` | `auto`, `builtin`, `speechbrain`, `resemblyzer`, `pyannote`, or `off`. |
 | `diarize_max_speakers` | `8` | Hint for pyannote. Distant voices are not merged to fit it. |
 | `hf_token` | empty | Optional Hugging Face token for pyannote. Prefer `HF_TOKEN`. Never commit it. |
+| `watcher_health_ping` | `false` | When true, and `webhook_url` is set, POST one `{"type": "watcher-health"}` event if the watcher starts after being down more than 15 minutes on the same local day. Not a transcript. |
 
 ### Autostart
 
-Windows only. Registers the watcher at login with `pythonw` (no console window), via Task Scheduler, or a Startup-folder script if `schtasks` fails.
+Windows only. One per-user scheduled task (no admin) runs `meeting-notes watch --ensure` hidden, without a console window and without taking focus:
+
+- at logon (about 15 seconds after login, so the profile is ready)
+- when the session is unlocked
+- on resume from sleep, when Windows accepts that trigger
+- every 5 minutes, which is what brings the watcher back if the other triggers do not fire
+
+`--ensure` starts a watcher only when one is not already healthy, so the 5-minute run does not open a second copy. The task replaces a Startup-folder `MeetingNotesWatch.vbs`. Install deletes that shortcut when it is present and does not create a new one.
+
+From the repo:
 
 ```bash
-meeting-notes watch --install
+git pull
+pip install -e ".[windows]"
+meeting-notes autostart install
+meeting-notes autostart status
 meeting-notes watch --status
-meeting-notes watch --uninstall
 ```
 
-`--status` prints whether login autostart is registered, whether a watcher process is running, and where the config and log are.
+`autostart install` registers the task and starts a watcher immediately when one is not already running. `autostart status` and `watch --status` print the same picture: whether the task is registered, whether the process is running, and the heartbeat age and state. `meeting-notes watch --install` is the same as `autostart install`. `meeting-notes autostart uninstall` removes the task and any leftover Startup shortcut.
+
+In Task Scheduler the task is named `MeetingNotesWatch`. It is hidden; turn on **View → Show hidden tasks** to see it there. You do not need to. `autostart status` is the check.
+
+`watch.log` is the place a failure shows up: `ensure: starting watcher`, `hang-kill`, `ensure: restarting watcher`, `Unhandled exception`, and `Watcher stopped` all have a timestamp. A healthy check every 5 minutes is an INFO line (`ensure: watcher already running`) and does not page anyone.
+
+Optional: set `watcher_health_ping = true` in `~/.meeting-notes/config.toml` when `webhook_url` is already set. If the watcher then starts after a gap longer than 15 minutes, and that gap begins and ends on the same local calendar day, it POSTs one small JSON body:
+
+`type` (`watcher-health`), `down_seconds`, `previous_state`, `previous_heartbeat_at`, `pid`, `version`, `started_at`.
+
+There is no transcript in that body, it does not go through the transcript outbox, and a receiver can ignore `type: watcher-health`. The webhook auth header is the same one used for transcripts. The auth value is not in the body and is not written to the log. The ping stays off until you set the key.
+
+Limits:
+
+- Install needs `schtasks` and a normal user account. If registration fails, the command prints the `schtasks` error, appends it to `watch.log`, and leaves autostart uninstalled. It does not write a Startup-folder shortcut.
+- If the resume-from-sleep trigger is rejected, install keeps logon, unlock, and the 5-minute trigger and says so.
+- A watcher that is actually recording (including while Whisper runs) is not killed for a stale heartbeat until that heartbeat is older than 10 minutes. A stuck recording can keep going until then. Killing it also stops its recorder.
+- A pid left in the lock file is not killed unless that process still holds the watcher lock, so a reused pid is not a random program that gets stopped.
+- The health ping cannot tell a crash from a laptop that slept for more than 15 minutes on the same day. Overnight (the previous heartbeat was on an earlier local date) does not ping. A gap that starts before midnight and is only noticed after midnight does not ping either; the 5-minute check during the evening would already have restarted it.
+- `git pull` does not reload a watcher that is already running. After an update, end the hidden `pythonw` process (Task Manager) and run `meeting-notes watch --ensure`.
+- The replacement watcher is started with WMI (`Win32_Process.Create`) so it keeps running after the scheduled task exits. If that call fails, `--ensure` starts a detached process instead and logs `popen-fallback`. A detached process can be stopped when the task exits; the next 5-minute run tries again.
+- The watcher and autostart are Windows-only.
 
 ## Privacy
 
 - Audio recording and Whisper transcription run entirely on your machine
 - The transcript text is sent to Claude via the Claude Code CLI for note generation — this is the only network call on the default `start` / `reprocess` path
-- Transcript-only mode and the Meet watcher do not call Claude. If `webhook_url` is set, the watcher POSTs the transcript to that URL after the session finishes
+- Transcript-only mode and the Meet watcher do not call Claude. If `webhook_url` is set, the watcher POSTs the transcript to that URL after the session finishes. With `watcher_health_ping = true` (default false), a long same-day outage also POSTs one `watcher-health` event to that same URL. That event is not a transcript
 - The optional Chrome extension sends participant names, the active-speaker highlight, and caption lines (only when you have captions on) to `127.0.0.1` on this computer only. It does not join the call or change what other people see
 - Naming remote speakers uses those local caption lines. No extra model is downloaded for that
 - All files (audio, transcript, notes) are stored locally in `~/meeting-notes/`
@@ -364,6 +404,9 @@ System audio is a WASAPI loopback per playback device. The recorder follows devi
 
 **Webhook transcript stops after a few minutes**
 `transcript.txt` is the full text. The webhook is several JSON bodies when that file is longer than `webhook_max_body_bytes`. Join `transcript` by `chunk_index`. `watch.log` lines `Posting transcript (N chars, M request(s), max body B bytes)` are the size that was sent. The `Authorization` header is unchanged and is not logged.
+
+**The watcher was not running and a call was missed**
+Run `meeting-notes watch --status`. `Watcher process: not running` or a heartbeat older than a few minutes means it was down. `~/.meeting-notes/watch.log` has the start, stop, hang-kill, and any traceback. `meeting-notes autostart status` should say the scheduled task is installed. If it says not installed, run `meeting-notes autostart install`. You should not have to check this yourself after that; the task runs `--ensure` every 5 minutes.
 
 **Watcher never notices a Google Meet**
 Open `~/.meeting-notes/watch.log`. `Microphone not in use (registry=no, wasapi=unavailable)` means the WASAPI probe is off (usually `pycaw` is not installed: `pip install pycaw`) and the consent-store registry also did not show Chrome. `Meet window not detected` while you are in the call means the Meet tab is not the active Chrome tab; focus it for the join hold (`join_debounce_seconds`, default 12). After the session has started, a mute or a background tab does not by itself end it.

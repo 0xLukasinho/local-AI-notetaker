@@ -16,6 +16,18 @@ import threading
 from dataclasses import dataclass
 
 from meeting_notes.autostart import find_pythonw
+from meeting_notes.watch_guard import (
+    HEARTBEAT_INTERVAL_SECONDS,
+    Heartbeat,
+    acquire_instance_lock,
+    clear_instance,
+    consume_start_reason,
+    maybe_send_health,
+    package_version,
+    read_heartbeat,
+    read_instance,
+    write_instance,
+)
 from meeting_notes.deliver import deliver_folder, retry_outbox
 from meeting_notes.device_log import DEVICE_LOG_FILENAME, read_new_device_events
 from meeting_notes.meet_detect import session_name
@@ -199,6 +211,7 @@ class MeetWatcher:
         wall_datetime,
         output_dir,
         log,
+        heartbeat=None,
     ):
         self.config = config
         self.detector = detector
@@ -212,6 +225,9 @@ class MeetWatcher:
         self.wall_datetime = wall_datetime
         self.output_dir = output_dir
         self.log = log
+        self.heartbeat = heartbeat if heartbeat is not None else None
+        self.activity = "idle"
+        self._last_beat_state = None
         from meeting_notes.meet_detect import CallDebouncer
 
         self.debouncer = CallDebouncer(
@@ -260,6 +276,24 @@ class MeetWatcher:
         self._poll_child()
         if self.session is not None:
             self._mirror_device_log(self.session.folder)
+        self._beat()
+
+    def health_state(self):
+        if self.activity == "recording":
+            return "recording"
+        return "idle"
+
+    def _beat(self):
+        heartbeat = self.heartbeat
+        if heartbeat is None:
+            return
+        state = self.health_state()
+        force = state != self._last_beat_state
+        self._last_beat_state = state
+        try:
+            heartbeat.beat(force=force, state=state)
+        except Exception as exc:
+            self.log.error("Could not write the heartbeat: %s", exc)
 
     def shutdown(self):
         """Stop a recording we started and deliver it before the process exits."""
@@ -324,7 +358,9 @@ class MeetWatcher:
             return
         self.delivered = False
         self.suppressed = False
+        self.activity = "recording"
         self.log.info("Started transcript session %s (%s)", folder, name)
+        self._beat()
 
     def _on_leave(self):
         session = self.session
@@ -332,28 +368,37 @@ class MeetWatcher:
         self.session = None
         self.suppressed = False
         if suppressed or session is None:
+            self.activity = "idle"
             self.log.info("Call ended with no watcher recording to stop.")
+            self._beat()
             return
         if self.delivered:
+            self.activity = "idle"
             self.log.info("Call ended; session %s was already delivered.", session.folder)
+            self._beat()
             return
+        self.activity = "recording"
         self.log.info("Call ended; stopping %s", session.folder)
-        self._mirror_device_log(session.folder)
         try:
-            self.launcher.request_stop(session)
-        except Exception as exc:
-            self.log.error("Failed to signal stop for %s: %s", session.folder, exc)
-        state = self._wait_until_finished(session)
-        self._mirror_device_log(session.folder)
-        if state in _FINISHED_OK:
-            self._deliver(session.folder)
-        else:
-            self.log.error(
-                "Session %s finished with state %s; not delivering.",
-                session.folder,
-                state,
-            )
-        self.delivered = True
+            self._mirror_device_log(session.folder)
+            try:
+                self.launcher.request_stop(session)
+            except Exception as exc:
+                self.log.error("Failed to signal stop for %s: %s", session.folder, exc)
+            state = self._wait_until_finished(session)
+            self._mirror_device_log(session.folder)
+            if state in _FINISHED_OK:
+                self._deliver(session.folder)
+            else:
+                self.log.error(
+                    "Session %s finished with state %s; not delivering.",
+                    session.folder,
+                    state,
+                )
+            self.delivered = True
+        finally:
+            self.activity = "idle"
+            self._beat()
 
     def _poll_child(self):
         if self.session is None or self.delivered:
@@ -370,14 +415,17 @@ class MeetWatcher:
             self.log.info("Recording process finished; delivering %s", self.session.folder)
             self._deliver(self.session.folder)
             self.delivered = True
+            self.activity = "idle"
             return
         if state in _FINISHED_BAD:
             self.log.error("Recording process ended (%s) before the call ended.", state)
             self.delivered = True
+            self.activity = "idle"
 
     def _wait_until_finished(self, session):
         deadline = self.monotonic() + float(self.config.transcribe_timeout_seconds)
         while True:
+            self._beat()
             try:
                 state = self.launcher.state(session)
             except Exception as exc:
@@ -433,17 +481,23 @@ class MeetWatcher:
             self.log.info("Retried outbox; delivered %s session(s).", count)
 
 
-def configure_watch_logging(control_dir):
+def configure_watch_logging(control_dir, max_bytes=1_000_000, backup_count=3):
+    """Log to ~/.meeting-notes/watch.log and rotate so the file stays bounded."""
     os.makedirs(control_dir, exist_ok=True)
     path = os.path.join(control_dir, LOG_FILENAME)
     logger = logging.getLogger("meeting_notes.watch")
     logger.setLevel(logging.INFO)
-    logger.handlers.clear()
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        try:
+            handler.close()
+        except Exception:
+            pass
     logger.propagate = False
     file_handler = logging.handlers.RotatingFileHandler(
         path,
-        maxBytes=1_000_000,
-        backupCount=3,
+        maxBytes=max_bytes,
+        backupCount=backup_count,
         encoding="utf-8",
     )
     formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
@@ -473,8 +527,27 @@ def build_windows_detector(config, log=None):
     )
 
 
+def _start_health_ping(config, previous, log):
+    """Send the optional health ping without delaying call detection."""
+    if not getattr(config, "watcher_health_ping", False) or not previous:
+        return
+
+    def _run():
+        try:
+            import time
+
+            maybe_send_health(config, previous, time.time(), log=log)
+        except Exception:
+            log.exception("Unhandled exception during watcher-health ping")
+
+    threading.Thread(target=_run, name="watcher-health-ping", daemon=True).start()
+
+
 def serve(config, control_dir, output_dir, sleep=None, monotonic=None):
-    """Run the watcher until Ctrl+C. Windows detection only."""
+    """Run the watcher until Ctrl+C. Windows detection only.
+
+    A second process exits immediately when one watcher already holds the lock.
+    """
     import time
 
     if sys.platform != "win32":
@@ -483,75 +556,132 @@ def serve(config, control_dir, output_dir, sleep=None, monotonic=None):
             "(Chrome window enumeration and the microphone probes)."
         )
     logger, _path = configure_watch_logging(control_dir)
+    lock = acquire_instance_lock(control_dir)
+    if lock is None:
+        owner = read_instance(control_dir) or {}
+        logger.warning(
+            "Watcher not started: another watcher holds the lock (pid %s). Exiting.",
+            owner.get("pid"),
+        )
+        logger.info(
+            "Watcher stopped: pid=%s reason=another watcher holds the lock",
+            os.getpid(),
+        )
+        other = owner.get("pid")
+        suffix = f" (pid {other})" if other else ""
+        print(
+            f"Another watcher is already running{suffix}. This process is exiting.",
+            file=sys.stderr,
+        )
+        return
+
+    reason = consume_start_reason(control_dir)
+    version = package_version()
+    started = time.time()
+    write_instance(control_dir, os.getpid(), version, started)
     write_watcher_pid(control_dir)
-    stop_event = threading.Event()
-
-    def _handle_sigint(_sig, _frame):
-        stop_event.set()
-        logger.info("Stop requested; finishing the current session if one is recording.")
-
-    previous = None
-    try:
-        import signal
-
-        previous = signal.getsignal(signal.SIGINT)
-        signal.signal(signal.SIGINT, _handle_sigint)
-        if hasattr(signal, "SIGBREAK"):
-            signal.signal(signal.SIGBREAK, _handle_sigint)
-    except Exception:
-        previous = None
-
-    def _sleep(seconds):
-        fn = sleep or time.sleep
-        if stop_event.is_set():
-            return
-        # Wake promptly on Ctrl+C without busy-spinning.
-        end = (monotonic or time.monotonic)() + seconds
-        while (monotonic or time.monotonic)() < end:
-            if stop_event.is_set():
-                return
-            remaining = end - (monotonic or time.monotonic)()
-            fn(min(0.2, remaining))
-
-    box = outbox_dir(control_dir)
-
-    def _deliver(folder):
-        return deliver_folder(folder, config, control_dir=control_dir, log=logger)
-
-    def _retry():
-        return retry_outbox(box, config, log=logger)
-
-    watcher = MeetWatcher(
-        config=config,
-        detector=build_windows_detector(config, log=logger),
-        launcher=SubprocessLauncher(control_dir),
-        deliver_fn=_deliver,
-        lock_store=FileLockStore(control_dir),
-        outbox_retry=_retry,
-        sleep=_sleep,
-        monotonic=monotonic or time.monotonic,
-        wall_iso=iso_now,
-        wall_datetime=_wall_datetime,
-        output_dir=output_dir,
-        log=logger,
+    # Read the previous beat before this process overwrites it. That gap is
+    # how long the watcher was down.
+    previous_heartbeat = read_heartbeat(control_dir)
+    heartbeat = Heartbeat(
+        control_dir,
+        interval=HEARTBEAT_INTERVAL_SECONDS,
+        version=version,
     )
-    logger.info(
-        "Watching for Google Meet in Chrome (join %.0fs, leave %.0fs). Ctrl+C to stop.",
-        config.join_debounce_seconds,
-        config.leave_debounce_seconds,
-    )
+    stop_reason = "stopped before the loop started"
     try:
-        watcher.run(stop_event=stop_event)
-    finally:
-        clear_watcher_pid(control_dir, pid=os.getpid())
+        try:
+            heartbeat.beat(force=True, state="idle")
+        except Exception:
+            logger.exception("Could not write the heartbeat")
+        logger.info(
+            "Watcher starting: pid=%s version=%s reason=%s",
+            os.getpid(),
+            version,
+            reason,
+        )
+        _start_health_ping(config, previous_heartbeat, logger)
+        stop_event = threading.Event()
+
+        def _handle_sigint(_sig, _frame):
+            stop_event.set()
+            logger.info("Stop requested; finishing the current session if one is recording.")
+
+        previous_signal = None
         try:
             import signal
 
-            if previous is not None:
-                signal.signal(signal.SIGINT, previous)
+            previous_signal = signal.getsignal(signal.SIGINT)
+            signal.signal(signal.SIGINT, _handle_sigint)
+            if hasattr(signal, "SIGBREAK"):
+                signal.signal(signal.SIGBREAK, _handle_sigint)
         except Exception:
-            pass
-        logger.info("Watcher stopped.")
+            previous_signal = None
+
+        def _sleep(seconds):
+            fn = sleep or time.sleep
+            if stop_event.is_set():
+                return
+            # Wake promptly on Ctrl+C without busy-spinning.
+            end = (monotonic or time.monotonic)() + seconds
+            while (monotonic or time.monotonic)() < end:
+                if stop_event.is_set():
+                    return
+                remaining = end - (monotonic or time.monotonic)()
+                fn(min(0.2, remaining))
+
+        box = outbox_dir(control_dir)
+
+        def _deliver(folder):
+            return deliver_folder(folder, config, control_dir=control_dir, log=logger)
+
+        def _retry():
+            return retry_outbox(box, config, log=logger)
+
+        watcher = MeetWatcher(
+            config=config,
+            detector=build_windows_detector(config, log=logger),
+            launcher=SubprocessLauncher(control_dir),
+            deliver_fn=_deliver,
+            lock_store=FileLockStore(control_dir),
+            outbox_retry=_retry,
+            sleep=_sleep,
+            monotonic=monotonic or time.monotonic,
+            wall_iso=iso_now,
+            wall_datetime=_wall_datetime,
+            output_dir=output_dir,
+            log=logger,
+            heartbeat=heartbeat,
+        )
+        logger.info(
+            "Watching for Google Meet in Chrome (join %.0fs, leave %.0fs). Ctrl+C to stop.",
+            config.join_debounce_seconds,
+            config.leave_debounce_seconds,
+        )
+        stop_reason = "stop requested"
+        try:
+            watcher.run(stop_event=stop_event)
+        except Exception:
+            stop_reason = "unhandled exception"
+            logger.exception("Unhandled exception in watcher")
+            raise
+        finally:
+            try:
+                import signal
+
+                if previous_signal is not None:
+                    signal.signal(signal.SIGINT, previous_signal)
+            except Exception:
+                pass
+    finally:
+        try:
+            heartbeat.beat(force=True, state="idle")
+        except Exception:
+            logger.exception("Could not write the final heartbeat")
+        clear_watcher_pid(control_dir, pid=os.getpid())
+        clear_instance(control_dir, pid=os.getpid())
+        logger.info("Watcher stopped: pid=%s reason=%s", os.getpid(), stop_reason)
+        lock.release()
 
 
 def _wall_datetime():

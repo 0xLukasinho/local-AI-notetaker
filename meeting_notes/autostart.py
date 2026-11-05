@@ -1,18 +1,31 @@
-"""Register the Meet watcher to start at Windows login.
+"""Register the Meet watcher with Windows Task Scheduler.
 
-Task Scheduler is preferred. If schtasks fails, a Startup-folder VBScript
-launches pythonw with window style 0 (no console). Both paths are described
-by pure helpers so tests can run without Windows.
+``meeting-notes autostart install`` creates one per-user task (no admin). The
+task runs ``meeting-notes watch --ensure`` at logon, on unlock, every five
+minutes, and on resume-from-sleep when Windows accepts that trigger. The task
+is hidden and does not open a console.
+
+An old Startup-folder ``MeetingNotesWatch.vbs`` is removed. Install does not
+create a new one: a shortcut that only runs at login is what left the watcher
+down all day with nobody noticing. If schtasks fails, install raises and the
+error is logged.
+
+The XML is built from the interpreter that runs install. Nothing in this
+module hardcodes a user name, a home directory, or a webhook.
 """
 
 import json
 import os
 import sys
-
-from meeting_notes.atomic_io import atomic_write_json
+from xml.sax.saxutils import escape
 
 TASK_NAME = "MeetingNotesWatch"
 AUTOSTART_FILENAME = "autostart.json"
+TASK_XML_FILENAME = "MeetingNotesWatch.xml"
+
+
+class AutostartError(RuntimeError):
+    """The scheduled task could not be registered."""
 
 
 def find_pythonw(executable=None):
@@ -28,24 +41,16 @@ def find_pythonw(executable=None):
 
 
 def watcher_module_args():
-    return ["-m", "meeting_notes.cli", "watch"]
+    return ["-m", "meeting_notes.cli", "watch", "--ensure"]
 
 
-def schtasks_create_argv(pythonw, task_name=TASK_NAME):
-    command = subprocess_command_line(pythonw)
-    return [
-        "schtasks",
-        "/Create",
-        "/F",
-        "/TN",
-        task_name,
-        "/SC",
-        "ONLOGON",
-        "/RL",
-        "LIMITED",
-        "/TR",
-        command,
-    ]
+def ensure_command_line(pythonw):
+    """Command line recorded in autostart.json. The task itself uses XML."""
+    return f'"{pythonw}" -m meeting_notes.cli watch --ensure'
+
+
+def schtasks_register_argv(xml_path, task_name=TASK_NAME):
+    return ["schtasks", "/Create", "/F", "/TN", task_name, "/XML", xml_path]
 
 
 def schtasks_query_argv(task_name=TASK_NAME):
@@ -56,13 +61,12 @@ def schtasks_delete_argv(task_name=TASK_NAME):
     return ["schtasks", "/Delete", "/TN", task_name, "/F"]
 
 
-def subprocess_command_line(pythonw):
-    """A single command line suitable for schtasks /TR and for the VBS runner."""
-    return f'"{pythonw}" -m meeting_notes.cli watch'
-
-
 def startup_vbs(pythonw):
-    """VBScript that runs the watcher with no window (style 0)."""
+    """Legacy Startup-folder script. Install no longer writes this.
+
+    Uninstall still deletes ``MeetingNotesWatch.vbs``. The text is kept so the
+    old hidden launch (window style 0) stays obvious in tests.
+    """
     safe = pythonw.replace('"', '""')
     return (
         'Set sh = CreateObject("WScript.Shell")\r\n'
@@ -70,9 +74,114 @@ def startup_vbs(pythonw):
     )
 
 
+def repetition_start(now=None):
+    """Local time one minute from now.
+
+    Task Scheduler treats a daily trigger whose time-of-day has already passed
+    as finished for today, so the 5-minute repetition would wait until tomorrow.
+    A start a minute ahead makes the first check soon, then every 5 minutes for
+    the next day, and the daily schedule repeats that window.
+    """
+    from datetime import datetime, timedelta
+
+    moment = (now or datetime.now()).replace(microsecond=0) + timedelta(minutes=1)
+    return moment.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def task_xml(pythonw, include_resume=True, repetition_start_at=None):
+    """Task Scheduler 2.0 XML for a per-user, least-privilege, hidden task.
+
+    The five-minute trigger is a daily schedule that repeats for one day. Its
+    start is one minute ahead so the window begins today instead of tomorrow.
+    Logon waits 15 seconds so the user profile is ready. Resume-from-sleep is
+    a System log event and is omitted when ``include_resume`` is false.
+    """
+    command = escape(pythonw)
+    arguments = escape("-m meeting_notes.cli watch --ensure")
+    boundary = escape(repetition_start_at or repetition_start())
+    resume = ""
+    if include_resume:
+        query = (
+            "<QueryList><Query Id=\"0\" Path=\"System\"><Select Path=\"System\">"
+            "*[System[Provider[@Name='Microsoft-Windows-Kernel-Power'] and "
+            "(EventID=107 or EventID=507)]]"
+            "</Select></Query></QueryList>"
+        )
+        resume = (
+            "    <EventTrigger>\r\n"
+            "      <Enabled>true</Enabled>\r\n"
+            f"      <Subscription>{escape(query)}</Subscription>\r\n"
+            "    </EventTrigger>\r\n"
+        )
+    return (
+        '<?xml version="1.0" encoding="UTF-16"?>\r\n'
+        '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\r\n'
+        "  <RegistrationInfo>\r\n"
+        "    <Description>Keep the meeting-notes watcher running. "
+        "Runs watch --ensure at logon, on unlock, every 5 minutes, "
+        "and on resume from sleep when that trigger is available.</Description>\r\n"
+        "  </RegistrationInfo>\r\n"
+        "  <Triggers>\r\n"
+        "    <LogonTrigger>\r\n"
+        "      <Enabled>true</Enabled>\r\n"
+        "      <Delay>PT15S</Delay>\r\n"
+        "    </LogonTrigger>\r\n"
+        "    <SessionStateChangeTrigger>\r\n"
+        "      <Enabled>true</Enabled>\r\n"
+        "      <StateChange>SessionUnlock</StateChange>\r\n"
+        "    </SessionStateChangeTrigger>\r\n"
+        "    <CalendarTrigger>\r\n"
+        "      <Repetition>\r\n"
+        "        <Interval>PT5M</Interval>\r\n"
+        "        <Duration>P1D</Duration>\r\n"
+        "        <StopAtDurationEnd>false</StopAtDurationEnd>\r\n"
+        "      </Repetition>\r\n"
+        f"      <StartBoundary>{boundary}</StartBoundary>\r\n"
+        "      <Enabled>true</Enabled>\r\n"
+        "      <ScheduleByDay>\r\n"
+        "        <DaysInterval>1</DaysInterval>\r\n"
+        "      </ScheduleByDay>\r\n"
+        "    </CalendarTrigger>\r\n"
+        f"{resume}"
+        "  </Triggers>\r\n"
+        "  <Principals>\r\n"
+        '    <Principal id="Author">\r\n'
+        "      <LogonType>InteractiveToken</LogonType>\r\n"
+        "      <RunLevel>LeastPrivilege</RunLevel>\r\n"
+        "    </Principal>\r\n"
+        "  </Principals>\r\n"
+        "  <Settings>\r\n"
+        "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\r\n"
+        "    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\r\n"
+        "    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\r\n"
+        "    <AllowHardTerminate>true</AllowHardTerminate>\r\n"
+        "    <StartWhenAvailable>true</StartWhenAvailable>\r\n"
+        "    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>\r\n"
+        "    <AllowStartOnDemand>true</AllowStartOnDemand>\r\n"
+        "    <Enabled>true</Enabled>\r\n"
+        "    <Hidden>true</Hidden>\r\n"
+        "    <RunOnlyIfIdle>false</RunOnlyIfIdle>\r\n"
+        "    <WakeToRun>false</WakeToRun>\r\n"
+        "    <ExecutionTimeLimit>PT10M</ExecutionTimeLimit>\r\n"
+        "    <Priority>7</Priority>\r\n"
+        "  </Settings>\r\n"
+        '  <Actions Context="Author">\r\n'
+        "    <Exec>\r\n"
+        f"      <Command>{command}</Command>\r\n"
+        f"      <Arguments>{arguments}</Arguments>\r\n"
+        "    </Exec>\r\n"
+        "  </Actions>\r\n"
+        "</Task>\r\n"
+    )
+
+
 def default_startup_dir():
     appdata = os.environ.get("APPDATA", "")
     return os.path.join(appdata, "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
+
+
+def task_xml_path(control_dir):
+    return os.path.join(control_dir, TASK_XML_FILENAME)
 
 
 def autostart_meta_path(control_dir):
@@ -90,46 +199,131 @@ def read_autostart(control_dir):
         return None
 
 
-def install_autostart(control_dir, pythonw=None, startup_dir=None, run=None, task_name=TASK_NAME):
-    """Create the login task. Falls back to a Startup VBS if schtasks fails.
+def startup_shortcut_path(startup_dir):
+    return os.path.join(startup_dir, f"{TASK_NAME}.vbs")
 
-    Returns a small dict describing what was installed.
+
+def legacy_startup_paths(control_dir, startup_dir):
+    paths = []
+    meta = read_autostart(control_dir) or {}
+    if meta.get("path"):
+        paths.append(meta["path"])
+    if startup_dir:
+        paths.append(startup_shortcut_path(startup_dir))
+    unique = []
+    for path in paths:
+        if path and path not in unique:
+            unique.append(path)
+    return unique
+
+
+def remove_legacy_startup(control_dir, startup_dir):
+    """Delete a leftover Startup-folder shortcut. Returns the paths removed."""
+    removed = []
+    for path in legacy_startup_paths(control_dir, startup_dir):
+        if path and os.path.isfile(path):
+            try:
+                os.remove(path)
+                removed.append(path)
+            except OSError:
+                pass
+    return removed
+
+
+def _write_task_xml(path, xml_text):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    # Task Scheduler wants UTF-16. atomic_write_text writes UTF-8, so write
+    # the bytes here and replace the destination in one step.
+    tmp = path + ".partial"
+    try:
+        with open(tmp, "wb") as handle:
+            handle.write(xml_text.encode("utf-16"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def _run_error(exc):
+    detail = getattr(exc, "stderr", None) or getattr(exc, "stdout", None) or str(exc)
+    return " ".join(str(detail).split()) or exc.__class__.__name__
+
+
+def install_autostart(
+    control_dir,
+    pythonw=None,
+    startup_dir=None,
+    run=None,
+    task_name=TASK_NAME,
+    include_resume=True,
+    repetition_start_at=None,
+):
+    """Create or replace the per-user task. Removes a legacy Startup shortcut.
+
+    Raises AutostartError when schtasks cannot register the task. A Startup
+    shortcut is never created as a fallback.
     """
     import subprocess
 
+    from meeting_notes.atomic_io import atomic_write_json
+
     pythonw = pythonw or find_pythonw()
-    startup_dir = startup_dir or default_startup_dir()
+    startup_dir = startup_dir if startup_dir is not None else default_startup_dir()
     run = run or subprocess.run
     os.makedirs(control_dir, exist_ok=True)
-    argv = schtasks_create_argv(pythonw, task_name=task_name)
-    try:
-        run(argv, check=True, capture_output=True, text=True)
-    except Exception as exc:
-        vbs_path = _install_startup_vbs(startup_dir, pythonw)
-        meta = {
-            "method": "startup",
-            "path": vbs_path,
-            "pythonw": pythonw,
-            "task_name": task_name,
-            "fallback_reason": str(exc),
-        }
+    xml_path = task_xml_path(control_dir)
+    boundary = repetition_start_at or repetition_start()
+    attempts = (True, False) if include_resume else (False,)
+    last_error = None
+    registered_resume = False
+    for resume in attempts:
+        _write_task_xml(
+            xml_path,
+            task_xml(pythonw, include_resume=resume, repetition_start_at=boundary),
+        )
+        try:
+            run(
+                schtasks_register_argv(xml_path, task_name=task_name),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except Exception as exc:
+            last_error = _run_error(exc)
+            continue
+        registered_resume = bool(resume)
+        break
     else:
-        meta = {
-            "method": "schtasks",
-            "task_name": task_name,
-            "pythonw": pythonw,
-            "command": subprocess_command_line(pythonw),
-        }
+        raise AutostartError(
+            "Could not register the scheduled task "
+            f"'{task_name}'. A Startup-folder shortcut was not created. "
+            f"schtasks said: {last_error}"
+        )
+
+    removed = remove_legacy_startup(control_dir, startup_dir)
+    triggers = ["logon", "unlock", "every-5-minutes"]
+    if registered_resume:
+        triggers.append("resume")
+    meta = {
+        "method": "schtasks",
+        "task_name": task_name,
+        "pythonw": pythonw,
+        "command": ensure_command_line(pythonw),
+        "triggers": triggers,
+        "resume_trigger": registered_resume,
+        "xml_path": xml_path,
+        "removed_startup": removed,
+    }
+    if include_resume and not registered_resume:
+        meta["resume_error"] = last_error or "resume trigger was rejected"
     atomic_write_json(autostart_meta_path(control_dir), meta)
     return meta
-
-
-def _install_startup_vbs(startup_dir, pythonw):
-    os.makedirs(startup_dir, exist_ok=True)
-    path = os.path.join(startup_dir, f"{TASK_NAME}.vbs")
-    with open(path, "w", encoding="utf-8", newline="") as handle:
-        handle.write(startup_vbs(pythonw))
-    return path
 
 
 def uninstall_autostart(control_dir, startup_dir=None, run=None, task_name=TASK_NAME):
@@ -137,7 +331,7 @@ def uninstall_autostart(control_dir, startup_dir=None, run=None, task_name=TASK_
     import subprocess
 
     run = run or subprocess.run
-    startup_dir = startup_dir or default_startup_dir()
+    startup_dir = startup_dir if startup_dir is not None else default_startup_dir()
     removed = []
     meta = read_autostart(control_dir) or {}
     name = meta.get("task_name") or task_name
@@ -146,12 +340,15 @@ def uninstall_autostart(control_dir, startup_dir=None, run=None, task_name=TASK_
         removed.append(f"schtasks:{name}")
     except Exception:
         pass
-    candidates = []
-    if meta.get("path"):
-        candidates.append(meta["path"])
-    candidates.append(os.path.join(startup_dir, f"{TASK_NAME}.vbs"))
-    for path in candidates:
+    for path in legacy_startup_paths(control_dir, startup_dir):
         if path and os.path.isfile(path):
+            try:
+                os.remove(path)
+                removed.append(path)
+            except OSError:
+                pass
+    for path in (meta.get("xml_path"), task_xml_path(control_dir)):
+        if path and os.path.isfile(path) and path not in removed:
             try:
                 os.remove(path)
                 removed.append(path)
@@ -181,7 +378,12 @@ def autostart_status(control_dir, query_task=None, task_name=TASK_NAME):
                 installed = _query_schtasks(name)
             else:
                 installed = bool(query_task(name))
-            detail = f"Task Scheduler ({name})" if installed else f"task missing ({name})"
+            triggers = meta.get("triggers") or []
+            trigger_text = ", ".join(triggers) if triggers else "logon"
+            if installed:
+                detail = f"Task Scheduler ({name}): {trigger_text}"
+            else:
+                detail = f"task missing ({name})"
         elif method == "startup":
             path = meta.get("path") or ""
             installed = bool(path) and os.path.isfile(path)

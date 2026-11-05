@@ -72,6 +72,10 @@ class Config:
     # Optional. Only pyannote's gated model needs it. Prefer HF_TOKEN in the
     # environment. Never commit a real token.
     hf_token: str = ""
+    # Off by default. When true, and webhook_url is set, a watcher that starts
+    # after being down for more than 15 minutes on the same local day POSTs one
+    # {"type": "watcher-health"} event. That body is not a transcript.
+    watcher_health_ping: bool = False
 
 
 _FLOAT_FIELDS = {
@@ -95,6 +99,7 @@ _BOOL_FIELDS = {
     "delete_audio_after_delivery",
     "speaker_labels",
     "diarize",
+    "watcher_health_ping",
 }
 _DIARIZE_BACKENDS = {"auto", "builtin", "speechbrain", "resemblyzer", "pyannote", "off"}
 _KNOWN = {item.name for item in fields(Config)}
