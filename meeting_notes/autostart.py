@@ -1,4 +1,4 @@
-"""Register the Meet watcher to start at Windows login.
+"""Register the call watcher to start at Windows login.
 
 Task Scheduler is preferred. If schtasks fails, a Startup-folder VBScript
 launches pythonw with window style 0 (no console). Both paths are described

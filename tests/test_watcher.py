@@ -140,9 +140,43 @@ def test_watcher_starts_transcript_only_session_and_delivers_on_leave(tmp_path):
     assert spec.meet_code == "abc-defg-hij"
     assert spec.window_title == SIGHT.window_title
     assert spec.joined_at == "2026-10-29T15:04:00+00:00"
+    assert spec.source == "google-meet"
     assert spec.whisper_model == "small"
     assert spec.folder.endswith("2026-10-29_abc-defg-hij")
     assert launcher.stopped == [spec.folder]
+    assert delivered == [spec.folder]
+
+
+def test_watcher_names_an_unnamed_huddle_and_tags_the_source(tmp_path):
+    clock = Clock()
+    huddle = Sighting(
+        key="slack-huddle",
+        display_name="Slack Huddle",
+        meet_code="",
+        window_title="Huddle",
+        source="slack-huddle",
+        unnamed=True,
+    )
+
+    class HuddleDetector(ScriptDetector):
+        def poll(self, in_call=False):
+            if self.clock.t < self.present_until:
+                return huddle
+            return None
+
+    detector = HuddleDetector(clock, present_until=2)
+    launcher = FakeLauncher()
+    delivered = []
+    watcher = _watcher(tmp_path, detector, launcher, Lock(), delivered, [])
+    watcher.run(max_ticks=4)
+    spec = launcher.started[0]
+    assert spec.source == "slack-huddle"
+    assert spec.name == "Slack Huddle 15:04"
+    assert spec.meet_code == ""
+    assert spec.window_title == "Huddle"
+    assert spec.folder.endswith("2026-10-29_slack-huddle-1504")
+    assert "--source" in build_start_argv(spec, executable="pythonw")
+    assert "slack-huddle" in build_start_argv(spec, executable="pythonw")
     assert delivered == [spec.folder]
 
 

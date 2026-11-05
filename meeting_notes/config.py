@@ -44,6 +44,10 @@ class Config:
     # Empty means the built-in "Meet - ..." Chrome title pattern.
     window_title_regex: str = ""
     mic_process_marker: str = "chrome.exe"
+    # Watcher sources. Both on so an existing config keeps Meet and also
+    # follows Slack Huddles. Set either to false to ignore that source.
+    watch_google_meet: bool = True
+    watch_slack_huddle: bool = True
     whisper_model: str = "medium"
     language: str = "en"
     transcribe_timeout_seconds: float = 3 * 60 * 60
@@ -95,6 +99,8 @@ _BOOL_FIELDS = {
     "delete_audio_after_delivery",
     "speaker_labels",
     "diarize",
+    "watch_google_meet",
+    "watch_slack_huddle",
 }
 _DIARIZE_BACKENDS = {"auto", "builtin", "speechbrain", "resemblyzer", "pyannote", "off"}
 _KNOWN = {item.name for item in fields(Config)}

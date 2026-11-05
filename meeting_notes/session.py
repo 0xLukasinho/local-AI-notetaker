@@ -27,7 +27,14 @@ STATE_FAILED = "failed"
 
 # Keys the watcher may set before the recorder advances state. A later update
 # must not blank them out.
-PRESERVE_ON_UPDATE = ("left_at", "joined_at", "meet_code", "window_title", "delivered_at")
+PRESERVE_ON_UPDATE = (
+    "left_at",
+    "joined_at",
+    "meet_code",
+    "window_title",
+    "delivered_at",
+    "source",
+)
 
 
 def slugify(text):
@@ -203,6 +210,7 @@ def begin_session(
     joined_at=None,
     break_ok=False,
     honor_existing_stop=False,
+    source=None,
 ):
     """Publish status.json and the active-session lock.
 
@@ -239,6 +247,10 @@ def begin_session(
         "folder_name": os.path.basename(os.path.abspath(folder)),
         "folder_path": os.path.abspath(folder),
     }
+    # Manual `start` does not set a source. Watch sessions do (`google-meet`,
+    # `slack-huddle`). Omit the key entirely for a manual session.
+    if source:
+        status["source"] = source
     write_status(folder, status)
     write_active(
         control_dir,

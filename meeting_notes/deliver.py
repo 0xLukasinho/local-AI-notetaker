@@ -45,6 +45,13 @@ def build_payload(status, transcript, folder):
         "language": status.get("language"),
         "transcript": transcript,
     }
+    # Watcher sessions name the call source. Manual and older sessions omit it.
+    source = status.get("source")
+    if source:
+        payload["source"] = source
+    meeting_name = status.get("meeting_name")
+    if meeting_name:
+        payload["meeting_name"] = meeting_name
     payload.update(speaker_webhook_fields(folder))
     return payload
 

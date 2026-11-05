@@ -36,6 +36,11 @@ class Sighting:
     display_name: str
     meet_code: str
     window_title: str
+    # Which watcher source produced this sighting. Meet stays the default so
+    # existing callers keep working. `unnamed` asks the watcher to add the
+    # clock time when it names the session (a Huddle window with no channel).
+    source: str = "google-meet"
+    unnamed: bool = False
 
 
 @dataclass(frozen=True)
@@ -95,11 +100,19 @@ def parse_meet_window_title(title, title_regex=None):
     )
 
 
-def session_name(sighting):
-    """Folder/meeting name: Meet code when we have one, otherwise the title."""
+def session_name(sighting, when=None):
+    """Folder/meeting name: Meet code when we have one, otherwise the title.
+
+    An unnamed sighting (a Huddle window that did not include a channel or
+    DM) becomes ``"<display name> HH:MM"`` when `when` is provided. The
+    sighting key stays stable; only the session name picks up the clock.
+    """
     if sighting.meet_code:
         return sighting.meet_code
-    return sighting.display_name
+    name = sighting.display_name
+    if getattr(sighting, "unnamed", False) and when is not None:
+        return "%s %s" % (name, when.strftime("%H:%M"))
+    return name
 
 
 def mic_in_use_from_entries(entries, marker="chrome.exe"):
@@ -264,6 +277,7 @@ class ChromeMeetDetector:
         self.title_regex = title_regex or None
         self.process_marker = process_marker or "chrome.exe"
         self.log = log
+        self.source = "google-meet"
         self._latched = None
         self._last_mic = _UNSEEN
         self._last_window = _UNSEEN
