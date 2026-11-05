@@ -39,7 +39,7 @@ from meeting_notes.session import (
 from meeting_notes.summarizer import generate_notes
 from meeting_notes.transcriber import transcribe
 from meeting_notes.watcher import configure_watch_logging, serve
-from meeting_notes.watch_guard import describe_heartbeat, ensure_watcher
+from meeting_notes.watch_guard import describe_heartbeat, ensure_until_running
 
 OUTPUT_DIR = os.path.expanduser("~/meeting-notes")
 CONTROL_DIR = os.path.expanduser("~/.meeting-notes")
@@ -760,17 +760,22 @@ def _print_autostart_result(meta):
             print(f"  {path}")
         print("The scheduled task replaces it.")
     print(f"Installed scheduled task {meta.get('task_name')}.")
-    print("It runs hidden at logon, when the session unlocks, and every 5 minutes.")
+    if meta.get("startup_trigger"):
+        print("It runs hidden at system startup and at logon.")
+    else:
+        print("It runs hidden at logon.")
+        print("System startup could not be registered without admin. Logon still runs it.")
+        if meta.get("startup_error"):
+            print(f"  {meta['startup_error']}")
+    print("It also runs when the session unlocks.")
     if meta.get("resume_trigger"):
         print("It also runs on resume from sleep.")
     else:
-        print(
-            "Resume-from-sleep could not be registered. "
-            "Unlock and the 5-minute check still run."
-        )
+        print("Resume-from-sleep could not be registered. Logon and unlock still run.")
         if meta.get("resume_error"):
             print(f"  {meta['resume_error']}")
     print("Each run starts a hidden watcher only when one is not already healthy.")
+    print("If that start fails, it retries after 30 seconds, 60 seconds, and 120 seconds.")
 
 
 def _cmd_install_autostart():
@@ -793,7 +798,7 @@ def _cmd_install_autostart():
         )
     except Exception:
         pass
-    result = ensure_watcher(CONTROL_DIR)
+    result = ensure_until_running(CONTROL_DIR)
     print(result.user_message)
     if not result.ok:
         sys.exit(1)
@@ -892,7 +897,7 @@ def cmd_watch(args):
                 file=sys.stderr,
             )
             sys.exit(1)
-        result = ensure_watcher(CONTROL_DIR)
+        result = ensure_until_running(CONTROL_DIR)
         print(result.user_message)
         sys.exit(0 if result.ok else 1)
     if sys.platform != "win32":
@@ -1054,7 +1059,7 @@ def build_parser():
 
     autostart_parser = subparsers.add_parser(
         "autostart",
-        help="Keep the watcher running at logon and every 5 minutes (Windows)",
+        help="Start the watcher at logon, unlock, and resume (Windows)",
     )
     autostart_subs = autostart_parser.add_subparsers(dest="autostart_command", required=True)
     autostart_subs.add_parser(

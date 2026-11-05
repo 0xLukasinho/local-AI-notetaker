@@ -40,6 +40,10 @@ HEARTBEAT_STALE_SECONDS = 180
 HEARTBEAT_RECORDING_DEAD_SECONDS = 600
 HEALTH_PING_DOWN_SECONDS = 15 * 60
 START_REASON_MAX_AGE_SECONDS = 120
+# After a failed start at logon, wait and try again. Devices and the network
+# are often not ready on the first attempt.
+ENSURE_RETRY_DELAYS = (30, 60, 120)
+ENSURE_SETTLE_SECONDS = 15
 START_REASON_ENV = "MEETING_NOTES_WATCH_START_REASON"
 
 _MUTEX_NAME = "Local\\MeetingNotesWatch"
@@ -543,6 +547,109 @@ def ensure_watcher(
         decision.action = "restart"
     else:
         decision.action = "start"
+    return decision
+
+
+def watcher_stayed_up(
+    control_dir,
+    is_alive=None,
+    sleep=None,
+    timeout=ENSURE_SETTLE_SECONDS,
+    monotonic=None,
+    lock_held_fn=None,
+):
+    """True when a watcher takes the lock and is still alive at the end of the wait.
+
+    Returns False early if it comes up and then exits. Used so a logon start
+    that dies because audio devices or the network are not ready is retried.
+    """
+    from meeting_notes.session import pid_alive
+
+    is_alive = is_alive or pid_alive
+    sleep = sleep or time.sleep
+    monotonic = monotonic or time.monotonic
+    lock_held_fn = lock_held_fn or (lambda: lock_is_held(control_dir))
+    deadline = monotonic() + float(timeout)
+    came_up = False
+    while True:
+        instance = read_instance(control_dir) or {}
+        pid = instance.get("pid")
+        try:
+            alive = bool(pid) and bool(is_alive(pid))
+        except Exception:
+            alive = False
+        try:
+            held = bool(lock_held_fn()) if alive else False
+        except Exception:
+            held = False
+        if alive and held:
+            came_up = True
+        elif came_up:
+            return False
+        if monotonic() >= deadline:
+            return came_up
+        sleep(0.5)
+
+
+def ensure_until_running(
+    control_dir,
+    log=None,
+    sleep=None,
+    delays=None,
+    ensure=None,
+    confirm=None,
+    **ensure_kwargs,
+):
+    """Run ensure, then retry after 30s, 60s, and 120s if the start does not stick.
+
+    A watcher that is already healthy or is spared because it is recording
+    returns on the first attempt. Each attempt is written to the log.
+    """
+    if log is None:
+        from meeting_notes.watcher import configure_watch_logging
+
+        log, _path = configure_watch_logging(control_dir)
+    pause = sleep or time.sleep
+    gaps = tuple(ENSURE_RETRY_DELAYS if delays is None else delays)
+    run = ensure or (lambda directory, attempt_log: ensure_watcher(directory, log=attempt_log, **ensure_kwargs))
+    if confirm is None:
+        confirm = lambda directory: watcher_stayed_up(directory)
+
+    total = len(gaps) + 1
+    decision = None
+    for attempt in range(1, total + 1):
+        log.warning("ensure attempt %s/%s", attempt, total)
+        decision = run(control_dir, log)
+        if decision.action in ("healthy", "spare"):
+            log.info("ensure attempt %s/%s succeeded: %s", attempt, total, decision.user_message)
+            return decision
+        stayed = False
+        if decision.ok and decision.action in ("start", "restart"):
+            try:
+                stayed = bool(confirm(control_dir))
+            except Exception as exc:
+                log.error("ensure attempt %s/%s could not confirm the watcher: %s", attempt, total, exc)
+                stayed = False
+        if stayed:
+            log.info("ensure attempt %s/%s succeeded: %s", attempt, total, decision.user_message)
+            return decision
+        if decision.ok and decision.action in ("start", "restart"):
+            decision.action = "failed"
+            decision.user_message = "ensure: watcher exited after start"
+        reason = decision.user_message or decision.reason or "start failed"
+        if attempt >= total:
+            log.error("ensure attempt %s/%s failed: %s", attempt, total, reason)
+            decision.user_message = f"ensure attempt {attempt}/{total} failed: {reason}"
+            return decision
+        delay = gaps[attempt - 1]
+        log.warning(
+            "ensure attempt %s/%s failed: %s; retrying in %ss",
+            attempt,
+            total,
+            reason,
+            delay,
+        )
+        pause(delay)
     return decision
 
 

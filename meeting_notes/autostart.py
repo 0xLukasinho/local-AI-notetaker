@@ -1,9 +1,10 @@
 """Register the Meet watcher with Windows Task Scheduler.
 
 ``meeting-notes autostart install`` creates one per-user task (no admin). The
-task runs ``meeting-notes watch --ensure`` at logon, on unlock, every five
-minutes, and on resume-from-sleep when Windows accepts that trigger. The task
-is hidden and does not open a console.
+task runs ``meeting-notes watch --ensure`` at system startup when that trigger
+is allowed, at logon, on unlock, and on resume-from-sleep when Windows accepts
+that trigger. There is no repeating timer. The task is hidden and does not
+open a console.
 
 An old Startup-folder ``MeetingNotesWatch.vbs`` is removed. Install does not
 create a new one: a shortcut that only runs at login is what left the watcher
@@ -74,31 +75,49 @@ def startup_vbs(pythonw):
     )
 
 
-def repetition_start(now=None):
-    """Local time one minute from now.
+def registration_plans(include_boot=True, include_resume=True):
+    """Most complete trigger set first.
 
-    Task Scheduler treats a daily trigger whose time-of-day has already passed
-    as finished for today, so the 5-minute repetition would wait until tomorrow.
-    A start a minute ahead makes the first check soon, then every 5 minutes for
-    the next day, and the daily schedule repeats that window.
+    A boot trigger often needs an administrator. Resume-from-sleep reads the
+    System event log and is sometimes rejected for a per-user task. Logon and
+    unlock are always in the XML. Later plans drop the optional triggers.
     """
-    from datetime import datetime, timedelta
+    candidates = []
+    if include_boot and include_resume:
+        candidates.append((True, True))
+    if include_resume:
+        candidates.append((False, True))
+    if include_boot:
+        candidates.append((True, False))
+    candidates.append((False, False))
+    plans = []
+    seen = set()
+    for boot, resume in candidates:
+        if (boot, resume) in seen:
+            continue
+        seen.add((boot, resume))
+        plans.append({"boot": boot, "resume": resume})
+    return plans
 
-    moment = (now or datetime.now()).replace(microsecond=0) + timedelta(minutes=1)
-    return moment.strftime("%Y-%m-%dT%H:%M:%S")
 
-
-def task_xml(pythonw, include_resume=True, repetition_start_at=None):
+def task_xml(pythonw, include_resume=True, include_boot=True):
     """Task Scheduler 2.0 XML for a per-user, least-privilege, hidden task.
 
-    The five-minute trigger is a daily schedule that repeats for one day. Its
-    start is one minute ahead so the window begins today instead of tomorrow.
-    Logon waits 15 seconds so the user profile is ready. Resume-from-sleep is
-    a System log event and is omitted when ``include_resume`` is false.
+    Logon waits 15 seconds so the profile is ready. The boot trigger waits 30
+    seconds so devices can settle, and is omitted when ``include_boot`` is
+    false. Resume-from-sleep is a System log event and is omitted when
+    ``include_resume`` is false. There is no repeating trigger.
     """
     command = escape(pythonw)
     arguments = escape("-m meeting_notes.cli watch --ensure")
-    boundary = escape(repetition_start_at or repetition_start())
+    boot = ""
+    if include_boot:
+        boot = (
+            "    <BootTrigger>\r\n"
+            "      <Enabled>true</Enabled>\r\n"
+            "      <Delay>PT30S</Delay>\r\n"
+            "    </BootTrigger>\r\n"
+        )
     resume = ""
     if include_resume:
         query = (
@@ -118,10 +137,11 @@ def task_xml(pythonw, include_resume=True, repetition_start_at=None):
         '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\r\n'
         "  <RegistrationInfo>\r\n"
         "    <Description>Keep the meeting-notes watcher running. "
-        "Runs watch --ensure at logon, on unlock, every 5 minutes, "
-        "and on resume from sleep when that trigger is available.</Description>\r\n"
+        "Runs watch --ensure at system startup, at logon, on unlock, "
+        "and on resume from sleep when those triggers are available.</Description>\r\n"
         "  </RegistrationInfo>\r\n"
         "  <Triggers>\r\n"
+        f"{boot}"
         "    <LogonTrigger>\r\n"
         "      <Enabled>true</Enabled>\r\n"
         "      <Delay>PT15S</Delay>\r\n"
@@ -130,18 +150,6 @@ def task_xml(pythonw, include_resume=True, repetition_start_at=None):
         "      <Enabled>true</Enabled>\r\n"
         "      <StateChange>SessionUnlock</StateChange>\r\n"
         "    </SessionStateChangeTrigger>\r\n"
-        "    <CalendarTrigger>\r\n"
-        "      <Repetition>\r\n"
-        "        <Interval>PT5M</Interval>\r\n"
-        "        <Duration>P1D</Duration>\r\n"
-        "        <StopAtDurationEnd>false</StopAtDurationEnd>\r\n"
-        "      </Repetition>\r\n"
-        f"      <StartBoundary>{boundary}</StartBoundary>\r\n"
-        "      <Enabled>true</Enabled>\r\n"
-        "      <ScheduleByDay>\r\n"
-        "        <DaysInterval>1</DaysInterval>\r\n"
-        "      </ScheduleByDay>\r\n"
-        "    </CalendarTrigger>\r\n"
         f"{resume}"
         "  </Triggers>\r\n"
         "  <Principals>\r\n"
@@ -262,12 +270,13 @@ def install_autostart(
     run=None,
     task_name=TASK_NAME,
     include_resume=True,
-    repetition_start_at=None,
+    include_boot=True,
 ):
     """Create or replace the per-user task. Removes a legacy Startup shortcut.
 
     Raises AutostartError when schtasks cannot register the task. A Startup
-    shortcut is never created as a fallback.
+    shortcut is never created as a fallback. If a boot trigger is rejected,
+    install retries with logon in its place.
     """
     import subprocess
 
@@ -278,14 +287,17 @@ def install_autostart(
     run = run or subprocess.run
     os.makedirs(control_dir, exist_ok=True)
     xml_path = task_xml_path(control_dir)
-    boundary = repetition_start_at or repetition_start()
-    attempts = (True, False) if include_resume else (False,)
+    plans = registration_plans(include_boot=include_boot, include_resume=include_resume)
     last_error = None
-    registered_resume = False
-    for resume in attempts:
+    chosen = None
+    for plan in plans:
         _write_task_xml(
             xml_path,
-            task_xml(pythonw, include_resume=resume, repetition_start_at=boundary),
+            task_xml(
+                pythonw,
+                include_resume=plan["resume"],
+                include_boot=plan["boot"],
+            ),
         )
         try:
             run(
@@ -297,7 +309,7 @@ def install_autostart(
         except Exception as exc:
             last_error = _run_error(exc)
             continue
-        registered_resume = bool(resume)
+        chosen = plan
         break
     else:
         raise AutostartError(
@@ -307,8 +319,10 @@ def install_autostart(
         )
 
     removed = remove_legacy_startup(control_dir, startup_dir)
-    triggers = ["logon", "unlock", "every-5-minutes"]
-    if registered_resume:
+    triggers = ["logon", "unlock"]
+    if chosen["boot"]:
+        triggers.insert(0, "startup")
+    if chosen["resume"]:
         triggers.append("resume")
     meta = {
         "method": "schtasks",
@@ -316,11 +330,14 @@ def install_autostart(
         "pythonw": pythonw,
         "command": ensure_command_line(pythonw),
         "triggers": triggers,
-        "resume_trigger": registered_resume,
+        "startup_trigger": bool(chosen["boot"]),
+        "resume_trigger": bool(chosen["resume"]),
         "xml_path": xml_path,
         "removed_startup": removed,
     }
-    if include_resume and not registered_resume:
+    if include_boot and not chosen["boot"]:
+        meta["startup_error"] = last_error or "startup trigger was rejected"
+    if include_resume and not chosen["resume"]:
         meta["resume_error"] = last_error or "resume trigger was rejected"
     atomic_write_json(autostart_meta_path(control_dir), meta)
     return meta

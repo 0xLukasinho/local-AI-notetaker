@@ -8,16 +8,20 @@ import pytest
 from meeting_notes.config import Config
 from meeting_notes.deliver import DeliveryError
 from meeting_notes.watch_guard import (
+    ENSURE_RETRY_DELAYS,
     HEARTBEAT_RECORDING_DEAD_SECONDS,
     HEARTBEAT_STALE_SECONDS,
+    Decision,
     acquire_instance_lock,
     build_health_payload,
     consume_start_reason,
     decide,
     describe_heartbeat,
+    ensure_until_running,
     ensure_watcher,
     maybe_send_health,
     read_heartbeat,
+    watcher_stayed_up,
     write_instance,
     write_start_reason,
     Heartbeat,
@@ -302,6 +306,126 @@ def test_ensure_kills_a_recording_whose_heartbeat_is_past_ten_minutes(tmp_path):
     assert killed == [PID]
     assert "recording" in log.text()
     assert spawned
+
+
+def test_ensure_retries_logon_failures_after_30_60_and_120_seconds():
+    assert ENSURE_RETRY_DELAYS == (30, 60, 120)
+    waits = []
+    log = ListLog()
+    attempts = {"n": 0}
+
+    def fake(_control, _log):
+        attempts["n"] += 1
+        if attempts["n"] < 4:
+            return Decision(
+                action="failed",
+                reason="audio devices not ready",
+                user_message="ensure: failed to start watcher: audio devices not ready",
+            )
+        return Decision(
+            action="healthy",
+            reason="up",
+            user_message="ensure: watcher already running (pid 1, state idle, heartbeat age 1s)",
+        )
+
+    decision = ensure_until_running(
+        "unused",
+        log=log,
+        sleep=waits.append,
+        ensure=fake,
+        confirm=lambda _control: False,
+    )
+    assert waits == [30, 60, 120]
+    assert attempts["n"] == 4
+    assert decision.action == "healthy"
+    text = log.text()
+    assert "ensure attempt 1/4" in text
+    assert "ensure attempt 4/4 succeeded" in text
+    assert "retrying in 30s" in text
+    assert "retrying in 60s" in text
+    assert "retrying in 120s" in text
+    assert "audio devices not ready" in text
+
+
+def test_ensure_does_not_retry_when_the_watcher_is_already_healthy():
+    waits = []
+    log = ListLog()
+
+    def fake(_control, _log):
+        return Decision(
+            action="healthy",
+            reason="up",
+            user_message="ensure: watcher already running",
+        )
+
+    decision = ensure_until_running(
+        "unused",
+        log=log,
+        sleep=waits.append,
+        ensure=fake,
+    )
+    assert waits == []
+    assert decision.action == "healthy"
+    assert "ensure attempt 1/4 succeeded" in log.text()
+
+
+def test_ensure_retries_when_the_new_watcher_exits_immediately():
+    waits = []
+    log = ListLog()
+    attempts = {"n": 0}
+
+    def fake(_control, _log):
+        attempts["n"] += 1
+        return Decision(
+            action="start",
+            reason="no watcher is running",
+            user_message="ensure: starting watcher (no watcher is running)",
+        )
+
+    def confirm(_control):
+        return attempts["n"] >= 2
+
+    decision = ensure_until_running(
+        "unused",
+        log=log,
+        sleep=waits.append,
+        ensure=fake,
+        confirm=confirm,
+    )
+    assert waits == [30]
+    assert decision.action == "start"
+    assert "watcher exited after start" in log.text()
+    assert "retrying in 30s" in log.text()
+    assert "ensure attempt 2/4 succeeded" in log.text()
+
+
+def test_watcher_stayed_up_is_false_when_the_process_dies(tmp_path):
+    clock = {"t": 0.0}
+
+    def monotonic():
+        return clock["t"]
+
+    def sleep(seconds):
+        clock["t"] += seconds
+
+    polls = {"n": 0}
+
+    def is_alive(_pid):
+        polls["n"] += 1
+        return polls["n"] < 3
+
+    write_instance(str(tmp_path), PID, "0.1.0", NOW)
+    assert (
+        watcher_stayed_up(
+            str(tmp_path),
+            is_alive=is_alive,
+            sleep=sleep,
+            timeout=15,
+            monotonic=monotonic,
+            lock_held_fn=lambda: True,
+        )
+        is False
+    )
 
 
 def test_ensure_does_not_start_a_second_watcher_when_hang_kill_fails(tmp_path):

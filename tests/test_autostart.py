@@ -10,6 +10,7 @@ from meeting_notes.autostart import (
     ensure_command_line,
     find_pythonw,
     install_autostart,
+    registration_plans,
     startup_vbs,
     task_xml,
     uninstall_autostart,
@@ -33,17 +34,20 @@ def test_find_pythonw_prefers_sibling(tmp_path):
     assert find_pythonw(str(other)) == os.path.abspath(str(other))
 
 
-def test_task_xml_is_hidden_and_repeats_ensure():
+def test_task_xml_runs_ensure_at_startup_logon_unlock_and_resume():
     pythonw = r"C:\Python\pythonw.exe"
-    xml = task_xml(pythonw, include_resume=True)
+    xml = task_xml(pythonw, include_resume=True, include_boot=True)
     assert "<?xml" in xml
+    assert "<BootTrigger>" in xml
+    assert "<Delay>PT30S</Delay>" in xml
     assert "<LogonTrigger>" in xml
     assert "<Delay>PT15S</Delay>" in xml
     assert "<StateChange>SessionUnlock</StateChange>" in xml
-    assert "<Interval>PT5M</Interval>" in xml
-    assert "<DaysInterval>1</DaysInterval>" in xml
     assert "EventID=107" in xml
     assert "EventID=507" in xml
+    assert "<CalendarTrigger>" not in xml
+    assert "PT5M" not in xml
+    assert "<Repetition>" not in xml
     assert "<Hidden>true</Hidden>" in xml
     assert "<RunLevel>LeastPrivilege</RunLevel>" in xml
     assert "<LogonType>InteractiveToken</LogonType>" in xml
@@ -54,20 +58,21 @@ def test_task_xml_is_hidden_and_repeats_ensure():
     assert "webhook" not in xml.lower()
     assert pythonw in xml
     assert "-m meeting_notes.cli watch --ensure" in xml
-    assert "<StartBoundary>2026-11-05T09:00:00</StartBoundary>" in task_xml(
-        pythonw,
-        include_resume=False,
-        repetition_start_at="2026-11-05T09:00:00",
-    )
     assert "cmd.exe" not in xml.lower()
     assert ensure_command_line(pythonw) == f'"{pythonw}" -m meeting_notes.cli watch --ensure'
+    plans = registration_plans()
+    assert plans[0] == {"boot": True, "resume": True}
+    assert plans[1] == {"boot": False, "resume": True}
+    assert {"boot": False, "resume": False} in plans
 
 
 def test_task_xml_escapes_the_interpreter_path():
-    xml = task_xml(r"C:\A&B\pythonw.exe", include_resume=False)
+    xml = task_xml(r"C:\A&B\pythonw.exe", include_resume=False, include_boot=False)
     assert r"C:\A&amp;B\pythonw.exe" in xml
     assert "Kernel-Power" not in xml
-    assert "PT5M" in xml
+    assert "<BootTrigger>" not in xml
+    assert "PT5M" not in xml
+    assert "<LogonTrigger>" in xml
 
 
 def test_startup_vbs_is_hidden():
@@ -96,7 +101,9 @@ def test_install_registers_task_and_removes_startup_shortcut(tmp_path):
     )
     assert meta["method"] == "schtasks"
     assert meta["resume_trigger"] is True
-    assert "every-5-minutes" in meta["triggers"]
+    assert meta["startup_trigger"] is True
+    assert "every-5-minutes" not in meta["triggers"]
+    assert meta["triggers"][0] == "startup"
     assert "logon" in meta["triggers"]
     assert "unlock" in meta["triggers"]
     assert "resume" in meta["triggers"]
@@ -107,36 +114,72 @@ def test_install_registers_task_and_removes_startup_shortcut(tmp_path):
     xml_path = tmp_path / "control" / "MeetingNotesWatch.xml"
     xml = xml_path.read_text(encoding="utf-16")
     assert "watch --ensure" in xml
-    assert "PT5M" in xml
+    assert "<BootTrigger>" in xml
+    assert "PT5M" not in xml
     saved = json.loads((tmp_path / "control" / "autostart.json").read_text(encoding="utf-8"))
     assert saved["command"].endswith("watch --ensure")
     status = autostart_status(str(tmp_path / "control"), query_task=lambda _name: True)
     assert status["installed"] is True
-    assert "every-5-minutes" in status["detail"]
+    assert "startup" in status["detail"]
+    assert "every-5-minutes" not in status["detail"]
 
 
-def test_install_retries_without_the_resume_trigger(tmp_path):
+def test_install_drops_the_boot_trigger_when_startup_needs_admin(tmp_path):
     calls = []
+    control = tmp_path / "control"
 
     def run(_argv, check, capture_output, text):
         calls.append(_argv)
-        if len(calls) == 1:
-            raise OSError("event trigger denied")
+        xml = (control / "MeetingNotesWatch.xml").read_text(encoding="utf-16")
+        if "<BootTrigger>" in xml:
+            raise OSError("boot trigger denied")
         return None
 
     meta = install_autostart(
-        str(tmp_path / "control"),
+        str(control),
         pythonw=r"C:\Python\pythonw.exe",
         startup_dir=str(tmp_path / "startup"),
         run=run,
     )
     assert len(calls) == 2
-    assert meta["resume_trigger"] is False
-    assert "resume" not in meta["triggers"]
+    assert meta["startup_trigger"] is False
+    assert meta["resume_trigger"] is True
+    assert "startup" not in meta["triggers"]
+    assert "logon" in meta["triggers"]
     assert "unlock" in meta["triggers"]
-    xml = (tmp_path / "control" / "MeetingNotesWatch.xml").read_text(encoding="utf-16")
+    assert "boot trigger denied" in meta["startup_error"]
+    xml = (control / "MeetingNotesWatch.xml").read_text(encoding="utf-16")
+    assert "<BootTrigger>" not in xml
+    assert "Kernel-Power" in xml
+    assert "SessionUnlock" in xml
+    assert "PT5M" not in xml
+
+
+def test_install_can_drop_boot_and_resume(tmp_path):
+    calls = []
+    control = tmp_path / "control"
+
+    def run(_argv, check, capture_output, text):
+        calls.append(_argv)
+        xml = (control / "MeetingNotesWatch.xml").read_text(encoding="utf-16")
+        if "Kernel-Power" in xml or "<BootTrigger>" in xml:
+            raise OSError("optional trigger denied")
+        return None
+
+    meta = install_autostart(
+        str(control),
+        pythonw=r"C:\Python\pythonw.exe",
+        startup_dir=str(tmp_path / "startup"),
+        run=run,
+    )
+    assert len(calls) == 4
+    assert meta["startup_trigger"] is False
+    assert meta["resume_trigger"] is False
+    assert meta["triggers"] == ["logon", "unlock"]
+    xml = (control / "MeetingNotesWatch.xml").read_text(encoding="utf-16")
+    assert "<BootTrigger>" not in xml
     assert "Kernel-Power" not in xml
-    assert "PT5M" in xml
+    assert "<LogonTrigger>" in xml
     assert "SessionUnlock" in xml
 
 

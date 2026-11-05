@@ -213,7 +213,7 @@ meeting-notes watch --ensure
 meeting-notes watch --status
 ```
 
-`--ensure` exits immediately when a healthy watcher is already running. When none is running, or the heartbeat is older than 3 minutes, it starts one hidden `pythonw` process and exits. A heartbeat that still says `recording` is left alone until it is older than 10 minutes, and a pid that does not hold the watcher lock is never killed. Two watchers cannot run at once: the live process holds a lock that disappears if that process crashes.
+`--ensure` exits immediately when a healthy watcher is already running. When none is running, or the heartbeat is older than 3 minutes, it starts one hidden `pythonw` process. A heartbeat that still says `recording` is left alone until it is older than 10 minutes, and a pid that does not hold the watcher lock is never killed. Two watchers cannot run at once: the live process holds a lock that disappears if that process crashes. If the start fails, or the new process exits straight away, `--ensure` tries again after 30 seconds, then 60, then 120, and writes each attempt to `watch.log`. That covers a logon where the audio devices or the network are not ready yet.
 
 `joined_at` is when the join debounce confirms and recording starts. `left_at` is when recording stops (the leave debounce has already elapsed). `duration_seconds` is that interval.
 
@@ -334,12 +334,12 @@ Copy `config.example.toml` to `~/.meeting-notes/config.toml`, or use `config.jso
 
 Windows only. One per-user scheduled task (no admin) runs `meeting-notes watch --ensure` hidden, without a console window and without taking focus:
 
-- at logon (about 15 seconds after login, so the profile is ready)
+- at system startup, about 30 seconds after boot, when Windows allows that without an administrator
+- at logon, about 15 seconds after login, so the profile is ready
 - when the session is unlocked
 - on resume from sleep, when Windows accepts that trigger
-- every 5 minutes, which is what brings the watcher back if the other triggers do not fire
 
-`--ensure` starts a watcher only when one is not already healthy, so the 5-minute run does not open a second copy. The task replaces a Startup-folder `MeetingNotesWatch.vbs`. Install deletes that shortcut when it is present and does not create a new one.
+There is no repeating check. If the startup trigger needs an administrator, install keeps the logon trigger and says so. `--ensure` starts a watcher only when one is not already healthy, so unlock does not open a second copy. If the start fails, or the new process exits straight away, the same run tries again after 30 seconds, then 60, then 120. Each attempt is logged. The task replaces a Startup-folder `MeetingNotesWatch.vbs`. Install deletes that shortcut when it is present and does not create a new one.
 
 From the repo:
 
@@ -355,7 +355,7 @@ meeting-notes watch --status
 
 In Task Scheduler the task is named `MeetingNotesWatch`. It is hidden; turn on **View → Show hidden tasks** to see it there. You do not need to. `autostart status` is the check.
 
-`watch.log` is the place a failure shows up: `ensure: starting watcher`, `hang-kill`, `ensure: restarting watcher`, `Unhandled exception`, and `Watcher stopped` all have a timestamp. A healthy check every 5 minutes is an INFO line (`ensure: watcher already running`) and does not page anyone.
+`watch.log` is the place a failure shows up: `ensure attempt 1/4`, `retrying in 30s`, `ensure: starting watcher`, `hang-kill`, `ensure: restarting watcher`, `Unhandled exception`, and `Watcher stopped` all have a timestamp. A logon where the watcher is already running is one line, `ensure attempt 1/4 succeeded`.
 
 Optional: set `watcher_health_ping = true` in `~/.meeting-notes/config.toml` when `webhook_url` is already set. If the watcher then starts after a gap longer than 15 minutes, and that gap begins and ends on the same local calendar day, it POSTs one small JSON body:
 
@@ -366,12 +366,13 @@ There is no transcript in that body, it does not go through the transcript outbo
 Limits:
 
 - Install needs `schtasks` and a normal user account. If registration fails, the command prints the `schtasks` error, appends it to `watch.log`, and leaves autostart uninstalled. It does not write a Startup-folder shortcut.
-- If the resume-from-sleep trigger is rejected, install keeps logon, unlock, and the 5-minute trigger and says so.
+- If the system-startup trigger is rejected, install keeps logon and says so. Logon is what runs `--ensure` after you sign in.
+- If the resume-from-sleep trigger is rejected, install keeps logon and unlock and says so.
 - A watcher that is actually recording (including while Whisper runs) is not killed for a stale heartbeat until that heartbeat is older than 10 minutes. A stuck recording can keep going until then. Killing it also stops its recorder.
 - A pid left in the lock file is not killed unless that process still holds the watcher lock, so a reused pid is not a random program that gets stopped.
-- The health ping cannot tell a crash from a laptop that slept for more than 15 minutes on the same day. Overnight (the previous heartbeat was on an earlier local date) does not ping. A gap that starts before midnight and is only noticed after midnight does not ping either; the 5-minute check during the evening would already have restarted it.
+- The health ping cannot tell a crash from a laptop that slept for more than 15 minutes on the same day. Overnight (the previous heartbeat was on an earlier local date) does not ping. A gap that crosses local midnight does not ping. There is no timer during the day; the next `--ensure` is at unlock, resume, or the next logon.
 - `git pull` does not reload a watcher that is already running. After an update, end the hidden `pythonw` process (Task Manager) and run `meeting-notes watch --ensure`.
-- The replacement watcher is started with WMI (`Win32_Process.Create`) so it keeps running after the scheduled task exits. If that call fails, `--ensure` starts a detached process instead and logs `popen-fallback`. A detached process can be stopped when the task exits; the next 5-minute run tries again.
+- The replacement watcher is started with WMI (`Win32_Process.Create`) so it keeps running after the scheduled task exits. If that call fails, `--ensure` starts a detached process instead and logs `popen-fallback`. A detached process can be stopped when the task exits. The same `--ensure` run retries after 30, 60, and 120 seconds when the start does not stick. The task's time limit is 10 minutes, which covers those waits.
 - The watcher and autostart are Windows-only.
 
 ## Privacy
@@ -406,7 +407,7 @@ System audio is a WASAPI loopback per playback device. The recorder follows devi
 `transcript.txt` is the full text. The webhook is several JSON bodies when that file is longer than `webhook_max_body_bytes`. Join `transcript` by `chunk_index`. `watch.log` lines `Posting transcript (N chars, M request(s), max body B bytes)` are the size that was sent. The `Authorization` header is unchanged and is not logged.
 
 **The watcher was not running and a call was missed**
-Run `meeting-notes watch --status`. `Watcher process: not running` or a heartbeat older than a few minutes means it was down. `~/.meeting-notes/watch.log` has the start, stop, hang-kill, and any traceback. `meeting-notes autostart status` should say the scheduled task is installed. If it says not installed, run `meeting-notes autostart install`. You should not have to check this yourself after that; the task runs `--ensure` every 5 minutes.
+Run `meeting-notes watch --status`. `Watcher process: not running` or a heartbeat older than a few minutes means it was down. `~/.meeting-notes/watch.log` has the start, stop, hang-kill, startup retries (`retrying in 30s`, `60s`, `120s`), and any traceback. `meeting-notes autostart status` should say the scheduled task is installed (startup or logon, unlock, and resume when Windows allowed them). If it says not installed, run `meeting-notes autostart install`. The task runs `--ensure` at startup or logon, on unlock, and on resume. It does not poll during the day.
 
 **Watcher never notices a Google Meet**
 Open `~/.meeting-notes/watch.log`. `Microphone not in use (registry=no, wasapi=unavailable)` means the WASAPI probe is off (usually `pycaw` is not installed: `pip install pycaw`) and the consent-store registry also did not show Chrome. `Meet window not detected` while you are in the call means the Meet tab is not the active Chrome tab; focus it for the join hold (`join_debounce_seconds`, default 12). After the session has started, a mute or a background tab does not by itself end it.
