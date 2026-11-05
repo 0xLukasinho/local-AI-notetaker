@@ -210,7 +210,7 @@ The log (`~/.meeting-notes/watch.log`) records an INFO line whenever the microph
 
 If a session is already recording — a Meet, a Huddle, or a manual `meeting-notes start` — the watcher does not start a second one and logs that. A manual `meeting-notes start` while the watcher is recording prints a warning and does not start either. Stop the current session with `meeting-notes stop` first.
 
-If a Meet and a Huddle are both visible before any recording has started, the Meet is the one that is recorded. The Huddle is logged and ignored until the Meet session has ended (its own leave rule, then the leave debounce). The reverse is the same: a Huddle that is already recording keeps going when a Meet starts, and the Meet is not recorded until the Huddle has ended. A Meet tab left open on the call or the post-call page still counts as the Meet, so a Huddle will not start until you switch away from that tab or close it.
+If a Meet is already detected and `slack.exe` is also on the microphone before any recording has started, the Meet is the one that is recorded. The Huddle is logged and ignored until the Meet session has ended (its own leave rule, then the leave debounce). The reverse is the same: a Huddle that is already recording keeps going when a Meet starts, and the Meet is not recorded until the Huddle has ended. A Meet tab left open on the call or the post-call page still counts as the Meet, so a Huddle will not start until you switch away from that tab or close it. An open Meet tab with Chrome's microphone already released does not block a desktop Huddle.
 
 Watcher sessions use a unique folder. The first one that day is still `YYYY-MM-DD_slug`. If that folder exists, the next is `YYYY-MM-DD_slug_HHMM`, then `YYYY-MM-DD_slug_HHMM_2`, and so on. Manual `start` keeps the unsuffixed name.
 
@@ -220,29 +220,21 @@ Logs rotate at `~/.meeting-notes/watch.log`.
 
 #### Slack Huddle
 
-A Huddle uses the same join and leave timers as Meet. It **starts** only when both are true:
+A desktop Huddle is `slack.exe` holding the microphone. The same two probes as Meet are OR-ed (the consent-store registry and WASAPI capture sessions). The window title is not part of the decision. Slack's own Huddle window, including a popped-out one, does not put "Huddle" in the title.
 
-1. A top-level window is a Huddle window.
-2. The process that owns that window is using the microphone. The same two probes as Meet are OR-ed (`slack.exe` for the desktop app, `chrome.exe` when the Huddle is a Chrome window).
+It **starts** after that microphone signal has held for `join_debounce_seconds` (default 12). A voice clip or a Preferences mic test shorter than that does not start a recording. It **ends** after `slack.exe` has released the microphone for `leave_debounce_seconds` (default 25). A Huddle window left open does not keep the recording going.
 
-**Desktop app (`slack.exe`).** The window title has to be a Huddle title, not the normal channel title. Any of these count:
+The session name comes from a `slack.exe` window title when one clearly has a channel or DM: a `#channel`, a `(Channel)` / `(DM)` / `(Group DM)` label, or Slack's usual `conversation - workspace - Slack` title. `Activity`, `Preferences`, `Slack` alone, and `Workspace - Slack` are not used. Otherwise the name is `Slack Huddle` plus the time the join is confirmed, for example `Slack Huddle 15:04`. Switching Slack views while the mic stays held does not start a second session. `status.json` and the webhook body include `source` `slack-huddle` (Meet watch sessions use `google-meet`).
 
-- It starts with `Huddle` (`Huddle`, `Huddle | #engineering | Acme - Slack`, `Huddle - #engineering - Acme - Slack`, `Huddle with Jane Doe`, `Huddle in #design-review`).
-- A `|` or ` - ` segment is the Huddle label (`Slack | Huddle | #engineering`, `Slack Huddle - #engineering`).
-- It starts with the headphones mark Slack has used on the call window (`🎧 #engineering - Acme - Slack`).
-
-A channel named `#huddle`, a voice message (the title stays on the channel), and the microphone test in Preferences do not match, so they do not start a recording. The microphone has to be seen together with that window once. Joining muted waits until you unmute. After that, mute alone does not end the session while the Huddle window is still open, and losing the title does not end it while `slack.exe` still holds the microphone. Both have to be gone for `leave_debounce_seconds`.
-
-**Slack in Chrome.** Same title rules, plus the title has to look like Slack: it ends with `Slack`, it is the bare popout (`Huddle` or `Huddle | Huddle`), or it is a short `Huddle with` / `Huddle in` / `Huddle |` title. A search page or an article that mentions huddles does not. Chrome uses one microphone for every tab, so a Meet-titled Chrome window and a Huddle-titled Chrome window at the same time are ambiguous. Meet wins when nothing is recording yet. The desktop app does not have that ambiguity: `slack.exe` on the microphone is the Huddle even if Chrome is open.
-
-The session name is the channel or DM from the title (`#engineering`, `Jane Doe`) when the title includes one. A bare `Huddle` window is named `Slack Huddle` plus the time the join is confirmed, for example `Slack Huddle 15:04`. `status.json` and the webhook body include `source` `slack-huddle` (Meet watch sessions use `google-meet`).
+**Slack in the browser is not detected.** `chrome.exe` has one microphone for every tab, and a Slack tab left open does not mean a Huddle is in progress. That cannot be told apart from a voice clip, another site using the mic, or a Meet whose tab is in the background. Meet keeps `chrome.exe`. Use the Slack desktop app for automatic Huddle recording.
 
 **Limitations.**
 
-- If Slack keeps the Huddle inside the main window and never puts `Huddle` on a top-level title, the watcher cannot see it. Pop the Huddle out, or focus the window whose title contains `Huddle`, and leave it that way at least for the join hold (default 12 seconds).
-- After you leave, a Huddle window that stays open with a Huddle title looks like a mute. Switch that window away or close it so the session can stop. If the window closes but Slack keeps the microphone (a voice message started immediately, for example), the session continues until the microphone is released, then the leave debounce.
-- A title that starts as `Huddle` and later shows the channel stays one session. Switching to a different channel's Huddle is a different call: the current session ends after the leave debounce, then the new one can start.
-- Participant names are not read from Slack. The transcript is your microphone against everyone else (`speaker_labels`). The Meet Chrome extension is not started for a Huddle, so a Meet tab that is also open does not rename these lines. A future source could supply names the way that extension does; this watcher does not.
+- A mute that makes `slack.exe` release the microphone ends the session after the leave debounce. Leaving the Huddle does the same thing. If Slack keeps the capture session while you are muted, the recording continues until the mic is actually released.
+- A voice clip or mic test that holds the microphone longer than the join debounce (default 12 seconds) starts a recording. Shorter ones do not.
+- Huddles joined from Slack in Chrome, Edge, or Firefox are not recorded.
+- The channel or DM is only as good as the window title. When the title is just `Slack`, the session is `Slack Huddle` plus the time.
+- Participant names are not read from Slack. The transcript is your microphone against everyone else (`speaker_labels`). The Meet Chrome extension is not started for a Huddle. A future source could supply names the way that extension does; this watcher does not.
 - One recording at a time, shared with Meet and with manual `meeting-notes start`.
 
 ### Speaker names
@@ -406,7 +398,7 @@ System audio is a WASAPI loopback per playback device. The recorder follows devi
 Open `~/.meeting-notes/watch.log`. `Microphone not in use (registry=no, wasapi=unavailable)` means the WASAPI probe is off (usually `pycaw` is not installed: `pip install pycaw`) and the consent-store registry also did not show Chrome. `Meet window not detected` while you are in the call means the Meet tab is not the active Chrome tab; focus it for the join hold (`join_debounce_seconds`, default 12). After the session has started, a mute or a background tab does not by itself end it. `watch_google_meet = false` turns Meet detection off.
 
 **Watcher never notices a Slack Huddle**
-In `~/.meeting-notes/watch.log`, `Slack Huddle window not detected` means no top-level title looked like a Huddle. Pop the Huddle out or focus the Huddle window so the title contains `Huddle`, and leave it there for the join hold. `Slack microphone not in use (slack.exe, ...)` means that window was seen but `slack.exe` was not on the microphone (you are muted, or the call is in Chrome — then the line is `chrome.exe`). A voice message or the Preferences mic test will not match the title. If a Meet is already being recorded, the Huddle waits until that session ends. `watch_slack_huddle = false` turns Huddle detection off.
+In `~/.meeting-notes/watch.log`, `Slack microphone not in use (slack.exe, ...)` means the desktop app is not holding the microphone. A Huddle in Chrome is not detected; use the Slack desktop app. The join still waits `join_debounce_seconds` (default 12) after the mic is seen, so a short clip does not start a session. If a Meet is already being recorded, the Huddle waits until that session ends. `watch_slack_huddle = false` turns Huddle detection off. `No channel or DM in the window title` means the recording will be named `Slack Huddle` plus the time.
 
 **"global hotkey unavailable" on Windows**
 The `keyboard` library couldn't install its low-level hook (often due to AV software). The tool falls back to Ctrl+C in the terminal. To use the hotkey, try running the terminal as administrator.

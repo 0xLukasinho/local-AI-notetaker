@@ -69,10 +69,12 @@ class CompositeCallDetector:
     """Poll several source detectors as one call signal.
 
     ``poll(in_call=True)`` is passed through only to the source that already
-    owns the call, so a mute or a background tab keeps using that source's
-    hold rules. Other sources are observed so the log can say they were
-    ignored. They do not take over until ``poll(in_call=False)``, which is
-    after the debouncer has finished the leave hold.
+    owns the call, so that source applies its own hold rules. Meet can keep
+    going on a window or the mic. A Slack Huddle ends when ``slack.exe``
+    releases the mic and the leave debounce elapses. Other sources are
+    observed so the log can say they were ignored. They do not take over
+    until ``poll(in_call=False)``, which is after the debouncer has finished
+    the leave hold.
     """
 
     def __init__(self, detectors, log=None):

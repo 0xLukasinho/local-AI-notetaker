@@ -47,7 +47,8 @@ window_title_regex = ""
 # Substring matched against the process using the microphone: the consent-store
 # subkey and, when pycaw is installed, the WASAPI capture-session process name.
 # Chrome is unpackaged, so the default looks for chrome.exe. This applies to
-# Google Meet. Slack Huddle detection uses slack.exe and chrome.exe itself.
+# Google Meet. A Slack Huddle is slack.exe holding the microphone, not this
+# marker, and not a window title.
 mic_process_marker = "chrome.exe"
 
 # Watcher sources. Omit either line to leave it on. A manual
