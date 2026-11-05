@@ -636,6 +636,7 @@ def ensure_watcher(
             f"heartbeat_age={_age_text(decision.heartbeat_age)}s reason={decision.reason}"
         )
         log.warning(hang)
+        _ask_recorder_to_finish(control_dir)
         killer = kill or terminate_watcher
         try:
             killer(decision.pid)
@@ -791,14 +792,31 @@ def _wait_until_dead(pid, is_alive, timeout=5.0, sleep=None):
     return True
 
 
+def _ask_recorder_to_finish(control_dir):
+    """Stop file only, so the recorder transcribes after the watcher is gone."""
+    from meeting_notes.session import read_active, request_stop
+
+    active = read_active(control_dir) or {}
+    folder = active.get("folder")
+    pid = active.get("pid")
+    if not folder or not pid or not os.path.isdir(folder):
+        return
+    try:
+        request_stop(control_dir, folder, pid, break_ok=False)
+    except Exception:
+        pass
+
+
 def terminate_watcher(pid):
     """Stop a hung watcher. Refuses pid 0, negative pids, and this process."""
     pid = int(pid)
     if pid <= 0 or pid == os.getpid():
         raise RuntimeError(f"refusing to kill pid {pid}")
     if sys.platform == "win32":
+        # No /T: the recorder child must keep running so it can transcribe
+        # after this watcher is replaced. taskkill /T was killing it first.
         completed = subprocess.run(
-            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            ["taskkill", "/PID", str(pid), "/F"],
             check=False,
             capture_output=True,
             text=True,
@@ -810,8 +828,8 @@ def terminate_watcher(pid):
     import signal
 
     # SIGKILL, not SIGTERM: a hung watcher may not be running Python bytecode.
-    # Kill only this pid. The Windows path uses taskkill /T so a stuck recorder
-    # exits with the watcher; this branch is the non-Windows fallback.
+    # Kill only this pid. The recorder child is not in this process tree kill
+    # on Windows either, so a stop already sent can still finish transcription.
     try:
         os.kill(pid, signal.SIGKILL)
     except ProcessLookupError:

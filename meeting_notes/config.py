@@ -5,6 +5,7 @@ config.json). Secrets belong there or in environment variables, never in git.
 
 Manual `start` / `reprocess` keep today's behavior when this file is absent:
 transcript_only defaults to false, so Claude notes are still generated.
+Watcher sessions also summarize unless watcher_transcript_only is set.
 """
 
 import json
@@ -39,7 +40,11 @@ class Config:
     # CLI start/reprocess. False preserves the historical Claude summary.
     transcript_only: bool = False
     # Watcher-started sessions. Independent of the CLI default.
-    watcher_transcript_only: bool = True
+    # False: transcribe, summarize, and deliver. True skips Claude notes.
+    watcher_transcript_only: bool = False
+    # Keep wav files after transcript.txt is written. The CLI --keep-audio
+    # flag does the same for one command.
+    keep_audio: bool = False
     delete_audio_after_delivery: bool = False
     # Empty means the built-in "Meet - ..." Chrome title pattern.
     window_title_regex: str = ""
@@ -100,6 +105,7 @@ _INT_FIELDS = {
 _BOOL_FIELDS = {
     "transcript_only",
     "watcher_transcript_only",
+    "keep_audio",
     "delete_audio_after_delivery",
     "speaker_labels",
     "diarize",

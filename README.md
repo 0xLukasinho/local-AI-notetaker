@@ -323,9 +323,10 @@ The request uses `webhook_auth_header` / `webhook_auth_value` when both are set,
 
 ```bash
 meeting-notes deliver 2026-10-29_abc-defg-hij_1430
+meeting-notes process 2026-10-29_abc-defg-hij_1430
 ```
 
-`deliver` resends any session that already has a `transcript.txt`.
+`deliver` resends any session that already has a `transcript.txt`. `process` transcribes a folder from its audio when `transcript.txt` is missing, writes notes, and delivers only when `status.json` says `mode` is `watch`. A manual session is never delivered. The wav files are deleted once the transcript is written, unless `keep_audio` or `--keep-audio` is set. The next time the watcher starts, it finishes any folder that still has audio and no transcript, then delivers watcher sessions.
 
 ### Config
 
@@ -342,7 +343,8 @@ Copy `config.example.toml` to `~/.meeting-notes/config.toml`, or use `config.jso
 | `poll_interval_seconds` | `2` | How often window and microphone state are checked. |
 | `outbox_retry_seconds` | `60` | How often failed deliveries are retried. |
 | `transcript_only` | `false` | Default for manual `start` / `reprocess`. |
-| `watcher_transcript_only` | `true` | Watcher sessions skip Claude notes. |
+| `watcher_transcript_only` | `false` | `true` skips Claude notes for watcher sessions. The default transcribes, summarizes, and delivers. |
+| `keep_audio` | `false` | Keep the wav files after `transcript.txt` is written. `--keep-audio` does this for one command. |
 | `delete_audio_after_delivery` | `false` | Remove `audio.wav` after a successful POST. |
 | `window_title_regex` | empty | Replaces the built-in `Meet - ...` pattern. |
 | `watch_google_meet` | `true` | Watcher records Google Meet. `false` ignores Meet. |
@@ -410,7 +412,7 @@ Limits:
 
 - Audio recording and Whisper transcription run entirely on your machine
 - The transcript text is sent to Claude via the Claude Code CLI for note generation — this is the only network call on the default `start` / `reprocess` path
-- Transcript-only mode and the watcher do not call Claude. If `webhook_url` is set, the watcher POSTs the transcript to that URL after a Meet or a Huddle session finishes. A manual `meeting-notes start` does not POST it. With `watcher_health_ping = true` (default false), a long same-day outage also POSTs one `watcher-health` event to that same URL. That event is not a transcript
+- Transcript-only mode does not call Claude. Watcher sessions do, unless `watcher_transcript_only = true`. If `webhook_url` is set, the watcher POSTs the transcript to that URL after a Meet or a Huddle session finishes. A manual `meeting-notes start` does not POST it. With `watcher_health_ping = true` (default false), a long same-day outage also POSTs one `watcher-health` event to that same URL. That event is not a transcript
 - The optional Chrome extension sends participant names, the active-speaker highlight, and caption lines (only when you have captions on) to `127.0.0.1` on this computer only. It does not join the call or change what other people see
 - Naming remote speakers uses those local caption lines. No extra model is downloaded for that
 - All files (audio, transcript, notes) are stored locally in `~/meeting-notes/`

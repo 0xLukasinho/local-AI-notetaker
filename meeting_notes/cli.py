@@ -155,25 +155,24 @@ def _release_hotkey():
         pass
 
 
-def _maybe_delete_audio(audio_path, notes_path, keep_audio):
-    """Delete the audio file by default; skip if keep_audio is True.
+def _wants_keep_audio(args, config):
+    if getattr(args, "keep_audio", False):
+        return True
+    return bool(getattr(config, "keep_audio", False))
 
-    Only deletes when notes.md exists and is non-empty.
+
+def _maybe_delete_audio(folder, keep_audio):
+    """Delete the recording once transcript.txt is on disk.
+
+    ``--keep-audio`` and config ``keep_audio`` both retain the files.
     """
-    if keep_audio:
+    from meeting_notes.session_finish import delete_session_audio, transcript_ready
+
+    if keep_audio or not transcript_ready(folder):
         return
-    if not os.path.exists(notes_path) or os.path.getsize(notes_path) == 0:
-        return
-    folder = os.path.dirname(audio_path)
-    for name in ("audio.wav", "audio-self.wav", "audio-others.wav"):
-        path = os.path.join(folder, name)
-        if not os.path.exists(path):
-            continue
-        try:
-            os.remove(path)
-            print(f"Audio file deleted: {path}")
-        except OSError as e:
-            print(f"Warning: could not delete audio file: {e}", file=sys.stderr)
+    removed, _freed = delete_session_audio(folder)
+    for path in removed:
+        print(f"Audio file deleted: {path}")
 
 
 def _load_config_lenient():
@@ -394,7 +393,6 @@ def cmd_start(args):
 
     audio_path = os.path.join(meeting_dir, "audio.wav")
     transcript_file = session_transcript_path(meeting_dir)
-    notes_path = os.path.join(meeting_dir, "notes.md")
 
     if has_transcript(meeting_dir):
         print(
@@ -418,7 +416,7 @@ def cmd_start(args):
         meet_code=_optional_text(getattr(args, "meet_code", None)),
         window_title=_optional_text(getattr(args, "window_title", None)),
         joined_at=_optional_text(getattr(args, "joined_at", None)),
-        break_ok=automated and sys.platform == "win32",
+        break_ok=False,
         honor_existing_stop=bool(automated or output_dir),
         source=source,
     )
@@ -467,60 +465,45 @@ def cmd_start(args):
             )
             sys.exit(1)
 
-        # --- Transcription ---
         stopped_at = iso_now()
         update_status(
             meeting_dir,
             {
-                "state": STATE_TRANSCRIBING,
                 "recording_stopped_at": stopped_at,
-                "transcription_started_at": stopped_at,
                 "left_at": stopped_at,
             },
         )
-        print("\n--- Transcription ---")
-        transcript = _write_transcript(meeting_dir, config, whisper_model, language)
-        print(f"Transcript saved: {transcript_file}")
+        from meeting_notes.session_finish import SessionFinishError, finish_folder
+        from meeting_notes.transcriber import transcribe_paths
 
-        if transcript_only:
-            print("Transcript-only mode: skipping note generation.")
-            update_status(
+        try:
+            result = finish_folder(
                 meeting_dir,
-                {
-                    "state": STATE_DONE,
-                    "finished_at": iso_now(),
-                    "error": None,
-                },
+                config,
+                meeting_name=meeting_name,
+                meeting_date=today,
+                model=model,
+                whisper_model=whisper_model,
+                language=language,
+                transcript_only=transcript_only,
+                keep_audio=_wants_keep_audio(args, config),
+                control_dir=CONTROL_DIR,
+                transcribe_plain=lambda path: transcribe(
+                    path, model_size=whisper_model, language=language
+                ),
+                transcribe_paths=lambda paths: transcribe_paths(
+                    paths,
+                    model_size=whisper_model,
+                    language=language,
+                    word_timestamps=True,
+                ),
+                notes_fn=generate_notes,
             )
-            print("Done!")
-            return
-
-        # --- Note Generation ---
-        print("\n--- Note Generation ---")
-        notes = generate_notes(transcript, meeting_name, today, model=model)
-
-        if notes is None:
-            _mark_failed(meeting_dir, "Failed to generate notes")
-            print("Failed to generate notes. Transcript was saved.", file=sys.stderr)
+        except SessionFinishError:
             sys.exit(1)
-
-        with open(notes_path, "w", encoding="utf-8") as f:
-            f.write(notes)
-
-        print(f"\nNotes saved: {notes_path}")
-        if copy_to_clipboard(notes):
+        notes = result.get("notes")
+        if notes and not transcript_only and copy_to_clipboard(notes):
             print("Notes copied to clipboard — paste into Notion with Ctrl+V.")
-
-        _maybe_delete_audio(audio_path, notes_path, args.keep_audio)
-        update_status(
-            meeting_dir,
-            {
-                "state": STATE_DONE,
-                "finished_at": iso_now(),
-                "error": None,
-            },
-        )
-        print("Done!")
     except Exception as exc:
         _mark_failed(meeting_dir, f"{type(exc).__name__}: {exc}")
         raise
@@ -597,6 +580,7 @@ def cmd_reprocess(args):
         transcript = _write_transcript(meeting_dir, config, whisper_model, language)
         print(f"Transcript saved: {transcript_file}")
         print("Transcript-only mode: skipping note generation.")
+        _maybe_delete_audio(meeting_dir, _wants_keep_audio(args, config))
         update_status(
             meeting_dir,
             {
@@ -634,7 +618,7 @@ def cmd_reprocess(args):
     if copy_to_clipboard(notes):
         print("Notes copied to clipboard — paste into Notion with Ctrl+V.")
 
-    _maybe_delete_audio(audio_path, notes_path, args.keep_audio)
+    _maybe_delete_audio(meeting_dir, _wants_keep_audio(args, config))
     update_status(
         meeting_dir,
         {
@@ -692,6 +676,51 @@ class _DeliverLog:
 
     def error(self, message, *args):
         print(message % args if args else message, file=sys.stderr)
+
+
+def cmd_process(args):
+    """Transcribe, summarize, and (for a watcher session) deliver a folder.
+
+    Manual sessions are never delivered. Audio is deleted after the transcript
+    is written unless ``--keep-audio`` or config ``keep_audio`` is set.
+    """
+    from meeting_notes.session_finish import SessionFinishError, finish_folder
+
+    try:
+        config = load_config(control_dir=CONTROL_DIR)
+    except ConfigError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    meeting_dir = _resolve_folder(args.folder)
+    if not os.path.isdir(meeting_dir):
+        print(f"Error: Meeting folder not found: {meeting_dir}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        result = finish_folder(
+            meeting_dir,
+            config,
+            model=args.model or DEFAULT_MODEL,
+            whisper_model=args.whisper_model,
+            language=args.language,
+            keep_audio=_wants_keep_audio(args, config),
+            control_dir=CONTROL_DIR,
+        )
+    except SessionFinishError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    if result.get("delivered"):
+        print(f"Delivered {meeting_dir}")
+    elif session_mode_is_manual(meeting_dir):
+        print("Manual session: transcript and notes are local only (not delivered).")
+
+
+def session_mode_is_manual(folder):
+    from meeting_notes.session import read_status
+
+    return (read_status(folder) or {}).get("mode") != "watch"
 
 
 def cmd_deliver(args):
@@ -1058,6 +1087,30 @@ def build_parser():
     )
     deliver_parser.add_argument("folder", help="Meeting folder name or absolute path")
     deliver_parser.set_defaults(func=cmd_deliver)
+
+    process_parser = subparsers.add_parser(
+        "process",
+        help="Transcribe and summarize a session folder from its audio",
+    )
+    process_parser.add_argument("folder", help="Meeting folder name or absolute path")
+    process_parser.add_argument(
+        "--model", help=f"Claude model for note generation (default: {DEFAULT_MODEL})"
+    )
+    process_parser.add_argument(
+        "--whisper-model",
+        help=f"Whisper model size (default: {DEFAULT_WHISPER_MODEL})",
+        choices=["tiny", "base", "small", "medium", "large"],
+    )
+    process_parser.add_argument(
+        "--language",
+        help=f"Language code to force, or 'auto' to detect (default: {DEFAULT_LANGUAGE})",
+    )
+    process_parser.add_argument(
+        "--keep-audio",
+        action="store_true",
+        help="Keep the wav files after the transcript is written",
+    )
+    process_parser.set_defaults(func=cmd_process)
 
     watch_parser = subparsers.add_parser(
         "watch",
