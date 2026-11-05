@@ -77,7 +77,7 @@ def test_transcript_only_skips_claude_and_writes_no_notes(tmp_path, monkeypatch,
     assert "Note Generation" not in out
     assert "notes" not in order
     assert not (folder / "notes.md").exists()
-    assert (folder / "audio.wav").is_file()
+    assert not (folder / "audio.wav").exists()
     assert (folder / "transcript.txt").read_text(encoding="utf-8") == "[00:03] transcript line"
     status = read_status(str(folder))
     assert status["state"] == "done"
@@ -213,7 +213,7 @@ def test_automated_start_refuses_a_second_session(tmp_path, monkeypatch, capsys)
     assert "mode manual" in err
 
 
-def test_reprocess_transcript_only_skips_notes_and_keeps_audio(tmp_path, monkeypatch, capsys):
+def test_reprocess_transcript_only_skips_notes_and_deletes_audio(tmp_path, monkeypatch, capsys):
     meetings, _control = _dirs(monkeypatch, tmp_path)
     folder = meetings / "2026-10-29_weekly-standup"
     folder.mkdir()
@@ -226,7 +226,7 @@ def test_reprocess_transcript_only_skips_notes_and_keeps_audio(tmp_path, monkeyp
     assert "Transcript-only mode: skipping note generation." in out
     assert "notes" not in order
     assert (folder / "notes.md").read_text(encoding="utf-8") == "old notes"
-    assert (folder / "audio.wav").is_file()
+    assert not (folder / "audio.wav").exists()
     assert (folder / "transcript.txt").read_text(encoding="utf-8") == "[00:03] transcript line"
 
 

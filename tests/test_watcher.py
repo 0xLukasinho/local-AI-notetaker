@@ -434,7 +434,7 @@ def test_heartbeat_stays_recording_while_transcription_finishes(tmp_path):
     beats = []
 
     class RememberHeartbeat:
-        def beat(self, force=False, state=None):
+        def beat(self, force=False, state=None, session_folder=None, session_pid=None):
             beats.append(state)
 
     class SlowFinish(FakeLauncher):
@@ -496,3 +496,63 @@ def test_outbox_is_retried_when_the_watcher_starts(tmp_path):
     )
     watcher.run(max_ticks=0)
     assert retries == ["retry"]
+
+
+def test_heartbeat_follows_the_active_watcher_session_when_activity_is_idle(tmp_path):
+    """The recorder is a child. active.json is the source of recording state."""
+    beats = []
+
+    class RememberHeartbeat:
+        def beat(self, force=False, state="idle", session_folder=None, session_pid=None):
+            beats.append((state, session_folder, session_pid))
+
+    folder = str(tmp_path / "2026-11-05_pitch-deck-design-workshop")
+    clock = Clock()
+    watcher = MeetWatcher(
+        config=_config(),
+        detector=ScriptDetector(clock, present_until=-1),
+        launcher=FakeLauncher(),
+        deliver_fn=lambda _folder: True,
+        lock_store=Lock(
+            {
+                "pid": 45400,
+                "mode": "watch",
+                "folder": folder,
+                "folder_name": "2026-11-05_pitch-deck-design-workshop",
+            }
+        ),
+        outbox_retry=lambda: 0,
+        sleep=clock.sleep,
+        monotonic=clock.monotonic,
+        wall_iso=lambda: "2026-11-05T14:32:48-05:00",
+        wall_datetime=lambda: datetime(2026, 11, 5, 14, 32, tzinfo=timezone.utc),
+        output_dir=str(tmp_path),
+        log=ListLog(),
+        heartbeat=RememberHeartbeat(),
+    )
+    watcher.activity = "idle"
+    watcher._beat()
+    assert beats == [(
+        "recording",
+        folder,
+        45400,
+    )]
+
+    manual = MeetWatcher(
+        config=_config(),
+        detector=ScriptDetector(clock, present_until=-1),
+        launcher=FakeLauncher(),
+        deliver_fn=lambda _folder: True,
+        lock_store=Lock({"pid": 9, "mode": "manual", "folder": str(tmp_path / "human")}),
+        outbox_retry=lambda: 0,
+        sleep=clock.sleep,
+        monotonic=clock.monotonic,
+        wall_iso=lambda: "2026-11-05T14:32:48-05:00",
+        wall_datetime=lambda: datetime(2026, 11, 5, 14, 32, tzinfo=timezone.utc),
+        output_dir=str(tmp_path),
+        log=ListLog(),
+        heartbeat=RememberHeartbeat(),
+    )
+    manual.activity = "idle"
+    manual._beat()
+    assert beats[-1] == ("idle", None, None)

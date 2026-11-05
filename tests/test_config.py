@@ -6,10 +6,11 @@ import pytest
 from meeting_notes.config import ConfigError, _parse_simple_toml, load_config
 
 
-def test_missing_file_keeps_manual_summary_and_watcher_transcript_only(tmp_path):
+def test_missing_file_keeps_manual_summary_and_watcher_notes(tmp_path):
     config = load_config(control_dir=str(tmp_path), environ={})
     assert config.transcript_only is False
-    assert config.watcher_transcript_only is True
+    assert config.watcher_transcript_only is False
+    assert config.keep_audio is False
     assert config.delete_audio_after_delivery is False
     assert config.webhook_url == ""
     assert config.join_debounce_seconds == 12

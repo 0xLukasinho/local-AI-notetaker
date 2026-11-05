@@ -34,10 +34,15 @@ outbox_retry_seconds = 60
 transcript_only = false
 
 # Watcher-started sessions. Independent of the manual default above.
-watcher_transcript_only = true
+# false transcribes, summarizes, and delivers. true skips Claude notes.
+watcher_transcript_only = false
 
-# Delete audio.wav after a successful webhook delivery. Manual sessions
-# still delete audio after notes.md is written, unless --keep-audio is set.
+# Keep audio.wav, audio-self.wav, and audio-others.wav after transcript.txt
+# is written. The default removes them once the transcript exists.
+# --keep-audio does the same for a single command.
+keep_audio = false
+
+# Delete audio.wav after a successful webhook delivery, if it is still there.
 delete_audio_after_delivery = false
 
 # Optional. Empty uses the built-in "Meet - <code or title>" Chrome title.

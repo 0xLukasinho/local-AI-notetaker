@@ -10,6 +10,9 @@ reads that file:
   killed and a new watcher is started
 - a heartbeat whose state is ``recording`` is not killed unless it is older
   than ten minutes, so a long transcription is not cut off
+- a live watcher session (``active.json`` with mode ``watch``) counts as
+  recording even when the heartbeat file still says idle, so a recorder
+  child process is not restarted mid-session
 
 The pid in the lock is killed only when that process still holds the lock.
 A pid that was reused by an unrelated program is not killed.
@@ -135,7 +138,7 @@ class Heartbeat:
         self.iso = iso or (lambda _unix: iso_now())
         self._last = None
 
-    def beat(self, force=False, state="idle"):
+    def beat(self, force=False, state="idle", session_folder=None, session_pid=None):
         current = float(self.now())
         if (
             not force
@@ -152,6 +155,14 @@ class Heartbeat:
             "version": self.version,
             "state": state,
         }
+        if state == "recording":
+            if session_folder:
+                payload["session_folder"] = str(session_folder)
+            try:
+                if session_pid is not None and int(session_pid) > 0:
+                    payload["session_pid"] = int(session_pid)
+            except (TypeError, ValueError):
+                pass
         atomic_write_json(heartbeat_path(self.control_dir), payload)
         self._last = current
         return True
@@ -305,6 +316,8 @@ class Decision:
     state: str = None
     heartbeat_age: float = None
     user_message: str = ""
+    session_folder: str = None
+    session_pid: int = None
 
     @property
     def ok(self):
@@ -330,8 +343,47 @@ def _heartbeat_age(heartbeat, now):
     return age
 
 
-def decide(instance, heartbeat, now, is_alive, lock_held):
+def read_watcher_recording(control_dir, is_alive=None):
+    """The active.json record for a live watcher session, or None.
+
+    Manual recordings are ignored. A dead recorder pid is ignored, so a stale
+    lock does not keep ``--ensure`` from replacing a crashed watcher.
+    """
+    from meeting_notes.session import pid_alive, read_active
+
+    data = read_active(control_dir)
+    if not isinstance(data, dict) or data.get("mode") != "watch":
+        return None
+    check = pid_alive if is_alive is None else is_alive
+    try:
+        alive = bool(check(data.get("pid")))
+    except Exception:
+        return None
+    if not alive:
+        return None
+    return data
+
+
+def _with_recording_state(heartbeat, active_session):
+    """Copy ``heartbeat`` with state recording when a watcher session is live."""
+    if not active_session or active_session.get("mode") != "watch":
+        return heartbeat, False
+    if not heartbeat:
+        return heartbeat, True
+    merged = dict(heartbeat)
+    merged["state"] = "recording"
+    folder = active_session.get("folder") or active_session.get("folder_name")
+    if folder:
+        merged["session_folder"] = folder
+    session_pid = _as_pid(active_session.get("pid"))
+    if session_pid:
+        merged["session_pid"] = session_pid
+    return merged, True
+
+
+def decide(instance, heartbeat, now, is_alive, lock_held, active_session=None):
     """Choose healthy, spare, start, restart, or failed. Pure: no I/O."""
+    heartbeat, recording = _with_recording_state(heartbeat, active_session)
     instance_pid = _as_pid(instance.get("pid")) if instance else None
     heartbeat_pid = _as_pid(heartbeat.get("pid")) if heartbeat else None
     instance_alive = bool(instance_pid) and bool(is_alive(instance_pid))
@@ -367,6 +419,34 @@ def decide(instance, heartbeat, now, is_alive, lock_held):
         and isinstance(heartbeat.get("unix"), (int, float))
     )
     if not matches:
+        if recording:
+            age = _heartbeat_age(heartbeat, now)
+            if age is not None and age > HEARTBEAT_RECORDING_DEAD_SECONDS:
+                return Decision(
+                    "restart",
+                    f"watcher pid {pid} heartbeat is stale while recording and past the dead limit",
+                    pid=pid,
+                    kill=True,
+                    state="recording",
+                    heartbeat_age=age,
+                )
+            if age is not None and age < HEARTBEAT_STALE_SECONDS:
+                return Decision(
+                    "healthy",
+                    f"watcher pid {pid} is recording",
+                    pid=pid,
+                    kill=False,
+                    state="recording",
+                    heartbeat_age=age,
+                )
+            return Decision(
+                "spare",
+                f"watcher pid {pid} is recording",
+                pid=pid,
+                kill=False,
+                state="recording",
+                heartbeat_age=age,
+            )
         started = None
         if instance and instance_pid == pid:
             started = instance.get("started_at_unix")
@@ -421,17 +501,55 @@ def _age_text(age):
     return str(int(age))
 
 
-def describe_heartbeat(control_dir, now=None):
-    """One status line for ``watch --status``."""
+def _session_fields(active, heartbeat, state):
+    """Folder path and recorder pid for a recording status line."""
+    if active:
+        folder = active.get("folder") or active.get("folder_name")
+        return folder, active.get("pid")
+    if state == "recording" and heartbeat:
+        return heartbeat.get("session_folder"), heartbeat.get("session_pid")
+    return None, None
+
+
+def _format_session(folder, session_pid):
+    parts = []
+    if folder:
+        parts.append(f"session_folder={folder}")
+    if session_pid is not None and session_pid != "":
+        parts.append(f"session_pid={session_pid}")
+    if not parts:
+        return ""
+    return ", " + ", ".join(parts)
+
+
+def describe_heartbeat(control_dir, now=None, active=None, is_alive=None):
+    """One status line for ``watch --status``.
+
+    A live watcher session is reported as recording even when the heartbeat
+    file still says idle. The line includes that session's folder and pid.
+    """
     now = time.time() if now is None else float(now)
     heartbeat = read_heartbeat(control_dir)
-    if not heartbeat:
+    if active is None:
+        active = read_watcher_recording(control_dir, is_alive=is_alive)
+    if not heartbeat and not active:
         return "Heartbeat: missing"
-    age = _heartbeat_age(heartbeat, now)
-    state = heartbeat.get("state") or "unknown"
-    stamp = heartbeat.get("timestamp") or "unknown time"
-    version = heartbeat.get("version") or "unknown"
-    pid = heartbeat.get("pid")
+    if heartbeat:
+        age = _heartbeat_age(heartbeat, now)
+        state = heartbeat.get("state") or "unknown"
+        stamp = heartbeat.get("timestamp") or "unknown time"
+        version = heartbeat.get("version") or "unknown"
+        pid = heartbeat.get("pid")
+    else:
+        age = None
+        state = "unknown"
+        stamp = "unknown time"
+        version = "unknown"
+        pid = None
+    if active:
+        state = "recording"
+    folder, session_pid = _session_fields(active, heartbeat, state)
+    session = _format_session(folder, session_pid)
     note = ""
     if age is not None and age >= HEARTBEAT_STALE_SECONDS:
         if state == "recording" and age <= HEARTBEAT_RECORDING_DEAD_SECONDS:
@@ -439,9 +557,13 @@ def describe_heartbeat(control_dir, now=None):
         else:
             note = "; stale"
     age_text = "unknown" if age is None else f"{int(age)}s"
+    if not heartbeat:
+        return (
+            f"Heartbeat: missing (state=recording{session})"
+        )
     return (
         f"Heartbeat: {stamp} (age {age_text}, state={state}, "
-        f"pid={pid}, version={version}){note}"
+        f"pid={pid}, version={version}{session}){note}"
     )
 
 
@@ -470,13 +592,17 @@ def ensure_watcher(
     current = float(clock() if callable(clock) else clock)
     alive = is_alive or pid_alive
     held = lock_is_held(control_dir) if lock_held_fn is None else bool(lock_held_fn())
+    active = read_watcher_recording(control_dir, is_alive=alive)
     decision = decide(
         read_instance(control_dir),
         read_heartbeat(control_dir),
         current,
         alive,
         held,
+        active_session=active,
     )
+    _remember_session(decision, active)
+    session_clause = _session_clause(active)
     if decision.action == "healthy":
         if decision.heartbeat_age is None:
             age_text = "no heartbeat yet"
@@ -485,6 +611,7 @@ def ensure_watcher(
         decision.user_message = (
             "ensure: watcher already running "
             f"(pid {decision.pid}, state {decision.state or 'unknown'}, {age_text})"
+            f"{session_clause}"
         )
         log.info(decision.user_message)
         return decision
@@ -493,6 +620,7 @@ def ensure_watcher(
             "ensure: not killing a recording watcher "
             f"(pid {decision.pid}, heartbeat age {_age_text(decision.heartbeat_age)}s, "
             f"dead limit {int(HEARTBEAT_RECORDING_DEAD_SECONDS)}s)"
+            f"{session_clause}"
         )
         log.warning(decision.user_message)
         return decision
@@ -508,6 +636,7 @@ def ensure_watcher(
             f"heartbeat_age={_age_text(decision.heartbeat_age)}s reason={decision.reason}"
         )
         log.warning(hang)
+        _ask_recorder_to_finish(control_dir)
         killer = kill or terminate_watcher
         try:
             killer(decision.pid)
@@ -536,7 +665,7 @@ def ensure_watcher(
         reason = f"ensure start: {decision.reason}"
 
     try:
-        method = spawn_watcher(control_dir, reason, spawn=spawn)
+        method = spawn_watcher(control_dir, reason, spawn=spawn, log=log)
     except Exception as exc:
         decision.action = "failed"
         decision.user_message = f"ensure: failed to start watcher: {exc}"
@@ -663,14 +792,31 @@ def _wait_until_dead(pid, is_alive, timeout=5.0, sleep=None):
     return True
 
 
+def _ask_recorder_to_finish(control_dir):
+    """Stop file only, so the recorder transcribes after the watcher is gone."""
+    from meeting_notes.session import read_active, request_stop
+
+    active = read_active(control_dir) or {}
+    folder = active.get("folder")
+    pid = active.get("pid")
+    if not folder or not pid or not os.path.isdir(folder):
+        return
+    try:
+        request_stop(control_dir, folder, pid, break_ok=False)
+    except Exception:
+        pass
+
+
 def terminate_watcher(pid):
     """Stop a hung watcher. Refuses pid 0, negative pids, and this process."""
     pid = int(pid)
     if pid <= 0 or pid == os.getpid():
         raise RuntimeError(f"refusing to kill pid {pid}")
     if sys.platform == "win32":
+        # No /T: the recorder child must keep running so it can transcribe
+        # after this watcher is replaced. taskkill /T was killing it first.
         completed = subprocess.run(
-            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            ["taskkill", "/PID", str(pid), "/F"],
             check=False,
             capture_output=True,
             text=True,
@@ -682,15 +828,42 @@ def terminate_watcher(pid):
     import signal
 
     # SIGKILL, not SIGTERM: a hung watcher may not be running Python bytecode.
-    # Kill only this pid. The Windows path uses taskkill /T so a stuck recorder
-    # exits with the watcher; this branch is the non-Windows fallback.
+    # Kill only this pid. The recorder child is not in this process tree kill
+    # on Windows either, so a stop already sent can still finish transcription.
     try:
         os.kill(pid, signal.SIGKILL)
     except ProcessLookupError:
         return
 
 
-def spawn_watcher(control_dir, reason, spawn=None):
+def _session_clause(active):
+    if not active:
+        return ""
+    folder = active.get("folder") or active.get("folder_name") or "unknown"
+    return f", session {folder} (pid {active.get('pid')})"
+
+
+def _remember_session(decision, active):
+    if not active:
+        return
+    decision.session_folder = active.get("folder") or active.get("folder_name")
+    decision.session_pid = _as_pid(active.get("pid"))
+
+
+def _short_spawn_error(exc):
+    """One line. PowerShell error records stay out of watch.log."""
+    text = " ".join(str(exc).split())
+    for cut in ("At line:", "CategoryInfo", "FullyQualifiedErrorId"):
+        index = text.find(cut)
+        if index != -1:
+            text = text[:index]
+    text = " ".join(text.split())
+    if not text:
+        text = exc.__class__.__name__
+    return text[:180]
+
+
+def spawn_watcher(control_dir, reason, spawn=None, log=None):
     """Start ``meeting-notes watch`` detached. Tests pass ``spawn``."""
     write_start_reason(control_dir, reason)
     if spawn is not None:
@@ -702,13 +875,19 @@ def spawn_watcher(control_dir, reason, spawn=None):
             _spawn_wmi(argv)
             return "wmi"
         except Exception as first:
+            short = _short_spawn_error(first)
+            if log is not None:
+                log.info(
+                    "ensure: Win32_Process.Create failed (%s); using popen fallback",
+                    short,
+                )
             try:
                 _spawn_popen(argv, reason)
             except Exception as second:
                 raise RuntimeError(
-                    f"wmi failed ({first}); detached start failed ({second})"
+                    f"wmi failed ({short}); detached start failed ({second})"
                 ) from second
-            return f"popen-fallback ({first})"
+            return "popen-fallback"
     _spawn_popen(argv, reason)
     return "posix"
 
@@ -775,8 +954,10 @@ def _spawn_wmi(argv):
         f"$create = @{{ CommandLine = {quoted} }}; "
         "$result = Invoke-CimMethod -ClassName Win32_Process -MethodName Create "
         "-Arguments $create; "
-        "if ($result.ReturnValue -ne 0) { "
-        "Write-Error ('Win32_Process.Create failed: ' + $result.ReturnValue); exit 1 }"
+        "if ($null -eq $result -or $result.ReturnValue -ne 0) { "
+        "if ($null -eq $result) { $code = -1 } else { $code = $result.ReturnValue }; "
+        "Write-Output ('Win32_Process.Create failed: ReturnValue ' + $code); "
+        "exit 1 }"
     )
     create_no_window = 0x08000000
     completed = subprocess.run(

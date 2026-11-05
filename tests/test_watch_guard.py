@@ -7,6 +7,7 @@ import pytest
 
 from meeting_notes.config import Config
 from meeting_notes.deliver import DeliveryError
+from meeting_notes.session import write_active
 from meeting_notes.watch_guard import (
     ENSURE_RETRY_DELAYS,
     HEARTBEAT_RECORDING_DEAD_SECONDS,
@@ -21,6 +22,7 @@ from meeting_notes.watch_guard import (
     ensure_watcher,
     maybe_send_health,
     read_heartbeat,
+    spawn_watcher,
     watcher_stayed_up,
     write_instance,
     write_start_reason,
@@ -123,6 +125,18 @@ def test_heartbeat_records_state_pid_and_version(tmp_path):
     assert saved["version"] == "0.1.0"
     assert saved["unix"] == NOW + 30
     assert saved["timestamp"] == "2026-11-05T12:00:00-05:00"
+    assert "session_folder" not in saved
+    assert beat.beat(
+        force=True,
+        state="recording",
+        session_folder=r"C:\meetings\2026-11-05_pitch-deck-design-workshop",
+        session_pid=45400,
+    )
+    saved = read_heartbeat(str(tmp_path))
+    assert saved["session_folder"] == r"C:\meetings\2026-11-05_pitch-deck-design-workshop"
+    assert saved["session_pid"] == 45400
+    assert beat.beat(force=True, state="idle")
+    assert "session_folder" not in read_heartbeat(str(tmp_path))
 
 
 def test_decide_thresholds():
@@ -183,6 +197,60 @@ def test_decide_thresholds():
     assert reused.action == "start"
     assert reused.kill is False
     assert "not killing" in reused.reason
+
+
+def _watch_session(pid=45400):
+    return {
+        "pid": pid,
+        "mode": "watch",
+        "folder": r"C:\meetings\2026-11-05_pitch-deck-design-workshop",
+        "folder_name": "2026-11-05_pitch-deck-design-workshop",
+    }
+
+
+def test_decide_treats_an_idle_heartbeat_as_recording_while_a_watcher_session_is_live():
+    alive = _alive_factory(PID, 45400)
+    fresh = decide(
+        _instance(),
+        _heartbeat(10, "idle"),
+        NOW,
+        alive,
+        True,
+        active_session=_watch_session(),
+    )
+    assert fresh.action == "healthy"
+    assert fresh.kill is False
+    assert fresh.state == "recording"
+
+    stale = decide(
+        _instance(),
+        _heartbeat(200, "idle"),
+        NOW,
+        alive,
+        True,
+        active_session=_watch_session(),
+    )
+    assert stale.action == "spare"
+    assert stale.kill is False
+    assert stale.state == "recording"
+
+    missing = decide(_instance(age=400), None, NOW, alive, True, active_session=_watch_session())
+    assert missing.action == "spare"
+    assert missing.kill is False
+    assert missing.state == "recording"
+
+    dead_limit = decide(
+        _instance(),
+        _heartbeat(HEARTBEAT_RECORDING_DEAD_SECONDS + 30, "idle"),
+        NOW,
+        alive,
+        True,
+        active_session=_watch_session(),
+    )
+    assert dead_limit.action == "restart"
+    assert dead_limit.kill is True
+    assert dead_limit.state == "recording"
+    assert "recording" in dead_limit.reason
 
 
 def _ensure(tmp_path, *, alive, lock_held, heartbeat=None, instance=None, kill=None, wait=None):
@@ -292,6 +360,82 @@ def test_ensure_spares_a_recording_until_the_heartbeat_is_clearly_dead(tmp_path)
     assert spawned == []
     assert killed == []
     assert "not killing a recording watcher" in log.text()
+
+
+def test_ensure_spares_a_live_watcher_session_when_the_heartbeat_says_idle(tmp_path):
+    folder = r"C:\meetings\2026-11-05_pitch-deck-design-workshop"
+    write_active(
+        str(tmp_path),
+        {
+            "pid": 45400,
+            "mode": "watch",
+            "folder": folder,
+            "folder_name": "2026-11-05_pitch-deck-design-workshop",
+        },
+    )
+    decision, spawned, killed, log = _ensure(
+        tmp_path,
+        alive=_alive_factory(PID, 45400),
+        lock_held=True,
+        instance=_instance(),
+        heartbeat=_heartbeat(200, "idle"),
+    )
+    assert decision.action == "spare"
+    assert decision.state == "recording"
+    assert decision.session_pid == 45400
+    assert decision.session_folder == folder
+    assert spawned == []
+    assert killed == []
+    text = log.text()
+    assert "not killing a recording watcher" in text
+    assert folder in text
+    assert "45400" in text
+
+
+def test_ensure_still_restarts_a_watcher_session_past_the_dead_limit(tmp_path):
+    write_active(str(tmp_path), _watch_session())
+    decision, spawned, killed, log = _ensure(
+        tmp_path,
+        alive=_alive_factory(PID, 45400),
+        lock_held=True,
+        instance=_instance(),
+        heartbeat=_heartbeat(HEARTBEAT_RECORDING_DEAD_SECONDS + 30, "idle"),
+    )
+    assert decision.action == "restart"
+    assert killed == [PID]
+    assert spawned
+    assert "recording" in log.text()
+
+
+def test_ensure_ignores_a_dead_or_manual_session_marker(tmp_path):
+    write_active(
+        str(tmp_path),
+        {"pid": 45400, "mode": "watch", "folder": r"C:\meetings\old"},
+    )
+    decision, spawned, killed, _log = _ensure(
+        tmp_path,
+        alive=_alive_factory(PID),
+        lock_held=True,
+        instance=_instance(),
+        heartbeat=_heartbeat(200, "idle"),
+    )
+    assert decision.action == "restart"
+    assert killed == [PID]
+    assert spawned
+
+    write_active(
+        str(tmp_path),
+        {"pid": 77, "mode": "manual", "folder": r"C:\meetings\human"},
+    )
+    decision, spawned, killed, _log = _ensure(
+        tmp_path,
+        alive=_alive_factory(PID, 77),
+        lock_held=True,
+        instance=_instance(),
+        heartbeat=_heartbeat(200, "idle"),
+    )
+    assert decision.action == "restart"
+    assert killed == [PID]
 
 
 def test_ensure_kills_a_recording_whose_heartbeat_is_past_ten_minutes(tmp_path):
@@ -451,12 +595,78 @@ def test_status_reports_a_stale_recording_heartbeat(tmp_path):
         version="0.1.0",
         pid=PID,
         iso=lambda _unix: "2026-11-05T12:00:00-05:00",
-    ).beat(force=True, state="recording")
+    ).beat(
+        force=True,
+        state="recording",
+        session_folder=r"C:\meetings\2026-11-05_pitch-deck-design-workshop",
+        session_pid=45400,
+    )
     text = describe_heartbeat(str(tmp_path), now=NOW)
     assert "state=recording" in text
     assert "age 200s" in text
     assert "left alone" in text
     assert "version=0.1.0" in text
+    assert "session_folder=C:\\meetings\\2026-11-05_pitch-deck-design-workshop" in text
+    assert "session_pid=45400" in text
+
+
+def test_status_reports_recording_from_the_active_session_when_the_heartbeat_says_idle(tmp_path):
+    Heartbeat(
+        str(tmp_path),
+        now=lambda: NOW - 12,
+        version="0.1.0",
+        pid=PID,
+        iso=lambda _unix: "2026-11-05T14:32:48-05:00",
+    ).beat(force=True, state="idle")
+    folder = r"C:\meetings\2026-11-05_pitch-deck-design-workshop"
+    write_active(str(tmp_path), _watch_session())
+    text = describe_heartbeat(str(tmp_path), now=NOW, is_alive=_alive_factory(45400))
+    assert "state=recording" in text
+    assert "state=idle" not in text
+    assert f"session_folder={folder}" in text
+    assert "session_pid=45400" in text
+    assert f"pid={PID}" in text
+
+    hidden = describe_heartbeat(str(tmp_path), now=NOW, is_alive=_alive_factory())
+    assert "state=idle" in hidden
+    assert "session_pid" not in hidden
+
+
+def test_status_reports_a_recording_when_the_heartbeat_file_is_missing(tmp_path):
+    write_active(str(tmp_path), _watch_session())
+    text = describe_heartbeat(str(tmp_path), now=NOW, is_alive=_alive_factory(45400))
+    assert text.startswith("Heartbeat: missing")
+    assert "state=recording" in text
+    assert "session_pid=45400" in text
+    assert "2026-11-05_pitch-deck-design-workshop" in text
+
+
+def test_popen_fallback_is_logged_at_info_without_the_powershell_error(tmp_path, monkeypatch):
+    import meeting_notes.watch_guard as watch_guard
+
+    log = ListLog()
+
+    def boom(_argv):
+        raise RuntimeError(
+            "Win32_Process.Create failed: ReturnValue 8\n"
+            "At line:1 char:1\n"
+            "+ ... Write-Error ('Win32_Process.Create failed: ' + $result.ReturnValue)\n"
+            "    + CategoryInfo          : NotSpecified: (:) [Write-Error], WriteErrorException\n"
+            "    + FullyQualifiedErrorId : Microsoft.PowerShell.Commands.WriteErrorException"
+        )
+
+    monkeypatch.setattr(watch_guard, "_spawn_wmi", boom)
+    monkeypatch.setattr(watch_guard, "_spawn_popen", lambda _argv, _reason: None)
+    monkeypatch.setattr(watch_guard.sys, "platform", "win32")
+    method = spawn_watcher(str(tmp_path), "ensure start: no watcher is running", log=log)
+    assert method == "popen-fallback"
+    text = log.text()
+    assert "using popen fallback" in text
+    assert "ReturnValue 8" in text
+    assert "CategoryInfo" not in text
+    assert "FullyQualifiedErrorId" not in text
+    assert "At line:" not in text
+    assert all(level == "info" for level, _message in log.messages)
 
 
 def test_start_reason_is_consumed_once_and_ignored_when_old(tmp_path):

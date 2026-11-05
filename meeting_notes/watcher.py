@@ -14,6 +14,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass
 
 from meeting_notes.autostart import find_pythonw
@@ -27,6 +28,7 @@ from meeting_notes.watch_guard import (
     package_version,
     read_heartbeat,
     read_instance,
+    read_watcher_recording,
     write_instance,
 )
 from meeting_notes.deliver import deliver_folder, retry_outbox
@@ -49,6 +51,19 @@ from meeting_notes.session import (
 
 CREATE_NEW_PROCESS_GROUP = 0x00000200
 CREATE_NO_WINDOW = 0x08000000
+
+
+def _transcript_ready(folder):
+    from meeting_notes.session_finish import transcript_ready
+
+    return transcript_ready(folder)
+
+
+def _folder_has_audio(folder):
+    from meeting_notes.session_finish import folder_has_audio
+
+    return folder_has_audio(folder)
+
 
 _RUNNING = {"recording", "transcribing", "running"}
 _FINISHED_OK = {"done"}
@@ -157,7 +172,9 @@ class SubprocessLauncher:
             pid=proc.pid,
             popen=proc,
             log_handle=log_handle,
-            break_ok=sys.platform == "win32",
+            # Stop file only. CTRL_BREAK against pythonw (no console) kills the
+            # process group, and the child dies before Whisper starts.
+            break_ok=False,
         )
 
     def request_stop(self, session):
@@ -232,6 +249,8 @@ class MeetWatcher:
         self.heartbeat = heartbeat if heartbeat is not None else None
         self.activity = "idle"
         self._last_beat_state = None
+        self._last_session_folder = None
+        self._last_session_pid = None
         from meeting_notes.meet_detect import CallDebouncer
 
         self.debouncer = CallDebouncer(
@@ -244,8 +263,10 @@ class MeetWatcher:
         self._last_outbox = None
         self._last_seen_key = None
         self._device_log_offsets = {}
+        self._stop_requested_for = None
 
     def run(self, stop_event=None, max_ticks=None):
+        self._resume_unfinished()
         self._retry_outbox()
         self._last_outbox = self.monotonic()
         ticks = 0
@@ -282,8 +303,35 @@ class MeetWatcher:
             self._mirror_device_log(self.session.folder)
         self._beat()
 
+    def _active_watch_recording(self):
+        """Live watcher session from the lock, or None.
+
+        The recorder is a child process. Its ``active.json`` (mode ``watch``)
+        is what makes the heartbeat say recording when this process's own
+        activity flag is still idle.
+        """
+        current_fn = getattr(self.lock_store, "current", None)
+        if current_fn is None:
+            return None
+        try:
+            current = current_fn()
+        except Exception:
+            return None
+        if not isinstance(current, dict) or current.get("mode") != "watch":
+            return None
+        return current
+
+    def _recording_marker(self):
+        active = self._active_watch_recording()
+        if active is not None:
+            return active.get("folder") or active.get("folder_name"), active.get("pid")
+        if self.activity == "recording" and self.session is not None:
+            return self.session.folder, self.session.pid
+        return None, None
+
     def health_state(self):
-        if self.activity == "recording":
+        folder, pid = self._recording_marker()
+        if folder or pid or self.activity == "recording":
             return "recording"
         return "idle"
 
@@ -292,10 +340,24 @@ class MeetWatcher:
         if heartbeat is None:
             return
         state = self.health_state()
-        force = state != self._last_beat_state
+        folder, pid = (None, None)
+        if state == "recording":
+            folder, pid = self._recording_marker()
+        force = (
+            state != self._last_beat_state
+            or folder != self._last_session_folder
+            or pid != self._last_session_pid
+        )
         self._last_beat_state = state
+        self._last_session_folder = folder
+        self._last_session_pid = pid
         try:
-            heartbeat.beat(force=force, state=state)
+            heartbeat.beat(
+                force=force,
+                state=state,
+                session_folder=folder,
+                session_pid=pid,
+            )
         except Exception as exc:
             self.log.error("Could not write the heartbeat: %s", exc)
 
@@ -366,6 +428,7 @@ class MeetWatcher:
             return
         self.delivered = False
         self.suppressed = False
+        self._stop_requested_for = None
         self.activity = "recording"
         self.log.info(
             "Started transcript session %s (%s, source %s)",
@@ -380,6 +443,8 @@ class MeetWatcher:
         suppressed = self.suppressed
         self.session = None
         self.suppressed = False
+        if session is not None and session.folder == self._stop_requested_for:
+            return
         if suppressed or session is None:
             self.activity = "idle"
             self.log.info("Call ended with no watcher recording to stop.")
@@ -390,6 +455,7 @@ class MeetWatcher:
             self.log.info("Call ended; session %s was already delivered.", session.folder)
             self._beat()
             return
+        self._stop_requested_for = session.folder
         self.activity = "recording"
         self.log.info("Call ended; stopping %s", session.folder)
         try:
@@ -400,7 +466,8 @@ class MeetWatcher:
                 self.log.error("Failed to signal stop for %s: %s", session.folder, exc)
             state = self._wait_until_finished(session)
             self._mirror_device_log(session.folder)
-            if state in _FINISHED_OK:
+            self._finish_if_recorder_died(session.folder, state)
+            if state in _FINISHED_OK or _transcript_ready(session.folder):
                 self._deliver(session.folder)
             else:
                 self.log.error(
@@ -432,6 +499,9 @@ class MeetWatcher:
             return
         if state in _FINISHED_BAD:
             self.log.error("Recording process ended (%s) before the call ended.", state)
+            self._finish_if_recorder_died(self.session.folder, state)
+            if _transcript_ready(self.session.folder):
+                self._deliver(self.session.folder)
             self.delivered = True
             self.activity = "idle"
 
@@ -466,7 +536,60 @@ class MeetWatcher:
         for line in lines:
             self.log.info("recorder: %s", line)
 
+    def _transcript_is_ready(self, folder):
+        return _transcript_ready(folder)
+
+    def _finish_if_recorder_died(self, folder, state):
+        """Transcribe here when the recorder child exited with no transcript.
+
+        The child is supposed to transcribe after the stop file. A reboot,
+        ``taskkill``, or CTRL_BREAK can kill it after the wavs are closed and
+        before transcript.txt is published. Finish that folder in place.
+        """
+        if _transcript_ready(folder) or not _folder_has_audio(folder):
+            return
+        self.log.warning(
+            "Recorder exited (%s) before a transcript was written; finishing %s",
+            state,
+            folder,
+        )
+        self._resume_one(folder)
+
+    def _resume_unfinished(self):
+        """Finish folders left behind when a recorder or this watcher died."""
+        from meeting_notes.session_finish import unfinished_folders
+
+        skip = None
+        try:
+            active = self.lock_store.current()
+        except Exception:
+            active = None
+        if active:
+            skip = active.get("folder")
+        for folder in unfinished_folders(self.output_dir, skip_folder=skip):
+            self.log.info("Resuming unfinished session %s", folder)
+            self._resume_one(folder)
+
+    def _resume_one(self, folder):
+        from meeting_notes.session_finish import finish_folder
+
+        try:
+            finish_folder(
+                folder,
+                self.config,
+                log=self.log,
+                deliver_fn=self._deliver,
+            )
+        except Exception as exc:
+            self.log.error("Could not finish %s: %s", folder, exc)
+
     def _deliver(self, folder):
+        from meeting_notes.session import read_status
+
+        status = read_status(folder) or {}
+        if status.get("delivered"):
+            self.log.info("Session %s was already delivered.", folder)
+            return True
         try:
             ok = self.deliver_fn(folder)
         except Exception as exc:
@@ -478,11 +601,12 @@ class MeetWatcher:
                 folder,
                 redact_secret(str(exc), secret),
             )
-            return
+            return False
         if ok:
             self.log.info("Delivered %s", folder)
-        else:
-            self.log.error("Delivery did not succeed for %s.", folder)
+            return True
+        self.log.error("Delivery did not succeed for %s.", folder)
+        return False
 
     def _retry_outbox(self):
         try:
@@ -492,6 +616,28 @@ class MeetWatcher:
             return
         if count:
             self.log.info("Retried outbox; delivered %s session(s).", count)
+
+
+class _DuplicateLogFilter(logging.Filter):
+    """Drop the same message twice in one poll.
+
+    Meet detection was logging ``Meet window detected`` once per detector.
+    A real change of window title is a different message and is kept.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._last = None
+        self._at = 0.0
+
+    def filter(self, record):
+        message = record.getMessage()
+        now = time.monotonic()
+        if message == self._last and now - self._at < 2.0:
+            return False
+        self._last = message
+        self._at = now
+        return True
 
 
 def configure_watch_logging(control_dir, max_bytes=1_000_000, backup_count=3):
@@ -507,6 +653,9 @@ def configure_watch_logging(control_dir, max_bytes=1_000_000, backup_count=3):
         except Exception:
             pass
     logger.propagate = False
+    # Two detectors in one process were writing the same Meet line twice.
+    logger.filters.clear()
+    logger.addFilter(_DuplicateLogFilter())
     file_handler = logging.handlers.RotatingFileHandler(
         path,
         maxBytes=max_bytes,
@@ -598,7 +747,16 @@ def serve(config, control_dir, output_dir, sleep=None, monotonic=None):
     stop_reason = "stopped before the loop started"
     try:
         try:
-            heartbeat.beat(force=True, state="idle")
+            active = read_watcher_recording(control_dir)
+            if active:
+                heartbeat.beat(
+                    force=True,
+                    state="recording",
+                    session_folder=active.get("folder") or active.get("folder_name"),
+                    session_pid=active.get("pid"),
+                )
+            else:
+                heartbeat.beat(force=True, state="idle")
         except Exception:
             logger.exception("Could not write the heartbeat")
         logger.info(
