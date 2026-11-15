@@ -1,6 +1,15 @@
+import os
 import shutil
 import subprocess
 import sys
+import threading
+
+from meeting_notes.macos_capture import (
+    avfoundation_device,
+    capture_backend_for,
+    find_capture_helper,
+    helper_record_argv,
+)
 
 
 def check_ffmpeg():
@@ -23,39 +32,109 @@ def list_audio_devices():
     return result.stderr
 
 
-def record_audio(output_path, device_index="1", separate_tracks=False):
-    """Start recording audio via ffmpeg AVFoundation.
+def _relay_stderr(stream):
+    try:
+        for raw in iter(stream.readline, b""):
+            print(raw.decode("utf-8", "replace"), end="", file=sys.stderr)
+    except Exception:
+        pass
 
-    Returns the running ffmpeg subprocess.Popen, which is treated as an
-    opaque "handle" by the CLI. `separate_tracks` matches the Windows recorder
-    signature. This backend captures one device, so the flag is ignored.
-    """
-    del separate_tracks
+
+def _start_ffmpeg(output_path, device_index):
     check_ffmpeg()
-
     cmd = [
         "ffmpeg",
         "-f", "avfoundation",
-        "-i", f":{device_index}",
+        "-i", ":%s" % device_index,
         "-ar", "16000",
         "-ac", "1",
         "-y",
         output_path,
     ]
-
-    process = subprocess.Popen(
+    return subprocess.Popen(
         cmd,
         stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
 
-    return process
+
+def _start_helper(helper, output_path, device_index):
+    """Record with the Swift helper. If it exits immediately, use ffmpeg.
+
+    The helper mixes system audio and the microphone. ffmpeg records one
+    AVFoundation input and cannot hear other applications, so it is only the
+    fallback when the helper is missing or refuses to start.
+    """
+    process = subprocess.Popen(
+        helper_record_argv(helper, output_path),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        process.wait(timeout=0.6)
+    except subprocess.TimeoutExpired:
+        if process.stderr is not None:
+            threading.Thread(
+                target=_relay_stderr, args=(process.stderr,), daemon=True
+            ).start()
+        return process
+    if process.stderr is not None:
+        try:
+            error = process.stderr.read()
+        except Exception:
+            error = b""
+        if error:
+            print(error.decode("utf-8", "replace"), end="", file=sys.stderr)
+    print(
+        "System-audio helper exited. Recording the AVFoundation input device "
+        "instead (other participants are on that device only if it already "
+        "carries their audio).",
+        file=sys.stderr,
+    )
+    return _start_ffmpeg(output_path, device_index)
+
+
+def record_audio(output_path, device_index="1", separate_tracks=False):
+    """Start a macOS recording and return the subprocess handle.
+
+    `separate_tracks` matches the Windows recorder signature. This backend
+    writes one mixed WAV. Speaker names still come from speakers.jsonl when
+    the Chrome extension is loaded.
+
+    When ``scripts/setup_macos.sh`` has built the helper, that program
+    captures system audio (Core Audio process tap, then ScreenCaptureKit)
+    plus the microphone. Otherwise this is the original ffmpeg AVFoundation
+    recording of one input device.
+    """
+    del separate_tracks
+    device = avfoundation_device(os.environ, device_index)
+    helper = find_capture_helper()
+    backend = capture_backend_for(os.environ, helper is not None)
+    if backend == "helper":
+        if not helper:
+            print(
+                "Error: MEETING_NOTES_CAPTURE=helper but the audio helper is not installed.",
+                file=sys.stderr,
+            )
+            print("Run scripts/setup_macos.sh, or unset MEETING_NOTES_CAPTURE.", file=sys.stderr)
+            sys.exit(1)
+        return _start_helper(helper, output_path, device)
+    return _start_ffmpeg(output_path, device)
 
 
 def stop_recording(process):
-    """Gracefully stop ffmpeg recording by sending 'q' to its stdin."""
-    if process.poll() is None:
-        process.stdin.write(b"q")
-        process.stdin.flush()
+    """Stop ffmpeg or the audio helper by sending ``q`` and closing stdin.
+
+    ffmpeg quits on the ``q`` byte. The helper reads a line, and also stops
+    when stdin hits EOF, which is what closing the pipe does.
+    """
+    if process.poll() is None and process.stdin:
+        try:
+            process.stdin.write(b"q\n")
+            process.stdin.flush()
+            process.stdin.close()
+        except Exception:
+            pass
         process.wait(timeout=10)

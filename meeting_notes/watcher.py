@@ -1,11 +1,12 @@
 """Long-running call watcher (Google Meet and Slack Huddle).
 
 The loop is platform-neutral: detectors, the session launcher, and delivery
-are injected. On Windows, `serve` wires the real window and mic probes and a
+are injected. On Windows, `serve` wires the window and mic probes and a
 hidden recorder subprocess. The mic probe ORs the consent-store registry with
-WASAPI capture sessions. One session records at a time. A call that is already
-in progress keeps going if the other source appears; a manual session blocks
-a watcher start for the rest of that call.
+WASAPI capture sessions. On macOS the same loop uses the audio helper for
+window titles and for which app is using the microphone. One session records
+at a time. A call that is already in progress keeps going if the other source
+appears; a manual session blocks a watcher start for the rest of that call.
 """
 
 import logging
@@ -683,6 +684,25 @@ def build_windows_detector(config, log=None):
     )
 
 
+def build_macos_detector(config, log=None):
+    """Same call sources as Windows, with the macOS window and mic probes."""
+    from meeting_notes.call_sources import build_call_detector
+    from meeting_notes.meet_detect_macos import list_windows, probe_microphone
+
+    return build_call_detector(
+        config,
+        windows=list_windows,
+        probe_microphone=probe_microphone,
+        log=log,
+    )
+
+
+def build_platform_detector(config, log=None):
+    if sys.platform == "darwin":
+        return build_macos_detector(config, log=log)
+    return build_windows_detector(config, log=log)
+
+
 def _start_health_ping(config, previous, log):
     """Send the optional health ping without delaying call detection."""
     if not getattr(config, "watcher_health_ping", False) or not previous:
@@ -700,16 +720,16 @@ def _start_health_ping(config, previous, log):
 
 
 def serve(config, control_dir, output_dir, sleep=None, monotonic=None):
-    """Run the watcher until Ctrl+C. Windows detection only.
+    """Run the watcher until Ctrl+C. Windows and macOS.
 
     A second process exits immediately when one watcher already holds the lock.
     """
     import time
 
-    if sys.platform != "win32":
+    if sys.platform not in ("win32", "darwin"):
         raise RuntimeError(
-            "meeting-notes watch requires Windows "
-            "(Chrome window enumeration and the microphone probes)."
+            "meeting-notes watch requires Windows or macOS "
+            "(call detection is implemented for those systems)."
         )
     logger, _path = configure_watch_logging(control_dir)
     lock = acquire_instance_lock(control_dir)
@@ -805,7 +825,7 @@ def serve(config, control_dir, output_dir, sleep=None, monotonic=None):
 
         watcher = MeetWatcher(
             config=config,
-            detector=build_windows_detector(config, log=logger),
+            detector=build_platform_detector(config, log=logger),
             launcher=SubprocessLauncher(control_dir),
             deliver_fn=_deliver,
             lock_store=FileLockStore(control_dir),

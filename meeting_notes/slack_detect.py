@@ -19,6 +19,7 @@ else. Google Meet keeps priority for ``chrome.exe``.
 import re
 
 from meeting_notes.meet_detect import MicStatus, Sighting
+from meeting_notes.platform_match import process_matches
 
 
 SOURCE_SLACK_HUDDLE = "slack-huddle"
@@ -152,8 +153,8 @@ def _best_name(windows):
     """Best (display name, window title) from slack.exe windows, or (None, "")."""
     ranked = []
     for index, window in enumerate(windows or []):
-        process_name = (getattr(window, "process_name", "") or "").lower()
-        if DESKTOP_MARKER not in process_name:
+        process_name = getattr(window, "process_name", "") or ""
+        if not process_matches(process_name, DESKTOP_MARKER):
             continue
         title = getattr(window, "title", "") or ""
         name = conversation_from_slack_title(title)

@@ -514,6 +514,16 @@ def autostart_status(control_dir, query_task=None, task_name=TASK_NAME):
             path = meta.get("path") or ""
             installed = bool(path) and os.path.isfile(path)
             detail = path if installed else "startup script missing"
+        elif method == "launchd":
+            label = meta.get("label") or "com.meeting-notes.watch"
+            plist = meta.get("plist") or ""
+            installed = bool(plist) and os.path.isfile(plist)
+            triggers = meta.get("triggers") or []
+            trigger_text = ", ".join(triggers) if triggers else "login"
+            if installed:
+                detail = "LaunchAgent (%s): %s" % (label, trigger_text)
+            else:
+                detail = "LaunchAgent plist missing (%s)" % label
         else:
             detail = "unknown autostart method"
     return {

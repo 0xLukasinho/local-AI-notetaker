@@ -16,6 +16,7 @@ times so a reload or a brief blip does not split one call into two sessions.
 import re
 from dataclasses import dataclass
 
+from meeting_notes.platform_match import process_matches
 from meeting_notes.session import slugify
 
 
@@ -121,11 +122,10 @@ def mic_in_use_from_entries(entries, marker="chrome.exe"):
     `entries` is a sequence of ``(subkey_name, last_used_time_stop)``. Windows
     writes 0 in LastUsedTimeStop while the app is using the microphone.
     """
-    needle = (marker or "").lower()
-    if not needle:
+    if not marker:
         return False
     for name, stop in entries:
-        if needle not in str(name).lower():
+        if not process_matches(str(name), marker):
             continue
         try:
             if int(stop) == 0:
@@ -183,12 +183,11 @@ def mic_in_use_from_capture_sessions(sessions, marker="chrome.exe"):
     `sessions` is a sequence of ``(process_name, state)``. State ``1`` is
     ``AudioSessionStateActive``.
     """
-    needle = (marker or "").lower()
-    if not needle:
+    if not marker:
         return False
     for item in sessions or []:
         name, state = item[0], item[1]
-        if needle not in str(name).lower():
+        if not process_matches(str(name), marker):
             continue
         try:
             if int(state) == AUDIO_SESSION_STATE_ACTIVE:
@@ -309,10 +308,9 @@ class ChromeMeetDetector:
             windows = self.windows() or []
         except Exception as exc:
             return None, exc
-        marker = self.process_marker.lower()
         for window in windows:
-            process_name = (getattr(window, "process_name", "") or "").lower()
-            if marker not in process_name:
+            process_name = getattr(window, "process_name", "") or ""
+            if not process_matches(process_name, self.process_marker):
                 continue
             parsed = parse_meet_window_title(
                 getattr(window, "title", ""),
