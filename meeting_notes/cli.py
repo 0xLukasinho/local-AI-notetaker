@@ -958,6 +958,29 @@ def cmd_autostart(args):
     sys.exit(2)
 
 
+def cmd_permissions(args):
+    """Report or request Screen & System Audio Recording for the audio helper."""
+    from meeting_notes.permissions_report import (
+        permission_warning,
+        read_screen_permission,
+        request_screen_permission,
+    )
+
+    action = args.permissions_command
+    if action == "request":
+        status = request_screen_permission()
+    else:
+        status = read_screen_permission()
+    print("Meeting Audio Capture screen recording: %s" % status)
+    warning = permission_warning(status)
+    if warning:
+        print(warning)
+        sys.exit(1)
+    if status == "unknown":
+        print("The helper did not report a permission state. Rebuild it with scripts/setup_macos.sh.")
+        sys.exit(1)
+
+
 def cmd_speakers(args):
     """Copy the unpacked Meet extension and print the one-time Chrome steps."""
     from meeting_notes.extension_install import install_extension
@@ -1236,6 +1259,23 @@ def build_parser():
         help="LaunchAgent entry point: ensure the watcher, then again on wake and unlock",
     )
     autostart_parser.set_defaults(func=cmd_autostart)
+
+    permissions_parser = subparsers.add_parser(
+        "permissions",
+        help="Check or request Screen & System Audio Recording for Meeting Audio Capture",
+    )
+    permissions_subs = permissions_parser.add_subparsers(
+        dest="permissions_command", required=True
+    )
+    permissions_subs.add_parser(
+        "check",
+        help="Print whether Meeting Audio Capture is allowed to record system audio",
+    )
+    permissions_subs.add_parser(
+        "request",
+        help="Show the macOS prompt for Meeting Audio Capture",
+    )
+    permissions_parser.set_defaults(func=cmd_permissions)
 
     speakers_parser = subparsers.add_parser(
         "speakers",

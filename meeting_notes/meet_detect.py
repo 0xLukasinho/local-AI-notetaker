@@ -285,7 +285,9 @@ class ChromeMeetDetector:
         # that says the mic is idle still requires both signals. Windows
         # leaves this false.
         self.mic_optional = bool(mic_optional)
+        self.extension_sighting = None
         self.source = "google-meet"
+        self._last_extension = _UNSEEN
         self._latched = None
         self._last_mic = _UNSEEN
         self._last_window = _UNSEEN
@@ -294,13 +296,26 @@ class ChromeMeetDetector:
         self._hold_reason = None
 
     def poll(self, in_call=False):
+        extension = self._read_extension()
         mic = self._read_mic()
         window, window_error = self._read_window()
+        self._log_extension(extension)
         self._log_mic(mic)
-        self._log_window(window, window_error)
-        sighting = self._decide(mic, window, bool(in_call))
-        self._log_hold(mic, window, sighting)
+        if extension is None:
+            self._log_window(window, window_error)
+        sighting = self._decide(mic, window, bool(in_call), extension)
+        self._log_hold(mic, window, sighting, extension)
         return sighting
+
+    def _read_extension(self):
+        fn = self.extension_sighting
+        if fn is None:
+            return None
+        try:
+            return fn()
+        except Exception as exc:
+            self._warn("Meet extension presence failed (%s)" % exc)
+            return None
 
     def _read_mic(self):
         try:
@@ -339,7 +354,14 @@ class ChromeMeetDetector:
             return True
         return self.mic_optional and not self._probe_can_name_the_app(mic)
 
-    def _decide(self, mic, window, in_call):
+    def _decide(self, mic, window, in_call, extension=None):
+        # The extension heartbeat is the primary Meet signal. It does not
+        # need a window title, so a LaunchAgent without Screen Recording
+        # still records. The window and microphone path below stays for
+        # when the extension is not loaded.
+        if extension is not None:
+            self._latched = extension
+            return extension
         if self._join_ok(mic, window):
             self._latched = window
             return window
@@ -377,9 +399,23 @@ class ChromeMeetDetector:
         else:
             self._info("Meet window detected: %s", window.window_title)
 
-    def _log_hold(self, mic, window, sighting):
+    def _log_extension(self, extension):
+        current = None if extension is None else (extension.key, extension.window_title)
+        if current == self._last_extension:
+            return
+        self._last_extension = current
+        if extension is None:
+            return
+        self._info(
+            "Meet extension: in call %s",
+            extension.meet_code or extension.display_name,
+        )
+
+    def _log_hold(self, mic, window, sighting, extension=None):
         reason = None
-        if sighting is not None and not (window is not None and mic.in_use):
+        if extension is not None:
+            reason = None
+        elif sighting is not None and not (window is not None and mic.in_use):
             if window is not None and not mic.in_use:
                 reason = "window"
             elif mic.in_use and window is None:

@@ -823,6 +823,23 @@ private func audioInputs() -> (items: [[String: Any]], available: Bool) {
     return (items, true)
 }
 
+private func reportPermissions(request: Bool) {
+    // Called in this process, after responsibility was disclaimed, so the
+    // prompt and the Privacy list name Meeting Audio Capture.
+    var granted = CGPreflightScreenCaptureAccess()
+    if request && !granted {
+        granted = CGRequestScreenCaptureAccess()
+    }
+    let payload: [String: Any] = ["screen_recording": granted, "app": "Meeting Audio Capture"]
+    if let data = try? JSONSerialization.data(withJSONObject: payload) {
+        FileHandle.standardOutput.write(data)
+    } else {
+        fputs("{\"screen_recording\":false}\n", stdout)
+        return
+    }
+    fputs("\n", stdout)
+}
+
 private func probe() {
     let options = CGWindowListOption(arrayLiteral: .optionOnScreenOnly, .excludeDesktopElements)
     let raw = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] ?? []
@@ -897,6 +914,8 @@ let command = arguments.first ?? ""
 switch command {
 case "probe":
     probe()
+case "permissions":
+    reportPermissions(request: arguments.contains("--request"))
 case "wait-session":
     waitSession()
 case "record":

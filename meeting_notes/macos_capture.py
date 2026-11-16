@@ -99,23 +99,29 @@ def parse_probe_json(text):
     return payload
 
 
-def run_probe(helper, runner):
-    """Run `helper probe` and return the JSON object. `runner` is subprocess.run."""
+def run_probe(helper, runner=None):
+    """Run `helper probe` and return the JSON object.
+
+    The default runner launches the helper as its own responsible process so
+    Screen Recording is attributed to Meeting Audio Capture, not to Python.
+    Tests pass `runner(argv) -> (returncode, stdout)`.
+    """
     if not helper:
         return {"windows": [], "inputs": [], "error": "helper-missing"}
     try:
-        completed = runner(
-            helper_probe_argv(helper),
-            capture_output=True,
-            text=True,
-            timeout=8,
-            check=False,
-        )
+        if runner is None:
+            from meeting_notes.responsible_spawn import run_responsible
+
+            code, text = run_responsible(helper_probe_argv(helper), timeout=8)
+        else:
+            code, text = runner(helper_probe_argv(helper))
     except subprocess.TimeoutExpired:
         return {"windows": [], "inputs": [], "error": "probe timed out"}
     except OSError as exc:
         return {"windows": [], "inputs": [], "error": str(exc)}
-    return parse_probe_json(getattr(completed, "stdout", "") or "")
+    if code not in (0, None) and not str(text).strip():
+        return {"windows": [], "inputs": [], "error": "probe exited %s" % code}
+    return parse_probe_json(text or "")
 
 
 def windows_from_probe(payload):

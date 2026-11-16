@@ -44,6 +44,15 @@ def test_a_meet_toast_is_not_a_participant_and_captions_can_be_on_with_no_lines(
     assert event["named_ids"] == {}
     assert event["captions_enabled"] is True
     assert caption_status([event]) == "on"
+    for leaked in ("Reframe", "Font size", "Others might still see your full video."):
+        leaked_event = coerce_event(
+            {
+                "t": 2.0,
+                "participants": [{"id": "tile", "name": leaked, "self": False}],
+            }
+        )
+        assert leaked_event["participants"] == []
+        assert leaked_event["named_ids"] == {}
 
 
 def _wav(path, amplitude, n=1600):

@@ -173,6 +173,8 @@ def test_extension_install_copies_files_and_writes_the_port(tmp_path):
     with open(os.path.join(source, "background.js"), encoding="utf-8") as handle:
         background = handle.read()
     assert "const BRIDGE_PORT = 8765;" in background
+    assert "BRIDGE_PORT + 1" in background
+    assert "/presence" in background
     with open(os.path.join(source, "content.js"), encoding="utf-8") as handle:
         content = handle.read()
     assert "data-participant-id" in content

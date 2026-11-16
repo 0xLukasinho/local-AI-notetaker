@@ -73,6 +73,16 @@ _TOAST_PHRASES = (
     "turned off",
 )
 
+# Meet chrome that has been scraped out of a tile. Exact, case-insensitive.
+_DENIED_NAMES = frozenset(
+    (
+        "reframe",
+        "font size",
+        "others might still see your full video.",
+        "others might still see your full video",
+    )
+)
+
 
 def plausible_display_name(value):
     """A Meet display name. A toast or a sentence is not one."""
@@ -84,6 +94,8 @@ def plausible_display_name(value):
     if len(name.split()) > 5:
         return ""
     lower = name.lower()
+    if lower in _DENIED_NAMES:
+        return ""
     for phrase in _TOAST_PHRASES:
         if phrase in lower:
             return ""

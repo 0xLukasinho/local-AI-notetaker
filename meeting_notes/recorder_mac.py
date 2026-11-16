@@ -10,6 +10,7 @@ from meeting_notes.macos_capture import (
     find_capture_helper,
     helper_record_argv,
 )
+from meeting_notes.responsible_spawn import popen_responsible
 
 
 def check_ffmpeg():
@@ -74,7 +75,7 @@ def _start_helper(helper, output_path, device_index, separate_tracks=False):
     AVFoundation input and cannot hear other applications, so it is only the
     fallback when the helper is missing or refuses to start.
     """
-    process = subprocess.Popen(
+    process = popen_responsible(
         helper_record_argv(
             helper,
             output_path,

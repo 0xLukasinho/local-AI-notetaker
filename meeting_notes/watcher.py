@@ -672,7 +672,7 @@ def configure_watch_logging(control_dir, max_bytes=1_000_000, backup_count=3):
     return logger, path
 
 
-def build_windows_detector(config, log=None):
+def build_windows_detector(config, log=None, presence=None):
     from meeting_notes.call_sources import build_call_detector
     from meeting_notes.meet_detect_windows import list_top_level_windows, probe_microphone
 
@@ -681,10 +681,11 @@ def build_windows_detector(config, log=None):
         windows=list_top_level_windows,
         probe_microphone=probe_microphone,
         log=log,
+        presence=presence,
     )
 
 
-def build_macos_detector(config, log=None):
+def build_macos_detector(config, log=None, presence=None):
     """Same call sources as Windows, with the macOS window and mic probes."""
     from meeting_notes.call_sources import build_call_detector
     from meeting_notes.meet_detect_macos import list_windows, probe_microphone
@@ -694,13 +695,14 @@ def build_macos_detector(config, log=None):
         windows=list_windows,
         probe_microphone=probe_microphone,
         log=log,
+        presence=presence,
     )
 
 
-def build_platform_detector(config, log=None):
+def build_platform_detector(config, log=None, presence=None):
     if sys.platform == "darwin":
-        return build_macos_detector(config, log=log)
-    return build_windows_detector(config, log=log)
+        return build_macos_detector(config, log=log, presence=presence)
+    return build_windows_detector(config, log=log, presence=presence)
 
 
 def _start_health_ping(config, previous, log):
@@ -765,6 +767,7 @@ def serve(config, control_dir, output_dir, sleep=None, monotonic=None):
         version=version,
     )
     stop_reason = "stopped before the loop started"
+    presence_listener = None
     try:
         try:
             active = read_watcher_recording(control_dir)
@@ -785,6 +788,37 @@ def serve(config, control_dir, output_dir, sleep=None, monotonic=None):
             version,
             reason,
         )
+        from meeting_notes.meet_presence import PresenceBook, PresenceServer, presence_port
+        from meeting_notes.permissions_report import (
+            permission_warning,
+            read_screen_permission,
+        )
+
+        presence = PresenceBook()
+        presence_listener = PresenceServer(
+            presence, presence_port(getattr(config, "speaker_bridge_port", 8765))
+        )
+        try:
+            presence_listener.start()
+            logger.info(
+                "Meet extension presence: 127.0.0.1:%s/presence",
+                presence_listener.port,
+            )
+        except OSError as exc:
+            logger.warning("Meet extension presence listener did not start (%s)", exc)
+            presence_listener = None
+        screen_permission = read_screen_permission()
+        warning = permission_warning(screen_permission)
+        if warning:
+            logger.warning("%s", warning)
+
+        def _health_extra():
+            return {
+                "screen_permission": screen_permission,
+                "extension_presence": _format_seen(presence.last_seen_unix()),
+            }
+
+        heartbeat.extra = _health_extra
         _start_health_ping(config, previous_heartbeat, logger)
         stop_event = threading.Event()
 
@@ -825,7 +859,7 @@ def serve(config, control_dir, output_dir, sleep=None, monotonic=None):
 
         watcher = MeetWatcher(
             config=config,
-            detector=build_platform_detector(config, log=logger),
+            detector=build_platform_detector(config, log=logger, presence=presence),
             launcher=SubprocessLauncher(control_dir),
             deliver_fn=_deliver,
             lock_store=FileLockStore(control_dir),
@@ -861,6 +895,11 @@ def serve(config, control_dir, output_dir, sleep=None, monotonic=None):
                 pass
     finally:
         try:
+            if presence_listener is not None:
+                presence_listener.stop()
+        except Exception:
+            logger.exception("Could not stop the Meet presence listener")
+        try:
             heartbeat.beat(force=True, state="idle")
         except Exception:
             logger.exception("Could not write the final heartbeat")
@@ -868,6 +907,14 @@ def serve(config, control_dir, output_dir, sleep=None, monotonic=None):
         clear_instance(control_dir, pid=os.getpid())
         logger.info("Watcher stopped: pid=%s reason=%s", os.getpid(), stop_reason)
         lock.release()
+
+
+def _format_seen(unix):
+    if not unix:
+        return "never"
+    from datetime import datetime
+
+    return datetime.fromtimestamp(float(unix)).astimezone().isoformat(timespec="seconds")
 
 
 def _watched_sources(config):
