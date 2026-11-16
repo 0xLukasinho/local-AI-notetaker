@@ -192,13 +192,18 @@ def _load_config_lenient():
 
 
 def _begin_recording(audio_path, separate_tracks):
-    """Windows can write microphone and loopback as their own files.
+    """Write the microphone and everyone else as their own files when we can.
 
-    Other platforms, and test doubles that only accept a path, keep the
-    single mixed recording.
+    Windows does this with WASAPI. macOS does it with the audio helper, which
+    is what lets a two-person call be named from the participant tile without
+    captions, the same way Windows does. A test double that only accepts a
+    path keeps the single mixed recording.
     """
-    if separate_tracks and sys.platform == "win32":
-        return record_audio(audio_path, separate_tracks=True)
+    if separate_tracks and sys.platform in ("win32", "darwin"):
+        try:
+            return record_audio(audio_path, separate_tracks=True)
+        except TypeError:
+            return record_audio(audio_path)
     return record_audio(audio_path)
 
 
@@ -286,7 +291,12 @@ def _write_transcript(meeting_dir, config, whisper_model, language):
             print(f"Remote voices: {info['clusters']} via {info['backend']}.")
         elif info.get("reason"):
             print(f"Remote diarization skipped ({info['reason']}).")
-        if document.get("captions") == "off":
+        others = [
+            name
+            for name in (document.get("participants") or [])
+            if name and name != document.get("self_name")
+        ]
+        if document.get("captions") == "off" and others:
             print(
                 "Meet captions were off, so remote speakers could not be named "
                 "from captions. Press CC in the Meet window next time. "

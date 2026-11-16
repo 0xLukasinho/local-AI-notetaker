@@ -13,6 +13,7 @@ from meeting_notes.speakers import (
     align_mixed,
     align_tracks,
     choose_self_label,
+    caption_status,
     coerce_event,
     load_speaker_events,
     produce_transcript,
@@ -20,6 +21,29 @@ from meeting_notes.speakers import (
     speaker_for_interval,
     track_has_speech,
 )
+
+
+def test_a_meet_toast_is_not_a_participant_and_captions_can_be_on_with_no_lines():
+    event = coerce_event(
+        {
+            "t": 1.0,
+            "self": "",
+            "participants": [
+                {
+                    "id": "spaces/x/devices/537",
+                    "name": "Others might still see your full video.",
+                    "self": False,
+                },
+                {"id": "self", "name": "Alex Chen", "self": True},
+            ],
+            "captions_enabled": True,
+        }
+    )
+    assert event["self"] == "Alex Chen"
+    assert event["participants"] == ["Alex Chen"]
+    assert event["named_ids"] == {}
+    assert event["captions_enabled"] is True
+    assert caption_status([event]) == "on"
 
 
 def _wav(path, amplitude, n=1600):

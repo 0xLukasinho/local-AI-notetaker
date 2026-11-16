@@ -12,12 +12,36 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from meeting_notes.speakers import clean_name, coerce_event
+from meeting_notes.speakers import clean_name, coerce_event, plausible_display_name
+
+
+def _remote_names(body):
+    """Display names of other people. A toast is not a person."""
+    if not isinstance(body, dict):
+        return []
+    self_name = plausible_display_name(body.get("self") or "")
+    names = []
+    for entry in list(body.get("participants") or []) + list(body.get("active") or []):
+        if isinstance(entry, str):
+            name = plausible_display_name(entry)
+            is_self = False
+        elif isinstance(entry, dict):
+            name = plausible_display_name(entry.get("name") or "")
+            is_self = bool(entry.get("self"))
+        else:
+            continue
+        if not name or is_self or name == self_name:
+            continue
+        if name not in names:
+            names.append(name)
+    return names
 
 
 def _body_has_caption(body):
     if not isinstance(body, dict):
         return False
+    if body.get("captions_enabled") is True:
+        return True
     if clean_name(body.get("caption_speaker") or ""):
         return True
     captions = body.get("captions")
@@ -151,6 +175,13 @@ class SpeakerBridge:
         if _body_has_caption(body):
             self._samples_with_captions += 1
         if self._caption_notice or self._samples < 8 or self._samples_with_captions:
+            return
+        # Nobody else is on the call, so there is no remote line to name.
+        # Captions that are on with no speech also have no lines. Only warn
+        # when another person is present and the CC control is not on.
+        if not _remote_names(body):
+            return
+        if body.get("captions_enabled") is True:
             return
         self._caption_notice = True
         print(

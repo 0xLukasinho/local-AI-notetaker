@@ -59,6 +59,37 @@ def clean_name(value):
     return " ".join(str(value).split())
 
 
+# Meet toasts are full sentences that share a tile with the real name.
+_TOAST_PHRASES = (
+    "might still",
+    "your video",
+    "your full video",
+    "see your",
+    "joined",
+    "left the",
+    "is presenting",
+    "raised a hand",
+    "turned on",
+    "turned off",
+)
+
+
+def plausible_display_name(value):
+    """A Meet display name. A toast or a sentence is not one."""
+    name = clean_name(value)
+    if not name or len(name) > 80:
+        return ""
+    if any(mark in name for mark in ".!?"):
+        return ""
+    if len(name.split()) > 5:
+        return ""
+    lower = name.lower()
+    for phrase in _TOAST_PHRASES:
+        if phrase in lower:
+            return ""
+    return name
+
+
 def clean_text(value):
     if value is None:
         return ""
@@ -127,7 +158,7 @@ def coerce_event(item):
     except (TypeError, ValueError):
         return None
 
-    self_name = clean_name(item.get("self") or "")
+    self_name = plausible_display_name(item.get("self") or "")
     self_active = bool(item.get("self_active"))
     active = []
     active_ids = []
@@ -137,7 +168,7 @@ def coerce_event(item):
     def take_person(entry, into_active):
         nonlocal self_name, self_active
         if isinstance(entry, str):
-            name = clean_name(entry)
+            name = plausible_display_name(entry)
             if name:
                 if into_active:
                     active.append(name)
@@ -146,7 +177,7 @@ def coerce_event(item):
             return
         if not isinstance(entry, dict):
             return
-        name = clean_name(entry.get("name") or "")
+        name = plausible_display_name(entry.get("name") or "")
         ident = str(entry.get("id") or "").strip()
         is_self = bool(entry.get("self"))
         if is_self and name and not self_name:
@@ -180,7 +211,7 @@ def coerce_event(item):
     if isinstance(raw_named, dict):
         for ident, name in raw_named.items():
             ident = str(ident).strip()
-            name = clean_name(name)
+            name = plausible_display_name(name)
             if ident and name:
                 named_ids[ident] = name
 
@@ -190,17 +221,20 @@ def coerce_event(item):
         for entry in raw_captions[:8]:
             if not isinstance(entry, dict):
                 continue
-            speaker = clean_name(entry.get("speaker") or entry.get("name"))[:80]
+            speaker = plausible_display_name(entry.get("speaker") or entry.get("name"))[:80]
             text = clean_text(entry.get("text"))[:600]
             if speaker and text:
                 captions.append({"speaker": speaker, "text": text})
     # Debug field written on every sample so a log shows who the caption
     # reader saw, including an empty string when captions are off.
-    caption_speaker = clean_name(item.get("caption_speaker") or "")[:80]
+    caption_speaker = plausible_display_name(item.get("caption_speaker") or "")[:80]
+    captions_enabled = item.get("captions_enabled")
+    if captions_enabled is not None:
+        captions_enabled = bool(captions_enabled)
     if not caption_speaker and len(captions) == 1:
         caption_speaker = captions[0]["speaker"]
 
-    return {
+    event = {
         "t": moment,
         "active": _unique(active),
         "active_ids": _unique(active_ids),
@@ -211,6 +245,9 @@ def coerce_event(item):
         "captions": captions,
         "caption_speaker": caption_speaker,
     }
+    if captions_enabled is not None:
+        event["captions_enabled"] = captions_enabled
+    return event
 
 
 def load_speaker_events(path):
@@ -464,15 +501,37 @@ def live_caption_intervals(events, self_label):
 
 
 def caption_status(events):
-    """`on` when any sample saw a caption, `off` when samples had none, else ""."""
+    """`on` when captions were enabled or a line was seen, else `off` or "".
+
+    No caption text is not enough to say captions were off. A solo call, or
+    captions that are on while nobody else speaks, has no lines. `off` is
+    only when a sample says the CC control was off and no line was seen.
+    Samples that never reported the control stay `off` when they also have
+    no lines, which is what older logs mean.
+    """
     if not events:
         return ""
+    saw_line = False
+    saw_on = False
+    saw_off = False
+    reported = False
     for event in events:
-        if clean_name(event.get("caption_speaker") or ""):
-            return "on"
-        if event.get("captions"):
-            return "on"
-    return "off"
+        if clean_name(event.get("caption_speaker") or "") or event.get("captions"):
+            saw_line = True
+        if "captions_enabled" not in event:
+            continue
+        reported = True
+        if event.get("captions_enabled"):
+            saw_on = True
+        else:
+            saw_off = True
+    if saw_line or saw_on:
+        return "on"
+    if reported and saw_off:
+        return "off"
+    if not reported:
+        return "off"
+    return ""
 
 
 def _has_multiple_remotes(events, self_label):

@@ -103,6 +103,38 @@ def test_samples_queued_before_audio_start_share_that_clock(tmp_path):
     assert events[0]["active"] == ["Ada Lovelace"]
 
 
+def test_bridge_does_not_warn_for_a_solo_call_or_when_captions_are_on(tmp_path, capsys):
+    path = tmp_path / "speakers.jsonl"
+    bridge = SpeakerBridge(str(path), port=0, clock=lambda: 10.0)
+    bridge.mark_audio_start()
+    solo = {
+        "self": "Alex Chen",
+        "participants": [
+            {"id": "spaces/x/devices/537", "name": "Alex Chen", "self": True},
+            {
+                "id": "spaces/x/devices/537",
+                "name": "Others might still see your full video.",
+                "self": False,
+            },
+        ],
+    }
+    for _index in range(8):
+        bridge.record(solo)
+    assert "Press CC" not in capsys.readouterr().out
+
+    remote_with_captions_on = {
+        "self": "Alex Chen",
+        "captions_enabled": True,
+        "participants": [
+            {"id": "self", "name": "Alex Chen", "self": True},
+            {"id": "ada", "name": "Ada Lovelace", "self": False},
+        ],
+    }
+    for _index in range(8):
+        bridge.record(remote_with_captions_on)
+    assert "Press CC" not in capsys.readouterr().out
+
+
 def test_bridge_warns_once_when_captions_stay_off(tmp_path, capsys):
     path = tmp_path / "speakers.jsonl"
     bridge = SpeakerBridge(str(path), port=0, clock=lambda: 10.0)
