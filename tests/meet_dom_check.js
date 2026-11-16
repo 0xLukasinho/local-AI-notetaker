@@ -141,6 +141,7 @@ const context = {
   Array,
   Math,
 };
+context.Map = Map;
 context.globalThis = context;
 vm.createContext(context);
 const source = fs.readFileSync(
@@ -228,5 +229,32 @@ const changed = context.activeCaptionSpeaker([
   { speaker: "Mahmoud Lababidi", text: "earlier" },
 ]);
 assert(changed === "Daniel Bronheim", "the caption row that changed is the speaker");
+
+const toast = el("div", { role: "alert" }, [], "Others might still see your full video.");
+const you = el("span", {}, [], "(You)");
+const nameSpan = el("span", {}, [], "Alex Chen");
+const selfTile = el(
+  "div",
+  { "data-participant-id": "spaces/x/devices/537", "aria-label": "Alex Chen (You)" },
+  [nameSpan, you, toast]
+);
+root.children = [selfTile];
+selfTile.parentElement = root;
+const snapshot = context.collect();
+assert(snapshot.self === "Alex Chen", "self name from the tile, not the toast: " + JSON.stringify(snapshot));
+assert(snapshot.participants.length === 1, "only the real participant");
+assert(snapshot.participants[0].name === "Alex Chen", "toast is not a participant name");
+assert(snapshot.participants[0].self === true, "the local tile is self");
+
+const toastOnly = el(
+  "div",
+  { "data-participant-id": "spaces/x/devices/999" },
+  [el("div", { role: "status" }, [], "Others might still see your full video.")]
+);
+root.children = [toastOnly];
+toastOnly.parentElement = root;
+const empty = context.collect();
+assert(empty.self === "", "a toast alone is not self");
+assert(empty.participants.length === 0, "a toast is not a participant: " + JSON.stringify(empty.participants));
 
 console.log("meet dom checks ok");

@@ -73,8 +73,11 @@ def avfoundation_device(environ, default="1"):
     return value or str(default)
 
 
-def helper_record_argv(helper, output_path):
-    return [helper, "record", "--output", output_path]
+def helper_record_argv(helper, output_path, self_path=None, others_path=None):
+    argv = [helper, "record", "--output", output_path]
+    if self_path and others_path:
+        argv.extend(["--self", self_path, "--others", others_path])
+    return argv
 
 
 def helper_probe_argv(helper):

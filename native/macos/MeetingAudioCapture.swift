@@ -418,13 +418,24 @@ private func startProcessTap(mix: MixBuffer) -> SystemCapture? {
     description.isPrivate = true
     description.isExclusive = false
     description.muteBehavior = CATapMuteBehavior.unmuted
+    if description.uuid.uuidString.isEmpty {
+        description.uuid = UUID()
+    }
     var tapID = AudioObjectID(kAudioObjectUnknown)
     let created = AudioHardwareCreateProcessTap(description, &tapID)
     if created != noErr {
         logLine("capture: process tap was not created (status \(created))")
         return nil
     }
-    guard let uid = readObjectString(tapID, selector: fourCC("uid ")) else {
+    // The property read failed on macOS 26 ("process tap has no uid") even
+    // after the tap was created. The description UUID is the tap UID.
+    var uid = ""
+    if let property = readObjectString(tapID, selector: kAudioTapPropertyUID), !property.isEmpty {
+        uid = property
+    } else {
+        uid = description.uuid.uuidString
+    }
+    if uid.isEmpty {
         AudioHardwareDestroyProcessTap(tapID)
         logLine("capture: process tap has no uid")
         return nil
@@ -620,7 +631,17 @@ private func startMicrophone(mix: MixBuffer) -> AVAudioEngine? {
 
 // MARK: - Record
 
-private func record(outputPath: String) {
+private func pcm(_ samples: [Float], gain: Float = 1) -> [Int16] {
+    var mixed = [Int16]()
+    mixed.reserveCapacity(samples.count)
+    for sample in samples {
+        let clipped = max(-1 as Float, min(1, sample * gain))
+        mixed.append(Int16(clipped * 32767))
+    }
+    return mixed
+}
+
+private func record(outputPath: String, selfPath: String?, othersPath: String?) {
     let flag = StopFlag()
     signal(SIGINT, SIG_IGN)
     signal(SIGTERM, SIG_IGN)
@@ -668,27 +689,38 @@ private func record(outputPath: String) {
     }
 
     let writer: WavWriter
+    var selfWriter: WavWriter?
+    var othersWriter: WavWriter?
     do {
         writer = try WavWriter(path: outputPath)
+        if let selfPath = selfPath, let othersPath = othersPath {
+            selfWriter = try WavWriter(path: selfPath)
+            othersWriter = try WavWriter(path: othersPath)
+        }
     } catch {
         logLine("capture-error: could not open \(outputPath) (\(error))")
         exit(1)
     }
     logLine("capture: writing \(outputPath)")
+    if selfWriter != nil {
+        logLine("capture: writing separate tracks audio-self.wav and audio-others.wav")
+    }
     let frameCount = 1600
     while !flag.isSet() {
         Thread.sleep(forTimeInterval: 0.1)
         let taken = mix.take(frames: frameCount)
-        var mixed = [Int16]()
-        mixed.reserveCapacity(frameCount)
+        var mixedSamples = [Float]()
+        mixedSamples.reserveCapacity(frameCount)
         for index in 0..<frameCount {
-            let sample = taken.mic[index] * 0.7 + taken.system[index]
-            let clipped = max(-1 as Float, min(1, sample))
-            mixed.append(Int16(clipped * 32767))
+            mixedSamples.append(taken.mic[index] * 0.7 + taken.system[index])
         }
-        writer.append(mixed)
+        writer.append(pcm(mixedSamples))
+        selfWriter?.append(pcm(taken.mic))
+        othersWriter?.append(pcm(taken.system))
     }
     writer.close()
+    selfWriter?.close()
+    othersWriter?.close()
     engine?.stop()
     stopSystem(system)
     logLine("capture: stopped")
@@ -869,10 +901,14 @@ case "wait-session":
     waitSession()
 case "record":
     guard let output = argumentValue("--output", in: arguments), !output.isEmpty else {
-        logLine("usage: meeting-audio-capture record --output PATH")
+        logLine("usage: meeting-audio-capture record --output PATH [--self PATH --others PATH]")
         exit(2)
     }
-    record(outputPath: output)
+    record(
+        outputPath: output,
+        selfPath: argumentValue("--self", in: arguments),
+        othersPath: argumentValue("--others", in: arguments)
+    )
 default:
     logLine("usage: meeting-audio-capture probe | wait-session | record --output PATH")
     exit(2)

@@ -31,16 +31,43 @@ const BLOCKED_NAMES = [
   "raise hand",
 ];
 
+// Meet toasts sit inside the same tile as the name. They are sentences, not
+// people. "Others might still see your full video." was stored as a participant.
+const TOAST_PHRASES = [
+  "might still",
+  "your video",
+  "your full video",
+  "see your",
+  "joined",
+  "left the",
+  "is presenting",
+  "raised a hand",
+  "turned on",
+  "turned off",
+];
+
 function plausibleName(text) {
   if (!text || text.length < 2 || text.length > 80) {
+    return false;
+  }
+  if (/[.!?]/.test(text)) {
     return false;
   }
   if (!/\p{L}/u.test(text)) {
     return false;
   }
+  const words = text.split(" ");
+  if (words.length > 5) {
+    return false;
+  }
   const lower = text.toLowerCase();
   for (const word of BLOCKED_NAMES) {
     if (lower === word || lower.startsWith(word + " ")) {
+      return false;
+    }
+  }
+  for (const phrase of TOAST_PHRASES) {
+    if (lower.indexOf(phrase) !== -1) {
       return false;
     }
   }
@@ -377,9 +404,31 @@ function activeCaptionSpeaker(captions) {
   return (last && last.speaker) || "";
 }
 
+function markedSelf(tile) {
+  if (!tile) {
+    return false;
+  }
+  if (tile.getAttribute && tile.getAttribute("data-self-name") != null) {
+    return true;
+  }
+  try {
+    if (tile.querySelector && tile.querySelector("[data-self-name]")) {
+      return true;
+    }
+  } catch (err) {
+    // A tile we cannot search is not the self marker.
+  }
+  const label = String((tile.getAttribute && tile.getAttribute("aria-label")) || "");
+  if (/\(\s*you\s*\)/i.test(label)) {
+    return true;
+  }
+  const text = String(tile.textContent || "");
+  return /\(\s*you\s*\)/i.test(text);
+}
+
 function selfIdentity() {
   const el = document.querySelector("[data-self-name]");
-  const name = el ? (el.getAttribute("data-self-name") || "").trim() : "";
+  let name = el ? cleanLabel(el.getAttribute("data-self-name") || el.textContent || "") : "";
   let id = "";
   let node = el;
   while (node) {
@@ -389,33 +438,114 @@ function selfIdentity() {
     }
     node = node.parentElement;
   }
+  if (!id) {
+    let tiles = [];
+    try {
+      tiles = document.querySelectorAll("[data-participant-id]");
+    } catch (err) {
+      tiles = [];
+    }
+    for (const tile of tiles) {
+      if (!markedSelf(tile)) {
+        continue;
+      }
+      id = tile.getAttribute("data-participant-id") || "";
+      if (!name) {
+        name = nameFromTile(tile);
+      }
+      break;
+    }
+  }
   return { name, id };
 }
 
 function nameFromTile(tile) {
-  const aria = cleanLabel(tile.getAttribute && tile.getAttribute("aria-label"));
-  const texts = [];
-  if (aria) {
-    texts.push(aria);
+  // Prefer the short label Meet puts on the tile. The longest text used to
+  // win, and a toast inside the tile is longer than a person's name.
+  const ranked = [];
+  function add(text) {
+    const name = cleanLabel(text);
+    if (name && ranked.indexOf(name) === -1) {
+      ranked.push(name);
+    }
   }
-  const nodes = tile.querySelectorAll("span, div");
+  try {
+    const selfNode = tile.querySelector("[data-self-name]");
+    if (selfNode) {
+      add(selfNode.getAttribute("data-self-name") || selfNode.textContent || "");
+    }
+  } catch (err) {
+    // Fall through to the aria label and the leaves.
+  }
+  add(tile.getAttribute && tile.getAttribute("aria-label"));
+  let nodes = [];
+  try {
+    nodes = tile.querySelectorAll("span, div");
+  } catch (err) {
+    nodes = [];
+  }
   for (const node of nodes) {
-    if (node.closest("button, [role='button']")) {
+    try {
+      if (node.closest && node.closest("button, [role='button'], [role='alert'], [role='status'], [aria-live]")) {
+        continue;
+      }
+    } catch (err) {
       continue;
     }
     if (node.childElementCount > 0) {
       continue;
     }
-    const text = cleanLabel(node.textContent || "");
-    if (text) {
-      texts.push(text);
-    }
+    add(node.textContent || "");
   }
-  if (!texts.length) {
+  const people = ranked.filter((name) => name.toLowerCase() !== "you");
+  const pool = people.length ? people : ranked;
+  if (!pool.length) {
     return "";
   }
-  texts.sort((a, b) => b.length - a.length);
-  return texts[0];
+  pool.sort((a, b) => a.split(" ").length - b.split(" ").length || a.length - b.length);
+  return pool[0];
+}
+
+function captionsEnabled() {
+  // "on" when the CC control says captions are showing, or a captions region
+  // is open. "off" only when that control says they are hidden. "" when Meet
+  // does not expose the control. No caption text is not the same as off:
+  // a call where nobody else speaks has no lines.
+  let buttons = [];
+  try {
+    buttons = document.querySelectorAll("button, [role='button']");
+  } catch (err) {
+    buttons = [];
+  }
+  const limit = Math.min(buttons.length, 80);
+  for (let i = 0; i < limit; i++) {
+    const button = buttons[i];
+    const label = String((button.getAttribute && button.getAttribute("aria-label")) || "").toLowerCase();
+    if (label.indexOf("caption") === -1 && label.indexOf("subtitle") === -1) {
+      continue;
+    }
+    const pressed = String((button.getAttribute && button.getAttribute("aria-pressed")) || "").toLowerCase();
+    if (pressed === "true") {
+      return true;
+    }
+    if (pressed === "false") {
+      return false;
+    }
+    if (label.indexOf("turn off") !== -1 || label.indexOf("hide caption") !== -1) {
+      return true;
+    }
+    if (label.indexOf("turn on") !== -1 || label.indexOf("show caption") !== -1) {
+      return false;
+    }
+  }
+  try {
+    if (captionRoots().length) {
+      return true;
+    }
+  } catch (err) {
+    return null;
+  }
+  return null;
 }
 
 function collect() {
@@ -428,7 +558,10 @@ function collect() {
     }
     const name = nameFromTile(el);
     const speaking = looksSpeaking(el);
-    const isSelf = (self.id && id === self.id) || (self.name && name === self.name);
+    const isSelf =
+      (self.id && id === self.id) ||
+      (self.name && name && name === self.name) ||
+      markedSelf(el);
     const prev = byId.get(id) || { id, name: "", self: isSelf, speaking: false };
     prev.speaking = prev.speaking || speaking;
     prev.self = prev.self || isSelf;
@@ -483,6 +616,7 @@ function collect() {
     self: self.name || "",
     captions,
     captionSpeaker,
+    captionsEnabled: captionsEnabled(),
   };
 }
 
@@ -505,6 +639,9 @@ function sample() {
     self: snapshot.self,
     caption_speaker: snapshot.captionSpeaker || "",
   };
+  if (snapshot.captionsEnabled === true || snapshot.captionsEnabled === false) {
+    payload.captions_enabled = snapshot.captionsEnabled;
+  }
   if (snapshot.captions && snapshot.captions.length) {
     payload.captions = snapshot.captions;
   }

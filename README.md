@@ -456,7 +456,7 @@ The helper's `probe` command reads window titles and which processes have an act
 
 AVFoundation, which `meeting-notes start` has always used on macOS, records one input device (index `1`, or `MEETING_NOTES_AVFOUNDATION_DEVICE`). That device is a microphone. It does not hear other applications, so a Meet recorded that way is only your side unless you point the device index at a virtual device you already installed.
 
-When `scripts/setup_macos.sh` has built the helper, recording uses it instead:
+When `scripts/setup_macos.sh` has built the helper, recording uses it instead. With speaker labels on it also writes `audio-self.wav` (microphone) and `audio-others.wav` (everyone else), the same split Windows uses, so a two-person call is named from the Meet tile without turning captions on:
 
 1. A Core Audio process tap (macOS 14.2 and later; the system-audio permission is the macOS 14.4 one) captures every other app's audio.
 2. If the tap cannot be created, ScreenCaptureKit captures system audio.

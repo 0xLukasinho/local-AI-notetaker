@@ -59,7 +59,15 @@ def _start_ffmpeg(output_path, device_index):
     )
 
 
-def _start_helper(helper, output_path, device_index):
+def _track_paths(output_path):
+    folder = os.path.dirname(os.path.abspath(output_path))
+    return (
+        os.path.join(folder, "audio-self.wav"),
+        os.path.join(folder, "audio-others.wav"),
+    )
+
+
+def _start_helper(helper, output_path, device_index, separate_tracks=False):
     """Record with the Swift helper. If it exits immediately, use ffmpeg.
 
     The helper mixes system audio and the microphone. ffmpeg records one
@@ -67,7 +75,11 @@ def _start_helper(helper, output_path, device_index):
     fallback when the helper is missing or refuses to start.
     """
     process = subprocess.Popen(
-        helper_record_argv(helper, output_path),
+        helper_record_argv(
+            helper,
+            output_path,
+            *(_track_paths(output_path) if separate_tracks else (None, None)),
+        ),
         stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
@@ -99,16 +111,16 @@ def _start_helper(helper, output_path, device_index):
 def record_audio(output_path, device_index="1", separate_tracks=False):
     """Start a macOS recording and return the subprocess handle.
 
-    `separate_tracks` matches the Windows recorder signature. This backend
-    writes one mixed WAV. Speaker names still come from speakers.jsonl when
-    the Chrome extension is loaded.
+    `separate_tracks` matches the Windows recorder. The helper then writes
+    audio-self.wav (microphone) and audio-others.wav (system audio) beside
+    the mix, so speaker names use the same tile and two-person rules as
+    Windows and do not require captions.
 
     When ``scripts/setup_macos.sh`` has built the helper, that program
     captures system audio (Core Audio process tap, then ScreenCaptureKit)
     plus the microphone. Otherwise this is the original ffmpeg AVFoundation
     recording of one input device.
     """
-    del separate_tracks
     device = avfoundation_device(os.environ, device_index)
     helper = find_capture_helper()
     backend = capture_backend_for(os.environ, helper is not None)
@@ -120,7 +132,7 @@ def record_audio(output_path, device_index="1", separate_tracks=False):
             )
             print("Run scripts/setup_macos.sh, or unset MEETING_NOTES_CAPTURE.", file=sys.stderr)
             sys.exit(1)
-        return _start_helper(helper, output_path, device)
+        return _start_helper(helper, output_path, device, separate_tracks=separate_tracks)
     return _start_ffmpeg(output_path, device)
 
 

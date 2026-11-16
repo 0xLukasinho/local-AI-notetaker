@@ -192,6 +192,13 @@ def test_capture_backend_keeps_avfoundation_unless_the_helper_is_used():
     assert capture_backend_for({"MEETING_NOTES_CAPTURE": "helper"}, helper_exists=False) == "helper"
     argv = helper_record_argv("/tmp/meeting-audio-capture", "/tmp/audio.wav")
     assert argv == ["/tmp/meeting-audio-capture", "record", "--output", "/tmp/audio.wav"]
+    tracks = helper_record_argv(
+        "/tmp/meeting-audio-capture",
+        "/tmp/audio.wav",
+        self_path="/tmp/audio-self.wav",
+        others_path="/tmp/audio-others.wav",
+    )
+    assert tracks[-4:] == ["--self", "/tmp/audio-self.wav", "--others", "/tmp/audio-others.wav"]
 
 
 def test_launchd_plist_runs_supervise_and_has_no_windows_paths(tmp_path):
