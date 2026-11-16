@@ -12,6 +12,8 @@ The composite polls them. Only one call is active at a time:
   The other call can start only after this one ends.
 """
 
+import sys
+
 from meeting_notes.meet_detect import ChromeMeetDetector
 from meeting_notes.slack_detect import SOURCE_SLACK_HUDDLE, SlackHuddleDetector
 
@@ -27,6 +29,7 @@ def _meet_detector(config, windows, probe_microphone, log):
         title_regex=config.window_title_regex or None,
         process_marker=marker,
         log=log,
+        mic_optional=(sys.platform == "darwin"),
     )
     detector.source = SOURCE_GOOGLE_MEET
     return detector

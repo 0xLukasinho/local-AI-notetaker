@@ -376,7 +376,7 @@ def test_watch_status_and_linux_guards(tmp_path, monkeypatch, capsys):
     with pytest.raises(SystemExit) as install_exit:
         cli.cmd_watch(cli.build_parser().parse_args(["watch", "--install"]))
     assert install_exit.value.code == 1
-    assert "Windows only" in capsys.readouterr().err
+    assert "Windows and macOS only" in capsys.readouterr().err
 
     with pytest.raises(SystemExit) as ensure_exit:
         cli.cmd_watch(cli.build_parser().parse_args(["watch", "--ensure"]))
@@ -395,7 +395,7 @@ def test_watch_status_and_linux_guards(tmp_path, monkeypatch, capsys):
     with pytest.raises(SystemExit) as autostart_install:
         cli.cmd_autostart(cli.build_parser().parse_args(["autostart", "install"]))
     assert autostart_install.value.code == 1
-    assert "Windows only" in capsys.readouterr().err
+    assert "Windows and macOS only" in capsys.readouterr().err
 
     cli.cmd_autostart(cli.build_parser().parse_args(["autostart", "status"]))
     assert "Heartbeat: missing" in capsys.readouterr().out

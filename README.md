@@ -88,13 +88,23 @@ winget install ffmpeg
 
 ### Step 2: Install the tool
 
-macOS:
+macOS, manual recording only (the original ffmpeg path):
 
 ```bash
 git clone <repo-url>
 cd local-AI-notetaker
 pip3 install -e .
 ```
+
+macOS, the same automatic workflow as Windows (detect Meet and Slack, record, transcribe, deliver, keep running after login). This does not need Homebrew. It needs the Xcode command-line tools (`xcode-select --install`):
+
+```bash
+git clone <repo-url>
+cd local-AI-notetaker
+bash scripts/setup_macos.sh
+```
+
+Details, including the permission dialogs, are in [macOS automatic recording](#macos-automatic-recording).
 
 Windows (the `[windows]` extra pulls in `pyaudiowpatch`, `numpy`, `keyboard`, `pycaw`, and `psutil` for capture, hotkey, and Meet microphone detection):
 
@@ -131,19 +141,13 @@ meeting-notes --help
 
 ### Step 5: Grant microphone access
 
-**macOS:** the first time you run the tool, macOS will prompt you to grant microphone access to Terminal. Accept this — it's required for recording.
+**macOS:** the original ffmpeg recorder asks Terminal for microphone access. The automatic watcher asks Meeting Audio Capture for the microphone and for Screen & System Audio Recording. See [macOS automatic recording](#macos-automatic-recording).
 
 **Windows:** no extra permission grant is needed. The tool records the default microphone and system audio from every playback device (see below).
 
 ## Audio Device Configuration
 
-**macOS** — defaults to device index 1. List available devices:
-
-```bash
-ffmpeg -f avfoundation -list_devices true -i ""
-```
-
-Update `device_index` in `meeting_notes/recorder_mac.py` to change.
+**macOS** — the original recorder uses AVFoundation device index 1. List devices with `ffmpeg -f avfoundation -list_devices true -i ""` and set `MEETING_NOTES_AVFOUNDATION_DEVICE` to change the index. After `scripts/setup_macos.sh`, recording uses the system-audio helper instead of that single device. See [macOS automatic recording](#macos-automatic-recording).
 
 **Windows** — records the default microphone, and a WASAPI loopback of **every** playback device, including ones that are not the Windows default. That covers Meet's own speaker menu, a per-app output device, and headphones that connect or disconnect after recording has already started. A loopback is tied to the endpoint it was opened on, so the recorder refreshes the device list during the call and opens or closes streams as devices appear and disappear. Losing one playback device does not stop the microphone.
 
@@ -303,7 +307,7 @@ Limits, also stored on `transcript.json`:
 - Names are only as good as the Meet tab the extension can see. Captions can be off. A background Meet tab, or a Meet UI change, falls back to `Remote`, `Them`, or `Speaker A` / `Speaker B`.
 - Loudspeakers can leak remote voices into the microphone. When the wording matches, the named remote line is kept. Headphones avoid that.
 
-macOS still records one device. Speaker labels there are applied only when `speakers.jsonl` exists; otherwise the transcript stays unlabeled. The watcher itself is Windows-only.
+On macOS, speaker labels are applied when `speakers.jsonl` exists (the same Chrome extension, posting to `127.0.0.1`). Without that file the transcript stays unlabeled. The watcher runs on macOS as well as Windows. See [macOS automatic recording](#macos-automatic-recording).
 
 `meeting-notes start`, `stop`, Ctrl+C, Ctrl+Alt+Q, and the tray app are unchanged. `meeting-notes watch` records Slack Huddles as well as Google Meet. The watcher does not require the extension.
 
@@ -406,7 +410,84 @@ Limits:
 - The health ping cannot tell a crash from a laptop that slept for more than 15 minutes on the same day. Overnight (the previous heartbeat was on an earlier local date) does not ping. A gap that crosses local midnight does not ping. There is no timer during the day; the next `--ensure` is at unlock, resume, or the next logon.
 - `git pull` does not reload a watcher that is already running. After an update, end the hidden `pythonw` process (Task Manager) and run `meeting-notes watch --ensure`.
 - The replacement watcher is started with WMI (`Win32_Process.Create`) so it keeps running after the scheduled task exits. The command uses the real `pythonw.exe` (`sys.executable`, or `sys._base_executable` and the `pythonw.exe` beside it when the Microsoft Store path is an app-execution alias). That alias cannot be launched by `Win32_Process.Create`. If WMI still fails, `--ensure` starts a detached process instead and logs one INFO line, `using popen fallback`, without the PowerShell error record. A detached process can be stopped when the task exits. The same `--ensure` run retries after 30, 60, and 120 seconds when the start does not stick. The task's time limit is 10 minutes, which covers those waits.
-- The watcher and autostart are Windows-only.
+- Windows autostart is the scheduled task above. macOS autostart is a LaunchAgent; see [macOS automatic recording](#macos-automatic-recording).
+
+## macOS automatic recording
+
+Manual `meeting-notes start`, transcription, and Claude notes already ran on macOS. What was Windows-only was noticing a call by itself, starting and stopping the recording, and coming back after login, wake, or a crash. That path now uses the same watcher. Windows Task Scheduler is unchanged.
+
+### What already worked
+
+- `meeting-notes start` records with ffmpeg and AVFoundation, transcribes with faster-whisper (CPU int8 when there is no NVIDIA GPU, which is this Mac), and writes notes with `claude -p`.
+- Sessions still land in `~/meeting-notes/YYYY-MM-DD_topic`. WAVs are deleted after a successful transcript unless `keep_audio` is set. A watcher session still POSTs the transcript with the configured bearer header.
+- The Chrome extension is the same unpacked extension. It only talks to `127.0.0.1`. On macOS the speaker bridge now listens during a recording, so caption names are written to `speakers.jsonl` and applied to the single mixed recording.
+- `meeting-notes watch --ensure` already knew how to restart a crashed or frozen watcher, with retries of 30 seconds, 60 seconds, and 120 seconds, and how to leave a recording alone. The LaunchAgent calls that same command.
+
+### What you run
+
+From the repo, on a Mac with the Xcode command-line tools:
+
+```bash
+bash scripts/setup_macos.sh
+```
+
+That creates `.venv`, installs this package into it, builds `Meeting Audio Capture` with `swiftc`, copies `config.example.toml` to `~/.meeting-notes/config.toml` when that file is missing, and installs the LaunchAgent. Edit the webhook URL and bearer value in the copied config. Do not commit that file.
+
+Equivalent pieces, if you prefer to run them yourself:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -e .
+bash scripts/install_launchagent.sh
+meeting-notes speakers
+```
+
+`scripts/uninstall_launchagent.sh` removes the agent. `meeting-notes autostart status` and `meeting-notes watch --status` show whether it is loaded and whether the watcher is alive.
+
+The agent is `~/Library/LaunchAgents/com.meeting-notes.watch.plist`. It starts at login (`RunAtLoad`) in the graphical session. The process it starts stays running and, when the Mac wakes or the screen unlocks, runs `meeting-notes watch --ensure` again. Ensure is what restarts a watcher that crashed or whose heartbeat froze, and what refuses to kill one that is mid-recording (including while Whisper is running), unless that heartbeat is older than 10 minutes. Logs go to `~/.meeting-notes/watch.log`, plus `launchd.log` and `launchd.err.log` beside it.
+
+### Call detection
+
+A Google Meet starts when a Google Chrome window title looks like `Meet - <code or title>` and Chrome is using the microphone. The helper asks Core Audio, on macOS 14.2 and later, which process has its input running, and matches that process's bundle id. An empty process list means the microphone is idle. If that property cannot be read, the Meet window title alone starts and stops the recording: leave the Meet tab, or close it, when the call ends. A Slack Huddle still needs the Slack app to be using the microphone, so a Huddle does not start while that probe is down. The join and leave holds are the same config keys as on Windows (`join_debounce_seconds`, `leave_debounce_seconds`). Slack in a browser tab is still not detected. `mic_process_marker` stays `chrome.exe` in config; on macOS that also matches Google Chrome and Slack.
+
+The helper's `probe` command reads window titles and which processes have an active input. Window titles of other apps are blank until Screen & System Audio Recording is allowed, so a Meet cannot be detected until you allow it.
+
+### Recording the call
+
+AVFoundation, which `meeting-notes start` has always used on macOS, records one input device (index `1`, or `MEETING_NOTES_AVFOUNDATION_DEVICE`). That device is a microphone. It does not hear other applications, so a Meet recorded that way is only your side unless you point the device index at a virtual device you already installed.
+
+When `scripts/setup_macos.sh` has built the helper, recording uses it instead:
+
+1. A Core Audio process tap (macOS 14.2 and later; the system-audio permission is the macOS 14.4 one) captures every other app's audio.
+2. If the tap cannot be created, ScreenCaptureKit captures system audio.
+3. The microphone is mixed into the same 16 kHz `audio.wav`.
+
+Nothing joins the call. If the helper exits immediately, recording falls back to the original AVFoundation device and says so.
+
+BlackHole is not installed. It is only useful when both system APIs are denied: set `MEETING_NOTES_CAPTURE=avfoundation` and `MEETING_NOTES_AVFOUNDATION_DEVICE` to the virtual device's AVFoundation index (`ffmpeg -f avfoundation -list_devices true -i ""`). Leave `MEETING_NOTES_CAPTURE` unset to keep the helper.
+
+### Permission dialogs you have to click
+
+The first time the helper records, and the first time it lists windows, macOS shows:
+
+1. **Microphone.** The dialog is "Meeting Audio Capture would like to access the microphone." Click Allow. If you started a recording from Terminal before the helper existed, the dialog may name Terminal instead.
+2. **Screen & System Audio Recording.** System Settings → Privacy & Security → Screen & System Audio Recording. Turn on Meeting Audio Capture. This is required for the Meet window title and for system audio. The screen is not written to disk.
+
+There is no separate Accessibility prompt and no Automation prompt. After changing either toggle, run `meeting-notes watch --ensure`.
+
+### Chrome on macOS
+
+`meeting-notes speakers` copies the extension to `~/.meeting-notes/chrome-extension`. In Google Chrome:
+
+1. Open `chrome://extensions`
+2. Turn on Developer mode
+3. Load unpacked and choose that folder
+
+In Meet, press CC. Captions are only shown to you. They are what puts real names on other people. Voice diarization stays off.
+
+### Transcription
+
+The transcriber is unchanged. On Apple Silicon, faster-whisper finds no CUDA device and uses CPU int8. The model size is still `whisper_model` (default `medium`).
 
 ## Privacy
 

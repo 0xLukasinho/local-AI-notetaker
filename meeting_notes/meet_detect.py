@@ -16,6 +16,7 @@ times so a reload or a brief blip does not split one call into two sessions.
 import re
 from dataclasses import dataclass
 
+from meeting_notes.platform_match import process_matches
 from meeting_notes.session import slugify
 
 
@@ -121,11 +122,10 @@ def mic_in_use_from_entries(entries, marker="chrome.exe"):
     `entries` is a sequence of ``(subkey_name, last_used_time_stop)``. Windows
     writes 0 in LastUsedTimeStop while the app is using the microphone.
     """
-    needle = (marker or "").lower()
-    if not needle:
+    if not marker:
         return False
     for name, stop in entries:
-        if needle not in str(name).lower():
+        if not process_matches(str(name), marker):
             continue
         try:
             if int(stop) == 0:
@@ -159,6 +159,9 @@ class MicStatus:
     registry: str = ""
     wasapi: str = ""
     notice: str = ""
+    # False means the probe could not tell which app holds the microphone.
+    # A clean "not in use" stays True. Windows probes leave this True.
+    available: bool = True
 
 
 def make_mic_status(registry, wasapi, notice=""):
@@ -183,12 +186,11 @@ def mic_in_use_from_capture_sessions(sessions, marker="chrome.exe"):
     `sessions` is a sequence of ``(process_name, state)``. State ``1`` is
     ``AudioSessionStateActive``.
     """
-    needle = (marker or "").lower()
-    if not needle:
+    if not marker:
         return False
     for item in sessions or []:
         name, state = item[0], item[1]
-        if needle not in str(name).lower():
+        if not process_matches(str(name), marker):
             continue
         try:
             if int(state) == AUDIO_SESSION_STATE_ACTIVE:
@@ -271,12 +273,18 @@ class ChromeMeetDetector:
         title_regex=None,
         process_marker="chrome.exe",
         log=None,
+        mic_optional=False,
     ):
         self.windows = windows
         self.mic_in_use = mic_in_use
         self.title_regex = title_regex or None
         self.process_marker = process_marker or "chrome.exe"
         self.log = log
+        # macOS sets this. When the Core Audio probe cannot name an app, a
+        # Meet window title is enough to join and to leave. A working probe
+        # that says the mic is idle still requires both signals. Windows
+        # leaves this false.
+        self.mic_optional = bool(mic_optional)
         self.source = "google-meet"
         self._latched = None
         self._last_mic = _UNSEEN
@@ -309,10 +317,9 @@ class ChromeMeetDetector:
             windows = self.windows() or []
         except Exception as exc:
             return None, exc
-        marker = self.process_marker.lower()
         for window in windows:
-            process_name = (getattr(window, "process_name", "") or "").lower()
-            if marker not in process_name:
+            process_name = getattr(window, "process_name", "") or ""
+            if not process_matches(process_name, self.process_marker):
                 continue
             parsed = parse_meet_window_title(
                 getattr(window, "title", ""),
@@ -322,8 +329,18 @@ class ChromeMeetDetector:
                 return parsed, None
         return None, None
 
+    def _probe_can_name_the_app(self, mic):
+        return bool(getattr(mic, "available", True))
+
+    def _join_ok(self, mic, window):
+        if window is None:
+            return False
+        if mic.in_use:
+            return True
+        return self.mic_optional and not self._probe_can_name_the_app(mic)
+
     def _decide(self, mic, window, in_call):
-        if window is not None and mic.in_use:
+        if self._join_ok(mic, window):
             self._latched = window
             return window
         if not in_call or self._latched is None:

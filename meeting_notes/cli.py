@@ -214,7 +214,9 @@ def _uses_meet_speaker_bridge(source):
 
 def _start_speaker_bridge(meeting_dir, config):
     """Listen for the Meet extension while this recording is running."""
-    if not getattr(config, "speaker_labels", False) or sys.platform != "win32":
+    # The bridge is a localhost HTTP server. Windows and macOS both use it so
+    # the Chrome extension can name speakers. Other platforms have no watcher.
+    if not getattr(config, "speaker_labels", False) or sys.platform not in ("win32", "darwin"):
         return None
     from meeting_notes.speaker_bridge import SpeakerBridge
 
@@ -828,9 +830,46 @@ def _print_autostart_result(meta):
     print("If that start fails, it retries after 30 seconds, 60 seconds, and 120 seconds.")
 
 
+def _print_launchd_result(meta):
+    print("Installed LaunchAgent %s." % meta.get("label"))
+    print("It runs at login, and again when the Mac wakes or the screen unlocks.")
+    print("Each run starts a watcher only when one is not already healthy.")
+    print("If that start fails, it retries after 30 seconds, 60 seconds, and 120 seconds.")
+    print("A watcher that is recording is left alone.")
+    print("Logs: %s" % os.path.join(CONTROL_DIR, "watch.log"))
+
+
+def _cmd_install_launchd():
+    from meeting_notes.launchd_agent import install_launch_agent
+
+    try:
+        meta = install_launch_agent(CONTROL_DIR)
+    except AutostartError as exc:
+        _log_watch("autostart install failed: %s", exc)
+        print("Error: %s" % exc, file=sys.stderr)
+        sys.exit(1)
+    _print_launchd_result(meta)
+    try:
+        logger, _path = configure_watch_logging(CONTROL_DIR)
+        logger.info(
+            "autostart install: LaunchAgent %s triggers %s",
+            meta.get("label"),
+            ", ".join(meta.get("triggers") or []),
+        )
+    except Exception:
+        pass
+    result = ensure_until_running(CONTROL_DIR)
+    print(result.user_message)
+    if not result.ok:
+        sys.exit(1)
+
+
 def _cmd_install_autostart():
+    if sys.platform == "darwin":
+        _cmd_install_launchd()
+        return
     if sys.platform != "win32":
-        print("Autostart install is supported on Windows only.", file=sys.stderr)
+        print("Autostart install is supported on Windows and macOS only.", file=sys.stderr)
         sys.exit(1)
     try:
         meta = install_autostart(CONTROL_DIR)
@@ -855,6 +894,22 @@ def _cmd_install_autostart():
 
 
 def _cmd_uninstall_autostart():
+    if sys.platform == "darwin":
+        from meeting_notes.launchd_agent import uninstall_launch_agent
+
+        removed = uninstall_launch_agent(CONTROL_DIR)
+        if removed:
+            print("Removed login autostart:")
+            for item in removed:
+                print("  %s" % item)
+        else:
+            print("Login autostart was not installed.")
+        try:
+            logger, _path = configure_watch_logging(CONTROL_DIR)
+            logger.info("autostart uninstall: removed %s", ", ".join(removed) or "nothing")
+        except Exception:
+            pass
+        return
     removed = uninstall_autostart(CONTROL_DIR)
     if removed:
         print("Removed login autostart:")
@@ -870,8 +925,16 @@ def _cmd_uninstall_autostart():
 
 
 def cmd_autostart(args):
-    """Install, remove, or inspect the Windows scheduled task."""
+    """Install, remove, or inspect login autostart."""
     command = args.autostart_command
+    if command == "supervise":
+        if sys.platform != "darwin":
+            print("The launchd supervisor is macOS only.", file=sys.stderr)
+            sys.exit(1)
+        from meeting_notes.launchd_agent import supervise
+
+        supervise(CONTROL_DIR)
+        return
     if command == "install":
         _cmd_install_autostart()
         return
@@ -941,19 +1004,19 @@ def cmd_watch(args):
         _cmd_install_autostart()
         return
     if args.ensure:
-        if sys.platform != "win32":
+        if sys.platform not in ("win32", "darwin"):
             print(
-                "meeting-notes watch --ensure requires Windows.",
+                "meeting-notes watch --ensure requires Windows or macOS.",
                 file=sys.stderr,
             )
             sys.exit(1)
         result = ensure_until_running(CONTROL_DIR)
         print(result.user_message)
         sys.exit(0 if result.ok else 1)
-    if sys.platform != "win32":
+    if sys.platform not in ("win32", "darwin"):
         print(
-            "meeting-notes watch requires Windows "
-            "(Chrome window enumeration and the microphone probes).",
+            "meeting-notes watch requires Windows or macOS "
+            "(call detection is implemented for those systems).",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -1143,7 +1206,7 @@ def build_parser():
 
     autostart_parser = subparsers.add_parser(
         "autostart",
-        help="Start the watcher at logon, unlock, and resume (Windows)",
+        help="Start the watcher at login (Windows scheduled task or macOS LaunchAgent)",
     )
     autostart_subs = autostart_parser.add_subparsers(dest="autostart_command", required=True)
     autostart_subs.add_parser(
@@ -1157,6 +1220,10 @@ def build_parser():
     autostart_subs.add_parser(
         "status",
         help="Show the scheduled task, the watcher process, and the heartbeat",
+    )
+    autostart_subs.add_parser(
+        "supervise",
+        help="LaunchAgent entry point: ensure the watcher, then again on wake and unlock",
     )
     autostart_parser.set_defaults(func=cmd_autostart)
 
