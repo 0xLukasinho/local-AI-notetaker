@@ -448,9 +448,11 @@ The agent is `~/Library/LaunchAgents/com.meeting-notes.watch.plist`. It starts a
 
 ### Call detection
 
-A Google Meet starts when a Google Chrome window title looks like `Meet - <code or title>` and Chrome is using the microphone. The helper asks Core Audio, on macOS 14.2 and later, which process has its input running, and matches that process's bundle id. An empty process list means the microphone is idle. If that property cannot be read, the Meet window title alone starts and stops the recording: leave the Meet tab, or close it, when the call ends. A Slack Huddle still needs the Slack app to be using the microphone, so a Huddle does not start while that probe is down. The join and leave holds are the same config keys as on Windows (`join_debounce_seconds`, `leave_debounce_seconds`). Slack in a browser tab is still not detected. `mic_process_marker` stays `chrome.exe` in config; on macOS that also matches Google Chrome and Slack.
+A Google Meet starts when the Chrome extension reports an in-call heartbeat (the leave-call button is on the page). That does not need Screen Recording, so it works when the watcher was started by the LaunchAgent. The window-title plus microphone check is still used when the extension is quiet. Heartbeats arrive about every 3 seconds on `127.0.0.1` at the speaker-bridge port plus one. After they stop, the usual leave hold (`leave_debounce_seconds`, default 25) ends the session.
 
-The helper's `probe` command reads window titles and which processes have an active input. Window titles of other apps are blank until Screen & System Audio Recording is allowed, so a Meet cannot be detected until you allow it.
+A Slack Huddle still needs the Slack app to be using the microphone, and the window title when one is available. Those titles stay blank until Meeting Audio Capture itself is allowed under Screen & System Audio Recording. Run `meeting-notes permissions request` and click Allow. `meeting-notes permissions check` prints whether that grant is in place. The same permission is what lets the process tap record the other side of a call.
+
+The join and leave holds are the same config keys as on Windows (`join_debounce_seconds`, `leave_debounce_seconds`). Slack in a browser tab is still not detected. `mic_process_marker` stays `chrome.exe` in config; on macOS that also matches Google Chrome and Slack. `watch --status` prints `screen_permission` and `extension_presence` from the heartbeat file.
 
 ### Recording the call
 

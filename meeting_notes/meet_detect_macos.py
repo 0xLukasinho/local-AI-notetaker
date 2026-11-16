@@ -11,7 +11,6 @@ status whose ``notice`` says to run the setup script. It does not raise, so
 one failed probe cannot start a recording.
 """
 
-import subprocess
 import time
 
 from meeting_notes.macos_capture import (
@@ -36,7 +35,7 @@ def _read(now=None, runner=None, helper=None):
         return cached
     if helper is None:
         helper = find_capture_helper()
-    payload = run_probe(helper, runner or subprocess.run)
+    payload = run_probe(helper, runner)
     _cache["at"] = current
     _cache["payload"] = payload
     return payload
@@ -62,9 +61,11 @@ def _warn_titles():
         import logging
 
         logging.getLogger("meeting_notes.watch").warning(
-            "Chrome and Slack window titles are blank. Grant Screen & System "
-            "Audio Recording to Meeting Audio Capture (System Settings → "
-            "Privacy & Security). A Meet tab cannot be detected without the title."
+            "Chrome and Slack window titles are blank. Meet calls are detected "
+            "from the Chrome extension and do not need this. Slack window titles "
+            "and other participants' audio need Screen & System Audio Recording "
+            "for Meeting Audio Capture. Run `meeting-notes permissions request` "
+            "and click Allow."
         )
     except Exception:
         pass

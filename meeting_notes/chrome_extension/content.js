@@ -46,6 +46,13 @@ const TOAST_PHRASES = [
   "turned off",
 ];
 
+const DENY_NAMES = {
+  reframe: true,
+  "font size": true,
+  "others might still see your full video.": true,
+  "others might still see your full video": true,
+};
+
 function plausibleName(text) {
   if (!text || text.length < 2 || text.length > 80) {
     return false;
@@ -61,6 +68,9 @@ function plausibleName(text) {
     return false;
   }
   const lower = text.toLowerCase();
+  if (DENY_NAMES[lower]) {
+    return false;
+  }
   for (const word of BLOCKED_NAMES) {
     if (lower === word || lower.startsWith(word + " ")) {
       return false;
@@ -460,8 +470,9 @@ function selfIdentity() {
 }
 
 function nameFromTile(tile) {
-  // Prefer the short label Meet puts on the tile. The longest text used to
-  // win, and a toast inside the tile is longer than a person's name.
+  // Only the tile's own label. Buttons, menus, and toasts inside the tile
+  // ("Reframe", "Font size", "Others might still see your full video.") are
+  // not names, so descendant text is ignored.
   const ranked = [];
   function add(text) {
     const name = cleanLabel(text);
@@ -472,38 +483,76 @@ function nameFromTile(tile) {
   try {
     const selfNode = tile.querySelector("[data-self-name]");
     if (selfNode) {
-      add(selfNode.getAttribute("data-self-name") || selfNode.textContent || "");
+      add(selfNode.getAttribute("data-self-name") || "");
     }
   } catch (err) {
-    // Fall through to the aria label and the leaves.
+    // Fall through to the tile's own aria-label.
   }
   add(tile.getAttribute && tile.getAttribute("aria-label"));
-  let nodes = [];
-  try {
-    nodes = tile.querySelectorAll("span, div");
-  } catch (err) {
-    nodes = [];
-  }
-  for (const node of nodes) {
-    try {
-      if (node.closest && node.closest("button, [role='button'], [role='alert'], [role='status'], [aria-live]")) {
-        continue;
-      }
-    } catch (err) {
-      continue;
-    }
-    if (node.childElementCount > 0) {
-      continue;
-    }
-    add(node.textContent || "");
-  }
   const people = ranked.filter((name) => name.toLowerCase() !== "you");
-  const pool = people.length ? people : ranked;
-  if (!pool.length) {
-    return "";
+  return (people.length ? people : ranked)[0] || "";
+}
+
+function meetPresence() {
+  // In-call is the leave-call control. The lobby has Join now and no leave
+  // button. A hidden tab is still in the call; visibility is reported, not
+  // required.
+  let code = "";
+  try {
+    const path = String((location && location.pathname) || "");
+    const match = path.match(/\/([a-z]{3}-[a-z]{4}-[a-z]{3})(?:\/|$)/i);
+    if (match) {
+      code = match[1].toLowerCase();
+    }
+  } catch (err) {
+    code = "";
   }
-  pool.sort((a, b) => a.split(" ").length - b.split(" ").length || a.length - b.length);
-  return pool[0];
+  let leave = false;
+  let lobby = false;
+  let buttons = [];
+  try {
+    buttons = document.querySelectorAll("button, [role='button']");
+  } catch (err) {
+    buttons = [];
+  }
+  const limit = Math.min(buttons.length, 120);
+  for (let i = 0; i < limit; i++) {
+    const button = buttons[i];
+    const label = String(
+      (button.getAttribute && button.getAttribute("aria-label")) || button.textContent || ""
+    ).toLowerCase();
+    if (label.indexOf("leave call") !== -1 || label.indexOf("leave meeting") !== -1) {
+      leave = true;
+    }
+    if (label.indexOf("join now") !== -1 || label.indexOf("ask to join") !== -1) {
+      lobby = true;
+    }
+  }
+  let phase = "left";
+  if (leave) {
+    phase = "in-call";
+  } else if (lobby || code) {
+    phase = "lobby";
+  }
+  let visible = true;
+  try {
+    visible = document.visibilityState !== "hidden";
+  } catch (err) {
+    visible = true;
+  }
+  let title = "";
+  try {
+    title = document.title || "";
+  } catch (err) {
+    title = "";
+  }
+  return {
+    meet_code: code,
+    in_call: phase === "in-call",
+    phase: phase,
+    visible: visible,
+    title: title,
+  };
 }
 
 function captionsEnabled() {
@@ -659,7 +708,23 @@ function sample() {
   }
 }
 
+function sendPresence() {
+  let payload;
+  try {
+    payload = meetPresence();
+  } catch (err) {
+    return;
+  }
+  try {
+    chrome.runtime.sendMessage({ type: "presence", payload: payload });
+  } catch (err) {
+    // The watcher is down. The next heartbeat tries again.
+  }
+}
+
 if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.sendMessage) {
   setInterval(sample, 400);
+  setInterval(sendPresence, 3000);
   sample();
+  sendPresence();
 }

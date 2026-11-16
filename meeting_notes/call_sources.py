@@ -56,7 +56,7 @@ def source_factories():
     )
 
 
-def build_call_detector(config, windows, probe_microphone, log=None):
+def build_call_detector(config, windows, probe_microphone, log=None, presence=None):
     """The watcher detector: every enabled source, or a no-op when none are."""
     detectors = []
     for source_id, flag, build in source_factories():
@@ -64,6 +64,8 @@ def build_call_detector(config, windows, probe_microphone, log=None):
             continue
         detector = build(config, windows, probe_microphone, log)
         detector.source = source_id
+        if presence is not None and source_id == SOURCE_GOOGLE_MEET:
+            detector.extension_sighting = presence.sighting
         detectors.append(detector)
     return CompositeCallDetector(detectors, log=log)
 

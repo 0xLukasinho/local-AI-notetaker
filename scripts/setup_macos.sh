@@ -96,18 +96,34 @@ SWIFTC="$(command -v swiftc || true)"
 if [[ -z "${SWIFTC}" ]]; then
   SWIFTC="$(xcrun --find swiftc)"
 fi
-"${SWIFTC}" -O \
-  -framework AVFoundation \
-  -framework CoreAudio \
-  -framework AudioToolbox \
-  -framework CoreMedia \
-  -framework ScreenCaptureKit \
-  -framework AppKit \
-  -framework CoreGraphics \
-  -o "${MACOS_DIR}/meeting-audio-capture" \
-  "${ROOT}/native/macos/MeetingAudioCapture.swift"
-codesign --force --sign - "${APP_DIR}"
-chmod +x "${MACOS_DIR}/meeting-audio-capture"
+# Ad-hoc signature is keyed by the binary's hash. Re-signing an unchanged
+# helper would drop the Screen Recording grant, so skip the build when the
+# source and Info.plist are the same as last time.
+STAMP="${APP_DIR}/Contents/_source.sha256"
+NEW_HASH="$(
+  shasum -a 256 \
+    "${ROOT}/native/macos/MeetingAudioCapture.swift" \
+    "${APP_DIR}/Contents/Info.plist" | shasum -a 256 | awk '{print $1}'
+)"
+if [[ -x "${MACOS_DIR}/meeting-audio-capture" && -f "${STAMP}" && "$(cat "${STAMP}")" == "${NEW_HASH}" ]]; then
+  echo "Helper unchanged. Not re-signing, so the Screen Recording grant stays."
+else
+  "${SWIFTC}" -O \
+    -framework AVFoundation \
+    -framework CoreAudio \
+    -framework AudioToolbox \
+    -framework CoreMedia \
+    -framework ScreenCaptureKit \
+    -framework AppKit \
+    -framework CoreGraphics \
+    -o "${MACOS_DIR}/meeting-audio-capture" \
+    "${ROOT}/native/macos/MeetingAudioCapture.swift"
+  # Stable identifier. The cdhash still changes when the binary changes, and
+  # that one rebuild needs Allow clicked again. An unchanged rerun does not.
+  codesign --force --sign - --identifier com.meeting-notes.audio-capture "${APP_DIR}"
+  chmod +x "${MACOS_DIR}/meeting-audio-capture"
+  printf '%s\n' "${NEW_HASH}" > "${STAMP}"
+fi
 ln -sfn "${MACOS_DIR}/meeting-audio-capture" "${BIN_DIR}/meeting-audio-capture"
 echo "Helper: ${MACOS_DIR}/meeting-audio-capture"
 

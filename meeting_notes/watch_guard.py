@@ -137,6 +137,7 @@ class Heartbeat:
         self.pid = os.getpid() if pid is None else int(pid)
         self.iso = iso or (lambda _unix: iso_now())
         self._last = None
+        self.extra = None
 
     def beat(self, force=False, state="idle", session_folder=None, session_pid=None):
         current = float(self.now())
@@ -163,6 +164,9 @@ class Heartbeat:
                     payload["session_pid"] = int(session_pid)
             except (TypeError, ValueError):
                 pass
+        extra = self.extra() if callable(getattr(self, "extra", None)) else None
+        if isinstance(extra, dict):
+            payload.update(extra)
         atomic_write_json(heartbeat_path(self.control_dir), payload)
         self._last = current
         return True
@@ -561,10 +565,25 @@ def describe_heartbeat(control_dir, now=None, active=None, is_alive=None):
         return (
             f"Heartbeat: missing (state=recording{session})"
         )
+    health = _format_health(heartbeat)
     return (
         f"Heartbeat: {stamp} (age {age_text}, state={state}, "
-        f"pid={pid}, version={version}{session}){note}"
+        f"pid={pid}, version={version}{session}){note}{health}"
     )
+
+
+def _format_health(heartbeat):
+    if not heartbeat:
+        return ""
+    parts = []
+    if heartbeat.get("screen_permission"):
+        parts.append("screen_permission=%s" % heartbeat.get("screen_permission"))
+    if "extension_presence" in heartbeat:
+        seen = heartbeat.get("extension_presence") or "never"
+        parts.append("extension_presence=%s" % seen)
+    if not parts:
+        return ""
+    return " " + " ".join(parts)
 
 
 def ensure_watcher(

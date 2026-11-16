@@ -246,6 +246,37 @@ assert(snapshot.participants.length === 1, "only the real participant");
 assert(snapshot.participants[0].name === "Alex Chen", "toast is not a participant name");
 assert(snapshot.participants[0].self === true, "the local tile is self");
 
+const reframe = el("button", { "aria-label": "Reframe" }, [], "Reframe");
+const font = el("div", { role: "menu" }, [], "Font size");
+const real = el(
+  "div",
+  { "data-participant-id": "spaces/x/devices/ada", "aria-label": "Ada Lovelace" },
+  [reframe, font, el("span", {}, [], "Others might still see your full video.")]
+);
+root.children = [real];
+real.parentElement = root;
+const named = context.collect();
+assert(named.participants.length === 1, "ui chrome is not a second participant: " + JSON.stringify(named.participants));
+assert(named.participants[0].name === "Ada Lovelace", "name is the tile label");
+assert(context.plausibleName("Reframe") === false, "Reframe is not a name");
+assert(context.plausibleName("Font size") === false, "Font size is not a name");
+assert(
+  context.plausibleName("Others might still see your full video.") === false,
+  "toast sentence is not a name"
+);
+
+document.visibilityState = "visible";
+context.location = { pathname: "/abc-defg-hij" };
+root.children = [el("button", { "aria-label": "Leave call" }, [], "Leave")];
+const live = context.meetPresence();
+assert(live.in_call === true, "leave call means in call");
+assert(live.meet_code === "abc-defg-hij", "meet code from the path");
+assert(live.phase === "in-call", "phase");
+root.children = [el("button", { "aria-label": "Join now" }, [], "Join now")];
+const lobby = context.meetPresence();
+assert(lobby.in_call === false, "lobby is not a call");
+assert(lobby.phase === "lobby", "lobby phase");
+
 const toastOnly = el(
   "div",
   { "data-participant-id": "spaces/x/devices/999" },
