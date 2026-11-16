@@ -69,6 +69,53 @@ def test_darwin_aliases_match_chrome_and_slack_only_on_mac():
     assert not process_matches("Google Chrome", "chrome.exe", platform="linux")
 
 
+def test_meet_window_alone_starts_only_when_the_mac_probe_cannot_name_an_app():
+    from meeting_notes.meet_detect import MicStatus, WindowInfo
+
+    title = "Meet - abc-defg-hij - Google Chrome"
+    windows = [WindowInfo(title, "chrome.exe")]
+    unavailable = MicStatus(False, (), notice="probe down", available=False)
+
+    started = ChromeMeetDetector(
+        windows=lambda: windows,
+        mic_in_use=lambda: unavailable,
+        mic_optional=True,
+    ).poll()
+    assert started is not None
+    assert started.meet_code == "abc-defg-hij"
+
+    # A working probe that says the microphone is idle does not start from the title.
+    idle = ChromeMeetDetector(
+        windows=lambda: windows,
+        mic_in_use=lambda: MicStatus(False, (), available=True),
+        mic_optional=True,
+    ).poll()
+    assert idle is None
+
+    # Windows keeps requiring the microphone even if a probe were marked unavailable.
+    windows_only = ChromeMeetDetector(
+        windows=lambda: windows,
+        mic_in_use=lambda: unavailable,
+        mic_optional=False,
+    ).poll()
+    assert windows_only is None
+
+    # Leaving is the window going away. An unavailable probe is not "mic still held".
+    state = {"windows": windows}
+
+    def mic():
+        return unavailable
+
+    detector = ChromeMeetDetector(
+        windows=lambda: state["windows"],
+        mic_in_use=mic,
+        mic_optional=True,
+    )
+    assert detector.poll(in_call=False) is not None
+    state["windows"] = []
+    assert detector.poll(in_call=True) is None
+
+
 def test_meet_detector_accepts_a_mac_chrome_window_only_on_darwin(monkeypatch):
     import meeting_notes.platform_match as platform_match
 
@@ -120,6 +167,15 @@ def test_probe_json_becomes_a_coreaudio_mic_status():
     missing = mic_status_from_probe({"error": "helper-missing"}, "chrome.exe")
     assert missing.in_use is False
     assert "setup_macos.sh" in missing.notice
+
+    unavailable = mic_status_from_probe({"input_available": False, "inputs": []}, "chrome.exe")
+    assert unavailable.in_use is False
+    assert unavailable.available is False
+    assert "window title" in unavailable.notice
+
+    idle_probe = mic_status_from_probe({"input_available": True, "inputs": []}, "chrome.exe")
+    assert idle_probe.in_use is False
+    assert idle_probe.available is True
 
     broken = parse_probe_json("not-json")
     assert broken["error"]

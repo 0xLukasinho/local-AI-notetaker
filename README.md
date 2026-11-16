@@ -448,7 +448,7 @@ The agent is `~/Library/LaunchAgents/com.meeting-notes.watch.plist`. It starts a
 
 ### Call detection
 
-A Google Meet starts when a Google Chrome window title looks like `Meet - <code or title>` and Chrome is using the microphone. A Slack Huddle starts when the Slack app is using the microphone. The join and leave holds are the same config keys as on Windows (`join_debounce_seconds`, `leave_debounce_seconds`). Slack in a browser tab is still not detected. `mic_process_marker` stays `chrome.exe` in config; on macOS that also matches Google Chrome.
+A Google Meet starts when a Google Chrome window title looks like `Meet - <code or title>` and Chrome is using the microphone. The helper asks Core Audio, on macOS 14.2 and later, which process has its input running, and matches that process's bundle id. An empty process list means the microphone is idle. If that property cannot be read, the Meet window title alone starts and stops the recording: leave the Meet tab, or close it, when the call ends. A Slack Huddle still needs the Slack app to be using the microphone, so a Huddle does not start while that probe is down. The join and leave holds are the same config keys as on Windows (`join_debounce_seconds`, `leave_debounce_seconds`). Slack in a browser tab is still not detected. `mic_process_marker` stays `chrome.exe` in config; on macOS that also matches Google Chrome and Slack.
 
 The helper's `probe` command reads window titles and which processes have an active input. Window titles of other apps are blank until Screen & System Audio Recording is allowed, so a Meet cannot be detected until you allow it.
 

@@ -159,6 +159,9 @@ class MicStatus:
     registry: str = ""
     wasapi: str = ""
     notice: str = ""
+    # False means the probe could not tell which app holds the microphone.
+    # A clean "not in use" stays True. Windows probes leave this True.
+    available: bool = True
 
 
 def make_mic_status(registry, wasapi, notice=""):
@@ -270,12 +273,18 @@ class ChromeMeetDetector:
         title_regex=None,
         process_marker="chrome.exe",
         log=None,
+        mic_optional=False,
     ):
         self.windows = windows
         self.mic_in_use = mic_in_use
         self.title_regex = title_regex or None
         self.process_marker = process_marker or "chrome.exe"
         self.log = log
+        # macOS sets this. When the Core Audio probe cannot name an app, a
+        # Meet window title is enough to join and to leave. A working probe
+        # that says the mic is idle still requires both signals. Windows
+        # leaves this false.
+        self.mic_optional = bool(mic_optional)
         self.source = "google-meet"
         self._latched = None
         self._last_mic = _UNSEEN
@@ -320,8 +329,18 @@ class ChromeMeetDetector:
                 return parsed, None
         return None, None
 
+    def _probe_can_name_the_app(self, mic):
+        return bool(getattr(mic, "available", True))
+
+    def _join_ok(self, mic, window):
+        if window is None:
+            return False
+        if mic.in_use:
+            return True
+        return self.mic_optional and not self._probe_can_name_the_app(mic)
+
     def _decide(self, mic, window, in_call):
-        if window is not None and mic.in_use:
+        if self._join_ok(mic, window):
             self._latched = window
             return window
         if not in_call or self._latched is None:

@@ -349,7 +349,7 @@ final class SystemCapture: @unchecked Sendable {
     private var sourceRate: Double = 48000
 }
 
-private let ioProc: AudioDeviceIOProc = { _, _, inputData, _, _, client in
+private let ioProc: AudioDeviceIOProc = { _, _, inputData, _, _, _, client in
     guard let client = client else {
         return noErr
     }
@@ -391,13 +391,33 @@ private func streamFormat(_ deviceID: AudioObjectID) -> AudioStreamBasicDescript
     return format
 }
 
+private func defaultOutputDeviceUID() -> String? {
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultSystemOutputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var deviceID = AudioObjectID(kAudioObjectUnknown)
+    var size = UInt32(MemoryLayout<AudioObjectID>.size)
+    let system = AudioObjectID(kAudioObjectSystemObject)
+    if AudioObjectGetPropertyData(system, &address, 0, nil, &size, &deviceID) != noErr {
+        return nil
+    }
+    if deviceID == kAudioObjectUnknown {
+        return nil
+    }
+    return readObjectString(deviceID, selector: kAudioDevicePropertyDeviceUID)
+}
+
 @available(macOS 14.2, *)
 private func startProcessTap(mix: MixBuffer) -> SystemCapture? {
-    let description = CATapDescription(stereoGlobalTapButExcludeProcesses: [NSNumber(value: getpid())])
+    // Process-object IDs, not pids. An empty list taps every process. This
+    // helper plays no audio, so excluding it is unnecessary.
+    let description = CATapDescription(stereoGlobalTapButExcludeProcesses: [])
     description.name = "Meeting Notes System Audio"
     description.isPrivate = true
     description.isExclusive = false
-    description.muteBehavior = .unmuted
+    description.muteBehavior = CATapMuteBehavior.unmuted
     var tapID = AudioObjectID(kAudioObjectUnknown)
     let created = AudioHardwareCreateProcessTap(description, &tapID)
     if created != noErr {
@@ -409,16 +429,29 @@ private func startProcessTap(mix: MixBuffer) -> SystemCapture? {
         logLine("capture: process tap has no uid")
         return nil
     }
+    guard let outputUID = defaultOutputDeviceUID() else {
+        AudioHardwareDestroyProcessTap(tapID)
+        logLine("capture: no default output device; process tap was not started")
+        return nil
+    }
     let aggregateUID = UUID().uuidString
+    // The tap is not a sub-device. It goes in TapList. The aggregate's clock
+    // is the default output device.
     let aggregate: [String: Any] = [
         kAudioAggregateDeviceNameKey as String: "Meeting Notes Aggregate",
         kAudioAggregateDeviceUIDKey as String: aggregateUID,
         kAudioAggregateDeviceIsPrivateKey as String: true,
         kAudioAggregateDeviceIsStackedKey as String: false,
         kAudioAggregateDeviceTapAutoStartKey as String: true,
-        kAudioAggregateDeviceMainSubDeviceKey as String: uid,
+        kAudioAggregateDeviceMainSubDeviceKey as String: outputUID,
         kAudioAggregateDeviceSubDeviceListKey as String: [
-            [kAudioSubDeviceUIDKey as String: uid],
+            [kAudioSubDeviceUIDKey as String: outputUID],
+        ],
+        kAudioAggregateDeviceTapListKey as String: [
+            [
+                kAudioSubTapDriftCompensationKey as String: true,
+                kAudioSubTapUIDKey as String: uid,
+            ],
         ],
     ]
     var aggregateID = AudioObjectID(kAudioObjectUnknown)
@@ -663,7 +696,7 @@ private func record(outputPath: String) {
 
 // MARK: - Probe
 
-private func readUInt32(_ objectID: AudioObjectID, selector: UInt32) -> UInt32? {
+private func readUInt32(_ objectID: AudioObjectID, selector: AudioObjectPropertySelector) -> UInt32? {
     var address = AudioObjectPropertyAddress(
         mSelector: AudioObjectPropertySelector(selector),
         mScope: kAudioObjectPropertyScopeGlobal,
@@ -679,7 +712,7 @@ private func readUInt32(_ objectID: AudioObjectID, selector: UInt32) -> UInt32? 
 
 private func readPID(_ objectID: AudioObjectID) -> pid_t? {
     var address = AudioObjectPropertyAddress(
-        mSelector: AudioObjectPropertySelector(fourCC("pid ")),
+        mSelector: kAudioProcessPropertyPID,
         mScope: kAudioObjectPropertyScopeGlobal,
         mElement: kAudioObjectPropertyElementMain
     )
@@ -709,15 +742,21 @@ private func processName(_ pid: pid_t) -> String {
 }
 
 private func audioInputs() -> (items: [[String: Any]], available: Bool) {
+    // macOS 14.2+: process objects, then whether each one is recording.
+    // An empty list is a successful answer (nobody is using the microphone),
+    // not a failed probe. A failed property read is the unavailable case.
     var address = AudioObjectPropertyAddress(
-        mSelector: AudioObjectPropertySelector(fourCC("prs#")),
+        mSelector: kAudioHardwarePropertyProcessObjectList,
         mScope: kAudioObjectPropertyScopeGlobal,
         mElement: kAudioObjectPropertyElementMain
     )
     var size: UInt32 = 0
     let system = AudioObjectID(kAudioObjectSystemObject)
-    if AudioObjectGetPropertyDataSize(system, &address, 0, nil, &size) != noErr || size == 0 {
+    if AudioObjectGetPropertyDataSize(system, &address, 0, nil, &size) != noErr {
         return ([], false)
+    }
+    if size == 0 {
+        return ([], true)
     }
     let count = Int(size) / MemoryLayout<AudioObjectID>.size
     var identifiers = [AudioObjectID](repeating: 0, count: max(count, 1))
@@ -725,24 +764,31 @@ private func audioInputs() -> (items: [[String: Any]], available: Bool) {
         return ([], false)
     }
     var items: [[String: Any]] = []
-    var sawProperty = false
+    var sawInputProperty = false
     for identifier in identifiers {
-        let running = readUInt32(identifier, selector: fourCC("runi"))
-        if running != nil {
-            sawProperty = true
+        let running = readUInt32(identifier, selector: kAudioProcessPropertyIsRunningInput)
+        if running == nil {
+            continue
         }
-        guard running == 1, let pid = readPID(identifier), pid > 0 else {
+        sawInputProperty = true
+        guard running != 0, let pid = readPID(identifier), pid > 0 else {
             continue
         }
         let app = NSRunningApplication(processIdentifier: pid)
+        let bundle = readObjectString(identifier, selector: kAudioProcessPropertyBundleID)
+            ?? app?.bundleIdentifier
+            ?? ""
         items.append([
             "name": processName(pid),
-            "bundle_id": app?.bundleIdentifier ?? "",
+            "bundle_id": bundle,
             "pid": Int(pid),
             "input_running": true,
         ])
     }
-    return (items, sawProperty)
+    if !sawInputProperty {
+        return ([], false)
+    }
+    return (items, true)
 }
 
 private func probe() {

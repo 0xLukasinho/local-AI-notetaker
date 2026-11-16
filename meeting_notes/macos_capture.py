@@ -159,8 +159,10 @@ def mic_status_from_probe(payload, marker):
             (),
             notice=(
                 "Core Audio did not report which app is using the microphone. "
-                "Call detection cannot see Chrome or Slack until it can."
+                "Google Meet will be detected from the Chrome window title alone. "
+                "Slack Huddles wait until the microphone probe works."
             ),
+            available=False,
         )
     in_use = False
     for item in payload.get("inputs") or []:
