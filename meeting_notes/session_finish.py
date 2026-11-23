@@ -203,6 +203,9 @@ def finish_folder(
             folder,
             {
                 "state": STATE_TRANSCRIBING,
+                # Whoever transcribes owns the folder, so a watcher restart
+                # does not start a second transcription of it.
+                "pid": os.getpid(),
                 "transcription_started_at": iso_now(),
                 "whisper_model": whisper_model,
                 "language": language,
@@ -335,7 +338,7 @@ def unfinished_folders(output_dir, skip_folder=None):
         if skip and os.path.abspath(folder) == skip:
             continue
         status = read_status(folder) or {}
-        if status.get("state") == "recording":
+        if status.get("state") in ("recording", "transcribing"):
             from meeting_notes.session import pid_alive
 
             if pid_alive(status.get("pid")):

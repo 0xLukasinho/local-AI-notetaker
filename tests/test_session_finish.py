@@ -9,6 +9,21 @@ from meeting_notes.session_finish import finish_folder, transcript_ready
 from meeting_notes.watcher import MeetWatcher, RunningSession
 
 
+class _Done:
+    def poll(self):
+        return 0
+
+
+def _inline_resumer(config, deliver_fn):
+    """Stand-in for the background `process` child: finish the folder in-process."""
+
+    def resume(folder):
+        finish_folder(folder, config, deliver_fn=deliver_fn)
+        return _Done()
+
+    return resume
+
+
 class _Clock:
     def __init__(self):
         self.t = 0.0
@@ -152,6 +167,7 @@ def test_stopped_watcher_session_transcribes_summarizes_and_delivers_when_the_ch
         ),
         output_dir=str(tmp_path),
         log=_Log(),
+        resumer=_inline_resumer(config, deliver),
     )
     watcher.run(max_ticks=4)
 
@@ -208,8 +224,11 @@ def test_watcher_resumes_a_folder_with_audio_and_no_transcript(tmp_path, monkeyp
         ),
         output_dir=str(tmp_path),
         log=_Log(),
+        resumer=_inline_resumer(
+            _config(), lambda path: delivered.append(path) or True
+        ),
     )
-    watcher.run(max_ticks=0)
+    watcher.run(max_ticks=1)
     assert transcript_ready(str(folder))
     assert "resumed" in (folder / "notes.md").read_text(encoding="utf-8")
     assert not (folder / "audio.wav").exists()

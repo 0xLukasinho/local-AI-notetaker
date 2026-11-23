@@ -223,7 +223,64 @@ def _log_ensure(log, reason, result):
     log.info("launchd ensure (%s): %s", reason, message)
 
 
-def supervise(control_dir, ensure=None, wait_for_session=None, log=None, max_events=None):
+WATCHDOG_INTERVAL_SECONDS = 30.0
+
+
+def watcher_needs_start(control_dir, now=None):
+    """True when no watcher is running. Quiet: writes no log and kills nothing."""
+    import time
+
+    from meeting_notes.session import pid_alive
+    from meeting_notes.watch_guard import (
+        decide,
+        lock_is_held,
+        read_heartbeat,
+        read_instance,
+        read_watcher_recording,
+    )
+
+    current = time.time() if now is None else float(now)
+    decision = decide(
+        read_instance(control_dir),
+        read_heartbeat(control_dir),
+        current,
+        pid_alive,
+        lock_is_held(control_dir),
+        active_session=read_watcher_recording(control_dir, is_alive=pid_alive),
+    )
+    return decision.action == "start"
+
+
+def start_watchdog(control_dir, ensure, log, interval=WATCHDOG_INTERVAL_SECONDS, needs_start=None, sleep=None):
+    """Restart a dead watcher within ~``interval`` s, with no wake or unlock event.
+
+    Returns a function that stops the watchdog thread.
+    """
+    import threading
+    import time
+
+    needs = needs_start or (lambda: watcher_needs_start(control_dir))
+    stop = threading.Event()
+    nap = sleep or stop.wait
+
+    def _loop():
+        while not stop.is_set():
+            nap(interval)
+            if stop.is_set():
+                break
+            try:
+                if needs():
+                    log.warning("watchdog: no watcher is running; starting one")
+                    _log_ensure(log, "watchdog", ensure("launchd watchdog"))
+            except Exception:
+                log.exception("watchdog check failed")
+
+    thread = threading.Thread(target=_loop, name="watcher-watchdog", daemon=True)
+    thread.start()
+    return stop.set
+
+
+def supervise(control_dir, ensure=None, wait_for_session=None, log=None, max_events=None, watchdog_interval=WATCHDOG_INTERVAL_SECONDS):
     """Run ensure at login, then again on every wake and unlock.
 
     ``ensure`` is ``watch --ensure``. That is what restarts a crashed or
@@ -242,6 +299,7 @@ def supervise(control_dir, ensure=None, wait_for_session=None, log=None, max_eve
 
     log.info("launchd supervisor started: login")
     _log_ensure(log, "login", ensure("launchd login"))
+    stop_watchdog = start_watchdog(control_dir, ensure, log, interval=watchdog_interval)
     seen = 0
     while max_events is None or seen < max_events:
         event = (wait_for_session or wait_for_session_event)()
@@ -250,4 +308,5 @@ def supervise(control_dir, ensure=None, wait_for_session=None, log=None, max_eve
             continue
         log.info("launchd session event: %s", event)
         _log_ensure(log, event, ensure("launchd %s" % event))
+    stop_watchdog()
     return seen

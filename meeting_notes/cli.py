@@ -378,6 +378,17 @@ def _resolve_folder(folder):
     return os.path.join(OUTPUT_DIR, folder)
 
 
+def _lower_priority(increment=10):
+    """Best-effort nice for the transcription phase (POSIX only)."""
+    nice = getattr(os, "nice", None)
+    if nice is None:
+        return
+    try:
+        nice(increment)
+    except OSError:
+        pass
+
+
 def cmd_start(args):
     """Handle the 'start' command: record, transcribe, summarize."""
     config = _load_config_lenient()
@@ -488,6 +499,11 @@ def cmd_start(args):
         from meeting_notes.session_finish import SessionFinishError, finish_folder
         from meeting_notes.transcriber import transcribe_paths
 
+        # Recording is over. Free the session lock so the watcher can record
+        # the next call while this one transcribes, and drop priority so the
+        # transcription does not starve that new recording.
+        clear_active(CONTROL_DIR, pid=os.getpid())
+        _lower_priority()
         try:
             result = finish_folder(
                 meeting_dir,
