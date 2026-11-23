@@ -106,10 +106,20 @@ def write_transcript(folder, config, whisper_model, language, transcribe_plain=N
     """Write transcript.txt. Returns the text. Does not delete audio."""
     from meeting_notes.atomic_io import atomic_write_json, atomic_write_text
     from meeting_notes.speakers import TRANSCRIPT_JSON, produce_transcript
-    from meeting_notes.transcriber import transcribe, transcribe_paths as default_paths
+    from meeting_notes.transcriber import (
+        DEFAULT_VOCABULARY,
+        configure,
+        transcribe,
+        transcribe_paths as default_paths,
+        vocabulary_prompt,
+    )
 
     model = whisper_model or getattr(config, "whisper_model", None) or "medium"
     lang = language or getattr(config, "language", None) or "en"
+    configure(
+        initial_prompt=vocabulary_prompt(getattr(config, "whisper_vocabulary", DEFAULT_VOCABULARY)),
+        device=getattr(config, "whisper_device", None) or None,
+    )
 
     def plain(path):
         if transcribe_plain is not None:
@@ -126,7 +136,57 @@ def write_transcript(folder, config, whisper_model, language, transcribe_plain=N
             word_timestamps=True,
         )
 
-    text, document = produce_transcript(
+    serial = bool(getattr(config, "serial_transcription", False))
+    with _transcription_slot(serial):
+        text, document = _produce(folder, config, plain, many, produce_transcript)
+    return _write_outputs(folder, text, document, TRANSCRIPT_JSON, atomic_write_text, atomic_write_json)
+
+
+def _transcription_slot(enabled):
+    """One Whisper run at a time on this machine when `enabled`.
+
+    Parallel CPU runs of the medium model each take every core, so three at
+    once finish later than three in a row. The lock lives in the control
+    directory and is released if the process dies.
+    """
+    import contextlib
+
+    if not enabled:
+        return contextlib.nullcontext()
+    try:
+        import fcntl
+    except ImportError:  # Windows
+        return contextlib.nullcontext()
+    from meeting_notes.config import default_control_dir
+
+    @contextlib.contextmanager
+    def slot():
+        handle = None
+        try:
+            directory = default_control_dir()
+            os.makedirs(directory, exist_ok=True)
+            handle = open(os.path.join(directory, "transcribe.lock"), "a+")
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                print("Waiting for another transcription to finish...", flush=True)
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        except OSError:
+            pass  # never block transcription on the lock itself
+        try:
+            yield
+        finally:
+            if handle is not None:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                finally:
+                    handle.close()
+
+    return slot()
+
+
+def _produce(folder, config, plain, many, produce_transcript):
+    return produce_transcript(
         folder,
         self_name=getattr(config, "self_name", "You"),
         enabled=bool(getattr(config, "speaker_labels", True)),
@@ -137,6 +197,9 @@ def write_transcript(folder, config, whisper_model, language, transcribe_plain=N
         diarize_max_speakers=int(getattr(config, "diarize_max_speakers", 8) or 8),
         hf_token=getattr(config, "hf_token", "") or "",
     )
+
+
+def _write_outputs(folder, text, document, TRANSCRIPT_JSON, atomic_write_text, atomic_write_json):
     atomic_write_text(transcript_path(folder), text if text is not None else "")
     if document is not None:
         atomic_write_json(os.path.join(folder, TRANSCRIPT_JSON), document)

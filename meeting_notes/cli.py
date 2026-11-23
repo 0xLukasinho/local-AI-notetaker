@@ -253,10 +253,25 @@ def _stop_speaker_bridge(bridge):
         pass
 
 
+def _configure_whisper(config):
+    """Apply config whisper_vocabulary / whisper_device to the transcriber."""
+    from meeting_notes.transcriber import DEFAULT_VOCABULARY, configure, vocabulary_prompt
+
+    configure(
+        initial_prompt=vocabulary_prompt(
+            getattr(config, "whisper_vocabulary", DEFAULT_VOCABULARY)
+        ),
+        device=getattr(config, "whisper_device", None) or None,
+    )
+
+
 def _write_transcript(meeting_dir, config, whisper_model, language):
     """Transcribe and, when speaker labels are possible, name each line."""
+    from meeting_notes.session_finish import _transcription_slot
     from meeting_notes.speakers import TRANSCRIPT_JSON, produce_transcript
     from meeting_notes.transcriber import transcribe_paths
+
+    _configure_whisper(config)
 
     def plain(path):
         return transcribe(path, model_size=whisper_model, language=language)
@@ -269,7 +284,13 @@ def _write_transcript(meeting_dir, config, whisper_model, language):
             word_timestamps=True,
         )
 
-    text, document = produce_transcript(
+    with _transcription_slot(bool(getattr(config, "serial_transcription", False))):
+        text, document = _produce_labeled(meeting_dir, config, plain, many, produce_transcript)
+    return _finish_written_transcript(meeting_dir, text, document, TRANSCRIPT_JSON)
+
+
+def _produce_labeled(meeting_dir, config, plain, many, produce_transcript):
+    return produce_transcript(
         meeting_dir,
         self_name=getattr(config, "self_name", "You"),
         enabled=bool(getattr(config, "speaker_labels", True)),
@@ -280,6 +301,9 @@ def _write_transcript(meeting_dir, config, whisper_model, language):
         diarize_max_speakers=int(getattr(config, "diarize_max_speakers", 8) or 8),
         hf_token=getattr(config, "hf_token", "") or "",
     )
+
+
+def _finish_written_transcript(meeting_dir, text, document, TRANSCRIPT_JSON):
     atomic_write_text(session_transcript_path(meeting_dir), text)
     if document is not None:
         atomic_write_json(os.path.join(meeting_dir, TRANSCRIPT_JSON), document)

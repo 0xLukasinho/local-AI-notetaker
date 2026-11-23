@@ -54,6 +54,17 @@ class Config:
     watch_google_meet: bool = True
     watch_slack_huddle: bool = True
     whisper_model: str = "medium"
+    # auto (CUDA if usable, else CPU int8), cpu, cuda, or mps (experimental
+    # CTranslate2 Metal backend on Apple Silicon; falls back to CPU on error).
+    whisper_device: str = "auto"
+    # Spelling hint passed to Whisper as initial_prompt. Empty turns it off.
+    whisper_vocabulary: str = (
+        "Greek, greek.fi, Bebop, Base, Base Batches, Coinbase, Coinbase Ventures, "
+        "Uniswap, PancakeSwap, Aerodrome, Kyber, Zircuit, Katana, ERC-20, RFQ, DeFi, "
+        "onchain, options, strike, expiry, collateral, Cyfrin, Quantstamp, Bailsec."
+    )
+    # One Whisper run at a time; later sessions wait their turn.
+    serial_transcription: bool = True
     language: str = "en"
     transcribe_timeout_seconds: float = 3 * 60 * 60
     delivery_attempts: int = 3
@@ -112,6 +123,7 @@ _BOOL_FIELDS = {
     "watch_google_meet",
     "watch_slack_huddle",
     "watcher_health_ping",
+    "serial_transcription",
 }
 _DIARIZE_BACKENDS = {"auto", "builtin", "speechbrain", "resemblyzer", "pyannote", "off"}
 _KNOWN = {item.name for item in fields(Config)}

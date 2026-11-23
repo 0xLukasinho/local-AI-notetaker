@@ -28,6 +28,15 @@ from difflib import SequenceMatcher
 
 THEM = "Them"
 REMOTE = "Remote"
+# Used when the system-audio track was recorded but is digital silence (every
+# sample is 0). The microphone then also hears remote voices from the
+# speakers, so its lines cannot be attributed to self_name.
+UNATTRIBUTED = "Unattributed"
+MIC_ONLY_WARNING = (
+    "System audio was not captured (audio-others.wav is digital silence). "
+    "All lines come from the microphone, which also picks up remote voices "
+    "from the speakers, so they are labeled Unattributed instead of self_name."
+)
 TRANSCRIPT_JSON = "transcript.json"
 SPEAKER_LOG = "speakers.jsonl"
 SELF_TRACK = "audio-self.wav"
@@ -149,6 +158,27 @@ def track_has_speech(path, threshold=SILENT_TRACK_RMS):
     if rms is None:
         return True
     return rms >= threshold
+
+
+def track_is_digital_silence(path):
+    """True when `path` is a readable 16-bit WAV whose samples are all 0.
+
+    A Core Audio process tap without the System Audio Recording grant writes
+    exact zeros. Real loopback audio, even a quiet call, has non-zero samples.
+    False on any read problem, an empty file, or another sample format.
+    """
+    try:
+        with wave.open(str(path), "rb") as handle:
+            if handle.getsampwidth() != 2 or handle.getnframes() == 0:
+                return False
+            while True:
+                raw = handle.readframes(160000)
+                if not raw:
+                    return True
+                if raw.count(0) != len(raw):
+                    return False
+    except (OSError, wave.Error, EOFError):
+        return False
 
 
 def _unique(items):
@@ -1337,6 +1367,13 @@ def produce_transcript(
     self_label = choose_self_label(self_name, events)
     self_path = _existing_track(folder, SELF_TRACK)
     others_path = _existing_track(folder, OTHERS_TRACK)
+    others_raw = os.path.join(folder, OTHERS_TRACK)
+    remote_capture_failed = bool(
+        self_path
+        and not others_path
+        and os.path.isfile(others_raw)
+        and track_is_digital_silence(others_raw)
+    )
 
     if self_path or others_path:
         paths = []
@@ -1371,7 +1408,15 @@ def produce_transcript(
         source = classify_source(
             labeled, events, used_tracks=True, used_mix=False, self_label=self_label
         )
+        if remote_capture_failed:
+            for segment in labeled:
+                if segment.get("speaker") in (self_label, "", None):
+                    segment["speaker"] = UNATTRIBUTED
+            source = "mic-only"
         document = build_document(labeled, events, self_label, source, diarization=diarization)
+        if remote_capture_failed:
+            document["warning"] = MIC_ONLY_WARNING
+            print("Warning: " + MIC_ONLY_WARNING, file=sys.stderr)
         return render_transcript(labeled, labeled=True), document
 
     if events:

@@ -64,6 +64,13 @@ watch_slack_huddle = true
 # Whisper settings for sessions started by the watcher.
 whisper_model = "medium"
 language = "en"
+# auto (CUDA if usable, else CPU int8), cpu, cuda, or mps (experimental
+# Metal backend on Apple Silicon; falls back to CPU on error).
+whisper_device = "auto"
+# Spelling hint passed to Whisper. Empty turns it off.
+# whisper_vocabulary = "Greek, Bebop, Base Batches, Uniswap, ..."
+# Run one Whisper transcription at a time; later sessions wait their turn.
+serial_transcription = true
 
 # Name the microphone track with this label. The default "You" is replaced
 # by your Google Meet display name when the Chrome extension reports it.

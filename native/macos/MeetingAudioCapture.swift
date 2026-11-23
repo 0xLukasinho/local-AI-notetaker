@@ -44,6 +44,55 @@ private func logLine(_ text: String) {
     fflush(stderr)
 }
 
+// MARK: - System audio permission
+//
+// A Core Audio process tap is created even when "System Audio Recording" was
+// never granted to this app. macOS then feeds it digital silence, so the
+// others track is all zeros and every line is labeled as the microphone
+// owner. TCC is a private framework; the check is best effort and returns
+// "unknown" when it cannot be loaded.
+
+private typealias TCCPreflightFunction = @convention(c) (CFString, CFDictionary?) -> Int
+private typealias TCCRequestFunction = @convention(c) (CFString, CFDictionary?, @escaping (Bool) -> Void) -> Void
+
+private let tccHandle: UnsafeMutableRawPointer? = dlopen(
+    "/System/Library/PrivateFrameworks/TCC.framework/Versions/A/TCC",
+    RTLD_NOW
+)
+
+/// "granted", "denied", or "unknown" (never asked, or the check is unavailable).
+private func systemAudioPermission() -> String {
+    guard let handle = tccHandle, let symbol = dlsym(handle, "TCCAccessPreflight") else {
+        return "unknown"
+    }
+    let preflight = unsafeBitCast(symbol, to: TCCPreflightFunction.self)
+    switch preflight("kTCCServiceAudioCapture" as CFString, nil) {
+    case 0:
+        return "granted"
+    case 1:
+        return "denied"
+    default:
+        return "unknown"
+    }
+}
+
+private func requestSystemAudioPermission() -> Bool {
+    guard let handle = tccHandle, let symbol = dlsym(handle, "TCCAccessRequest") else {
+        return false
+    }
+    let request = unsafeBitCast(symbol, to: TCCRequestFunction.self)
+    let semaphore = DispatchSemaphore(value: 0)
+    let result = StopFlag()
+    request("kTCCServiceAudioCapture" as CFString, nil) { granted in
+        if granted {
+            result.stop()
+        }
+        semaphore.signal()
+    }
+    _ = semaphore.wait(timeout: .now() + 120)
+    return result.isSet()
+}
+
 // MARK: - Stop flag
 
 final class StopFlag: @unchecked Sendable {
@@ -293,6 +342,18 @@ final class SystemCapture: @unchecked Sendable {
     var stream: SCStream?
     var keepAlive: AnyObject?
     let backend: String
+    // Set once any non-zero sample arrives. A tap without the System Audio
+    // Recording grant only ever delivers exact zeros.
+    let signalSeen = StopFlag()
+
+    private func noteSignal(_ samples: [Float]) {
+        if signalSeen.isSet() {
+            return
+        }
+        if samples.contains(where: { $0 != 0 }) {
+            signalSeen.stop()
+        }
+    }
 
     init(mix: MixBuffer, backend: String) {
         self.mix = mix
@@ -301,6 +362,7 @@ final class SystemCapture: @unchecked Sendable {
 
     func consume(bufferList: UnsafePointer<AudioBufferList>) {
         let samples = floatsFromBufferList(bufferList, format: format)
+        noteSignal(samples)
         resamplerLock.lock()
         let converted = resampler.process(samples)
         resamplerLock.unlock()
@@ -336,6 +398,7 @@ final class SystemCapture: @unchecked Sendable {
         let pointer = audio.mBuffers.mData!.bindMemory(to: Float.self, capacity: max(count, 1))
         let channels = max(1, Int(audio.mBuffers.mNumberChannels))
         let mono = monoFloats(pointer: pointer, count: count, channels: channels)
+        noteSignal(mono)
         resamplerLock.lock()
         if asbd.mSampleRate > 0 && abs(asbd.mSampleRate - sourceRate) > 1 {
             sourceRate = asbd.mSampleRate
@@ -663,12 +726,27 @@ private func record(outputPath: String, selfPath: String?, othersPath: String?) 
 
     let mix = MixBuffer()
     var system: SystemCapture?
-    if #available(macOS 14.2, *) {
-        system = startProcessTap(mix: mix)
-    } else {
-        logLine("capture: process taps need macOS 14.2 or newer")
+    // MEETING_NOTES_SYSTEM_AUDIO: auto (default), tap, or screencapturekit.
+    // auto uses the process tap only when System Audio Recording is granted;
+    // otherwise ScreenCaptureKit first and the tap as the last resort.
+    let preference = (ProcessInfo.processInfo.environment["MEETING_NOTES_SYSTEM_AUDIO"] ?? "auto")
+        .trimmingCharacters(in: .whitespaces).lowercased()
+    let permission = systemAudioPermission()
+    logLine("capture: system audio permission \(permission)")
+    let preferScreen = preference == "screencapturekit" || preference == "sck"
+        || (preference != "tap" && permission != "granted")
+    if preferScreen {
+        logLine("capture: using ScreenCaptureKit for system audio (process tap needs System Audio Recording)")
+        system = startScreenCapture(mix: mix)
     }
     if system == nil {
+        if #available(macOS 14.2, *) {
+            system = startProcessTap(mix: mix)
+        } else {
+            logLine("capture: process taps need macOS 14.2 or newer")
+        }
+    }
+    if system == nil && !preferScreen {
         logLine("capture: trying ScreenCaptureKit for system audio")
         system = startScreenCapture(mix: mix)
     }
@@ -706,8 +784,26 @@ private func record(outputPath: String, selfPath: String?, othersPath: String?) 
         logLine("capture: writing separate tracks audio-self.wav and audio-others.wav")
     }
     let frameCount = 1600
+    let silenceLimit = 150  // 15 s of 0.1 s steps
+    var steps = 0
+    var silenceChecked = false
     while !flag.isSet() {
         Thread.sleep(forTimeInterval: 0.1)
+        steps += 1
+        if !silenceChecked && steps >= silenceLimit {
+            silenceChecked = true
+            if let current = system, current.backend == "coreaudio-tap", !current.signalSeen.isSet() {
+                logLine("capture: process tap delivered only digital silence for 15 s; switching to ScreenCaptureKit")
+                stopSystem(current)
+                system = nil
+                if let screen = startScreenCapture(mix: mix) {
+                    system = screen
+                } else if #available(macOS 14.2, *) {
+                    logLine("capture: ScreenCaptureKit failed; keeping the process tap")
+                    system = startProcessTap(mix: mix)
+                }
+            }
+        }
         let taken = mix.take(frames: frameCount)
         var mixedSamples = [Float]()
         mixedSamples.reserveCapacity(frameCount)
@@ -830,7 +926,15 @@ private func reportPermissions(request: Bool) {
     if request && !granted {
         granted = CGRequestScreenCaptureAccess()
     }
-    let payload: [String: Any] = ["screen_recording": granted, "app": "Meeting Audio Capture"]
+    var audio = systemAudioPermission()
+    if request && audio != "granted" {
+        audio = requestSystemAudioPermission() ? "granted" : systemAudioPermission()
+    }
+    let payload: [String: Any] = [
+        "screen_recording": granted,
+        "system_audio": audio,
+        "app": "Meeting Audio Capture",
+    ]
     if let data = try? JSONSerialization.data(withJSONObject: payload) {
         FileHandle.standardOutput.write(data)
     } else {
