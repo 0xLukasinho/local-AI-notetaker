@@ -366,6 +366,9 @@ def test_uninstall_removes_task_xml_and_startup_script(tmp_path):
 
 
 def test_watch_status_and_linux_guards(tmp_path, monkeypatch, capsys):
+    # The guards are for Linux. On a Mac this test used to run the real
+    # macOS install and rewrite the live LaunchAgent.
+    monkeypatch.setattr(cli.sys, "platform", "linux")
     monkeypatch.setattr(cli, "CONTROL_DIR", str(tmp_path))
     cli.cmd_watch(cli.build_parser().parse_args(["watch", "--status"]))
     out = capsys.readouterr().out
