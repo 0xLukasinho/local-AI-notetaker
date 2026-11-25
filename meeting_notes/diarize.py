@@ -6,6 +6,12 @@ diarization API. It turns that WAV into time ranges tagged with a cluster id
 
 Backends, first match wins when `backend` is `auto`:
 
+- `sherpa` — pyannote segmentation 3.0 + WeSpeaker ResNet34 speaker
+  embeddings, run through sherpa-onnx (ONNX Runtime, CPU, no token, no
+  PyTorch). Models live in `~/.meeting-notes/models` and are fetched once
+  by `scripts/install_macos.sh` / `meeting-notes models --download`. This
+  backend also returns one embedding per voice, which the voice-profile
+  store uses to recognise recurring people.
 - `pyannote` — only if that package is installed and a Hugging Face token is
   set (`hf_token`, or `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN`). The model is
   gated; the first run downloads it.
@@ -34,11 +40,12 @@ _FAR_DISTANCE = 0.55
 _DIRECT_CLUSTER_LIMIT = 280
 
 
-def diarize_wav(path, backend="auto", hf_token="", max_speakers=8):
-    """Return `{backend, segments, reason}`.
+def diarize_wav(path, backend="auto", hf_token="", max_speakers=8, models_dir=None):
+    """Return `{backend, segments, reason}` (and `embeddings` from sherpa).
 
     `segments` is a list of `{start, end, cluster}`. Empty segments means the
     caller should not trust a voice split. `backend` is None in that case.
+    `embeddings` maps cluster id -> L2-normalised voice vector (list of float).
     """
     requested = (backend or "auto").strip().lower()
     if requested in ("off", "none", "disabled", "false"):
@@ -54,13 +61,24 @@ def diarize_wav(path, backend="auto", hf_token="", max_speakers=8):
     reasons = []
     for name in order:
         try:
-            segments = _run_backend(name, path, token, cap)
+            if name == "sherpa":
+                segments, embeddings = _sherpa_segments(path, cap, models_dir)
+            else:
+                segments, embeddings = _run_backend(name, path, token, cap), {}
         except Exception as exc:
             reasons.append(_safe_reason(name, exc, token))
             continue
-        cleaned = _clean_segments(segments)
+        renames = {}
+        cleaned = _clean_segments(segments, renames)
         if cleaned:
-            return {"backend": name, "segments": cleaned, "reason": ""}
+            result = {"backend": name, "segments": cleaned, "reason": ""}
+            if embeddings:
+                result["embeddings"] = {
+                    renames[str(old)]: vector
+                    for old, vector in embeddings.items()
+                    if str(old) in renames
+                }
+            return result
         reasons.append(f"{name} found no distinct voiced ranges")
     if not reasons:
         reasons.append("no diarization backend available")
@@ -113,11 +131,13 @@ def cluster_windows(windows, max_speakers=8):
 def _backend_order(requested, token):
     if requested == "auto":
         order = []
+        if sherpa_available():
+            order.append("sherpa")
         if token:
             order.append("pyannote")
         order.extend(["speechbrain", "resemblyzer", "builtin"])
         return order
-    if requested in ("pyannote", "speechbrain", "resemblyzer", "builtin"):
+    if requested in ("sherpa", "pyannote", "speechbrain", "resemblyzer", "builtin"):
         return [requested]
     return ["builtin"]
 
@@ -151,7 +171,7 @@ def _safe_reason(name, exc, token):
     return f"{name} failed ({text})"
 
 
-def _clean_segments(segments):
+def _clean_segments(segments, renames=None):
     cleaned = []
     if not segments:
         return cleaned
@@ -168,15 +188,17 @@ def _clean_segments(segments):
             continue
         cleaned.append({"start": start, "end": end, "cluster": cluster})
     cleaned.sort(key=lambda item: (item["start"], item["end"], item["cluster"]))
-    return _renumber(cleaned)
+    return _renumber(cleaned, renames)
 
 
-def _renumber(segments):
+def _renumber(segments, renames=None):
     order = []
     for segment in segments:
         if segment["cluster"] not in order:
             order.append(segment["cluster"])
     mapping = {old: str(index) for index, old in enumerate(order)}
+    if renames is not None:
+        renames.update(mapping)
     for segment in segments:
         segment["cluster"] = mapping[segment["cluster"]]
     return segments
@@ -644,3 +666,276 @@ def _pyannote_segments(path, token, max_speakers):
             {"start": float(turn.start), "end": float(turn.end), "cluster": str(speaker)}
         )
     return segments
+
+
+# --- sherpa-onnx backend -------------------------------------------------
+
+SEGMENTATION_MODEL = "sherpa-onnx-pyannote-segmentation-3-0/model.onnx"
+EMBEDDING_MODEL = "wespeaker_en_voxceleb_resnet34_LM.onnx"
+MODEL_URLS = {
+    "segmentation": (
+        "https://github.com/k2-fsa/sherpa-onnx/releases/download/"
+        "speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2"
+    ),
+    "embedding": (
+        "https://github.com/k2-fsa/sherpa-onnx/releases/download/"
+        "speaker-recongition-models/wespeaker_en_voxceleb_resnet34_LM.onnx"
+    ),
+}
+# Agglomerative clustering cut on cosine distance between voice embeddings.
+# Calibrated with tests/test_e2e_capture.py (distinct macOS voices) and real
+# calls: 0.5 kept one person as one cluster and separated different people.
+SHERPA_CLUSTER_THRESHOLD = 0.5
+# Seconds of audio per voice used for its profile embedding.
+PROFILE_SECONDS = 40.0
+
+
+def default_models_dir():
+    return os.path.join(os.path.expanduser("~/.meeting-notes"), "models")
+
+
+def model_paths(models_dir=None):
+    base = models_dir or default_models_dir()
+    return os.path.join(base, SEGMENTATION_MODEL), os.path.join(base, EMBEDDING_MODEL)
+
+
+def sherpa_available(models_dir=None):
+    try:
+        import importlib.util
+
+        if importlib.util.find_spec("sherpa_onnx") is None:
+            return False
+    except (ImportError, ValueError):
+        return False
+    segmentation, embedding = model_paths(models_dir)
+    return os.path.isfile(segmentation) and os.path.isfile(embedding)
+
+
+def download_models(models_dir=None, fetch=None):
+    """Fetch the two public ONNX models (no account or token). Idempotent."""
+    import tarfile
+    import tempfile
+    import urllib.request
+
+    base = models_dir or default_models_dir()
+    os.makedirs(base, exist_ok=True)
+    segmentation, embedding = model_paths(base)
+    fetch = fetch or urllib.request.urlretrieve
+    if not os.path.isfile(segmentation):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = os.path.join(tmp, "seg.tar.bz2")
+            fetch(MODEL_URLS["segmentation"], archive)
+            with tarfile.open(archive, "r:bz2") as tar:
+                for member in tar.getmembers():
+                    if member.name.startswith("/") or ".." in member.name.split("/"):
+                        raise RuntimeError("unsafe path in model archive")
+                tar.extractall(base)
+    if not os.path.isfile(embedding):
+        partial = embedding + ".part"
+        fetch(MODEL_URLS["embedding"], partial)
+        os.replace(partial, embedding)
+    return segmentation, embedding
+
+
+_SHERPA_CACHE = {}
+
+
+def _sherpa_engine(models_dir, threshold):
+    import sherpa_onnx
+
+    segmentation, embedding = model_paths(models_dir)
+    key = (segmentation, embedding, threshold)
+    if key in _SHERPA_CACHE:
+        return _SHERPA_CACHE[key]
+    threads = max(1, min(4, (os.cpu_count() or 2) // 2))
+    config = sherpa_onnx.OfflineSpeakerDiarizationConfig(
+        segmentation=sherpa_onnx.OfflineSpeakerSegmentationModelConfig(
+            pyannote=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(model=segmentation),
+            num_threads=threads,
+        ),
+        embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=embedding, num_threads=threads),
+        clustering=sherpa_onnx.FastClusteringConfig(num_clusters=-1, threshold=threshold),
+        min_duration_on=0.3,
+        min_duration_off=0.5,
+    )
+    if not config.validate():
+        raise RuntimeError("sherpa-onnx diarization config is invalid (models missing?)")
+    diarizer = sherpa_onnx.OfflineSpeakerDiarization(config)
+    extractor = sherpa_onnx.SpeakerEmbeddingExtractor(
+        sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=embedding, num_threads=threads)
+    )
+    _SHERPA_CACHE[key] = (diarizer, extractor)
+    return diarizer, extractor
+
+
+def voice_embedding(extractor, samples, sample_rate=16000):
+    """One L2-normalised embedding for a stretch of 16 kHz mono float audio."""
+    import numpy as np
+
+    stream = extractor.create_stream()
+    stream.accept_waveform(sample_rate, np.asarray(samples, dtype=np.float32))
+    stream.input_finished()
+    vector = np.asarray(extractor.compute(stream), dtype=np.float64)
+    norm = float(np.linalg.norm(vector))
+    if norm <= 0:
+        return []
+    return [float(value) for value in vector / norm]
+
+
+def _sherpa_segments(path, max_speakers, models_dir=None, threshold=None):
+    import numpy as np
+
+    if not sherpa_available(models_dir):
+        raise RuntimeError("sherpa-onnx or its models are not installed")
+    samples, rate = _read_wav_mono(path)
+    if samples.size < rate:  # under a second of audio
+        return [], {}
+    diarizer, extractor = _sherpa_engine(models_dir, threshold or SHERPA_CLUSTER_THRESHOLD)
+    audio = samples.astype(np.float32)
+    result = diarizer.process(audio).sort_by_start_time()
+    segments = []
+    for item in result:
+        segments.append(_segment(item.start, item.end, item.speaker))
+    del max_speakers  # threshold decides; distinct voices are never merged to fit
+    embeddings = {}
+    by_cluster = {}
+    for segment in segments:
+        by_cluster.setdefault(segment["cluster"], []).append(segment)
+    for cluster, items in by_cluster.items():
+        items = sorted(items, key=lambda seg: seg["end"] - seg["start"], reverse=True)
+        pieces = []
+        total = 0.0
+        for seg in items:
+            begin = int(seg["start"] * rate)
+            finish = int(seg["end"] * rate)
+            if finish - begin < int(0.5 * rate):
+                continue
+            pieces.append(audio[begin:finish])
+            total += (finish - begin) / float(rate)
+            if total >= PROFILE_SECONDS:
+                break
+        if pieces and total >= 1.5:
+            vector = voice_embedding(extractor, np.concatenate(pieces), rate)
+            if vector:
+                embeddings[cluster] = vector
+    return segments, embeddings
+
+
+# --- utterance-level clustering -----------------------------------------
+#
+# pyannote's 10 ms frames over-split turn-taking voices on a Meet mix. Whisper
+# already cut the remote track into utterances, so each utterance gets one
+# WeSpeaker embedding and utterances are grouped by average-linkage cosine
+# similarity. Same person across a call sits well above this; different
+# people (including similar synthetic voices in the e2e test) sit below it.
+UTTERANCE_SIMILARITY = 0.55
+MIN_UTTERANCE_SECONDS = 0.8
+MAX_UTTERANCE_SECONDS = 20.0
+
+
+def average_linkage(vectors, threshold=UTTERANCE_SIMILARITY):
+    """Group L2-normalised vectors; returns one integer label per vector."""
+    import numpy as np
+
+    count = len(vectors)
+    if count == 0:
+        return []
+    if count == 1:
+        return [0]
+    matrix = np.asarray(vectors, dtype=np.float64)
+    sims = matrix @ matrix.T
+    sizes = np.ones(count)
+    active = np.ones(count, dtype=bool)
+    members = {index: [index] for index in range(count)}
+    np.fill_diagonal(sims, -np.inf)
+    while active.sum() > 1:
+        masked = np.where(np.outer(active, active), sims, -np.inf)
+        flat = int(np.argmax(masked))
+        left, right = divmod(flat, count)
+        if masked[left, right] < threshold:
+            break
+        # Lance-Williams update for average linkage.
+        merged = (sims[left] * sizes[left] + sims[right] * sizes[right]) / (sizes[left] + sizes[right])
+        sims[left, :] = merged
+        sims[:, left] = merged
+        sims[left, left] = -np.inf
+        sizes[left] += sizes[right]
+        active[right] = False
+        sims[right, :] = -np.inf
+        sims[:, right] = -np.inf
+        members[left].extend(members.pop(right))
+    labels = [0] * count
+    order = sorted(members.values(), key=lambda group: min(group))
+    for label, group in enumerate(order):
+        for index in group:
+            labels[index] = label
+    return labels
+
+
+def diarize_utterances(path, spans, models_dir=None, threshold=UTTERANCE_SIMILARITY, extractor=None):
+    """Cluster Whisper utterances of the remote track into voices.
+
+    `spans` is a list of `(start, end)` seconds. Returns the same shape as
+    `diarize_wav`; utterances shorter than MIN_UTTERANCE_SECONDS take the
+    voice of the nearest longer utterance.
+    """
+    import numpy as np
+
+    clean = []
+    for item in spans or []:
+        try:
+            start, end = float(item[0]), float(item[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if end > start:
+            clean.append((start, end))
+    clean.sort()
+    if not clean:
+        return {"backend": None, "segments": [], "reason": "no remote utterances"}
+    if extractor is None:
+        if not sherpa_available(models_dir):
+            return {"backend": None, "segments": [], "reason": "sherpa-onnx or its models are not installed"}
+        _diarizer, extractor = _sherpa_engine(models_dir, SHERPA_CLUSTER_THRESHOLD)
+    samples, rate = _read_wav_mono(path)
+    audio = samples.astype(np.float32)
+    vectors = []
+    owners = []
+    for index, (start, end) in enumerate(clean):
+        if end - start < MIN_UTTERANCE_SECONDS:
+            continue
+        finish = min(end, start + MAX_UTTERANCE_SECONDS)
+        piece = audio[int(start * rate):int(finish * rate)]
+        if piece.size < int(MIN_UTTERANCE_SECONDS * rate):
+            continue
+        vector = voice_embedding(extractor, piece, rate)
+        if vector:
+            vectors.append(vector)
+            owners.append(index)
+    if not vectors:
+        return {"backend": None, "segments": [], "reason": "no utterance long enough to embed"}
+    labels = average_linkage(vectors, threshold)
+    label_of = dict(zip(owners, labels))
+    segments = []
+    for index, (start, end) in enumerate(clean):
+        label = label_of.get(index)
+        if label is None:
+            middle = (start + end) / 2.0
+            nearest = min(owners, key=lambda other: abs((clean[other][0] + clean[other][1]) / 2.0 - middle))
+            label = label_of[nearest]
+        segments.append(_segment(start, end, label))
+    embeddings = {}
+    matrix = np.asarray(vectors)
+    for label in sorted(set(labels)):
+        rows = matrix[[i for i, value in enumerate(labels) if value == label]]
+        mean = rows.mean(axis=0)
+        norm = float(np.linalg.norm(mean))
+        if norm > 0:
+            embeddings[str(label)] = [float(v) for v in mean / norm]
+    renames = {}
+    cleaned = _clean_segments(segments, renames)
+    return {
+        "backend": "sherpa-utterance",
+        "segments": cleaned,
+        "reason": "",
+        "embeddings": {renames[k]: v for k, v in embeddings.items() if k in renames},
+    }

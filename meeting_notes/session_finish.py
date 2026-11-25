@@ -196,7 +196,24 @@ def _produce(folder, config, plain, many, produce_transcript):
         diarize_backend=getattr(config, "diarize_backend", "auto"),
         diarize_max_speakers=int(getattr(config, "diarize_max_speakers", 8) or 8),
         hf_token=getattr(config, "hf_token", "") or "",
+        naming=naming_options(config),
     )
+
+
+def naming_options(config):
+    """What speaker naming needs from the config (no secrets are logged)."""
+    from meeting_notes.config import config_list
+
+    if not bool(getattr(config, "speaker_labels", True)):
+        return None
+    return {
+        "self_aliases": config_list(getattr(config, "self_aliases", "")),
+        "known_people": config_list(getattr(config, "known_people", "")),
+        "organizations": config_list(getattr(config, "organizations", "")),
+        "calendar": config,
+        "profiles_path": None if bool(getattr(config, "voice_profiles", True)) else False,
+        "update_profiles": bool(getattr(config, "voice_profiles", True)),
+    }
 
 
 def _write_outputs(folder, text, document, TRANSCRIPT_JSON, atomic_write_text, atomic_write_json):

@@ -79,13 +79,15 @@ class Config:
     self_name: str = "You"
     # Loopback port the Chrome extension posts Meet speaker samples to.
     speaker_bridge_port: int = 8765
-    # Off by default. Captions (then the active-speaker tile) name remote
-    # lines. True also splits the remote mix into voices locally. That path
-    # needs optional packages and is not part of the normal install.
-    diarize: bool = False
-    # auto uses pyannote when a token is set and that package is installed,
-    # then speechbrain, resemblyzer, then the built-in numpy clusterer.
-    # builtin, speechbrain, resemblyzer, pyannote, and off are explicit.
+    # Split the remote (system-audio) track into voices on this machine and
+    # name them (see speaker_naming.py). With sherpa-onnx and its models
+    # installed (scripts/install_macos.sh does this) every remote utterance
+    # gets a voice; without them the older caption/tile path is used.
+    diarize: bool = True
+    # auto: sherpa-onnx when installed, then pyannote when a token is set and
+    # that package is installed, then speechbrain, resemblyzer, then the
+    # built-in numpy clusterer. sherpa, builtin, speechbrain, resemblyzer,
+    # pyannote, and off are explicit.
     diarize_backend: str = "auto"
     # Hint for neural diarizers. Distant voices are not merged to fit this.
     diarize_max_speakers: int = 8
@@ -96,6 +98,27 @@ class Config:
     # after being down for more than 15 minutes on the same local day POSTs one
     # {"type": "watcher-health"} event. That body is not a transcript.
     watcher_health_ping: bool = False
+    # --- speaker naming (comma-separated lists; this TOML reader is flat) ---
+    # Other names you go by, so they are never given to a remote voice.
+    self_aliases: str = ""
+    # People you talk to often. Names here can be matched when someone is
+    # addressed by name, even with no calendar entry.
+    known_people: str = ""
+    # Company / product names that must never be read as a person in titles.
+    organizations: str = "Greek, greek.fi, Bebop, Base, Coinbase"
+    # Calendar attendees: a JSON events file (e.g. synced into Google Drive)
+    # and/or the private iCal URL. Both optional. The URL is a secret.
+    calendar_json_path: str = ""
+    calendar_ics_url: str = ""
+    # Remember voices of confirmed people in ~/.meeting-notes/voices.
+    voice_profiles: bool = True
+    # --- delivery / retention ---
+    # Also write the complete transcript (txt + json + sha256) here, e.g. a
+    # Google Drive synced folder. Empty turns it off.
+    transcript_archive_dir: str = ""
+    # Watcher sessions keep their audio until the transcript was delivered
+    # (or archived) and passed verification.
+    delete_audio_requires_delivery: bool = True
 
 
 _FLOAT_FIELDS = {
@@ -124,8 +147,10 @@ _BOOL_FIELDS = {
     "watch_slack_huddle",
     "watcher_health_ping",
     "serial_transcription",
+    "voice_profiles",
+    "delete_audio_requires_delivery",
 }
-_DIARIZE_BACKENDS = {"auto", "builtin", "speechbrain", "resemblyzer", "pyannote", "off"}
+_DIARIZE_BACKENDS = {"auto", "sherpa", "builtin", "speechbrain", "resemblyzer", "pyannote", "off"}
 _KNOWN = {item.name for item in fields(Config)}
 
 
@@ -300,3 +325,14 @@ def _apply_env(config, environ):
     token = str(token).strip()
     if token:
         config.hf_token = token
+
+
+def config_list(value):
+    """Comma-separated config string (or list) -> clean list of names."""
+    if not value:
+        return []
+    if isinstance(value, (list, tuple)):
+        items = value
+    else:
+        items = str(value).split(",")
+    return [" ".join(str(item).split()) for item in items if str(item).strip()]
