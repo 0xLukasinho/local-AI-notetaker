@@ -219,7 +219,15 @@ final class MixBuffer: @unchecked Sendable {
     private let lock = NSLock()
     private var microphone: [Float] = []
     private var system: [Float] = []
-    private let cap = 16000 * 8
+    // 60 s. The writer drains by available samples, so this only matters
+    // when the process is badly starved.
+    private let cap = 16000 * 60
+
+    func counts() -> (mic: Int, system: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (microphone.count, system.count)
+    }
 
     func pushMicrophone(_ samples: [Float]) {
         push(&microphone, samples)
@@ -479,7 +487,9 @@ private func startProcessTap(mix: MixBuffer) -> SystemCapture? {
     let description = CATapDescription(stereoGlobalTapButExcludeProcesses: [])
     description.name = "Meeting Notes System Audio"
     description.isPrivate = true
-    description.isExclusive = false
+    // Do not set isExclusive = false: with the "ButExcludeProcesses"
+    // initializer, exclusive means "tap everything except the list". false
+    // turns the empty list into an inclusion list and the tap hears nothing.
     description.muteBehavior = CATapMuteBehavior.unmuted
     if description.uuid.uuidString.isEmpty {
         description.uuid = UUID()
@@ -724,6 +734,13 @@ private func record(outputPath: String, selfPath: String?, othersPath: String?) 
         flag.stop()
     }
 
+    // Keep App Nap and background timer throttling off while recording; a
+    // throttled 0.1 s loop drops audio (recordings came out ~50% short).
+    let activity = ProcessInfo.processInfo.beginActivity(
+        options: [.userInitiated, .latencyCritical, .idleSystemSleepDisabled],
+        reason: "Recording meeting audio"
+    )
+    defer { ProcessInfo.processInfo.endActivity(activity) }
     let mix = MixBuffer()
     var system: SystemCapture?
     // MEETING_NOTES_SYSTEM_AUDIO: auto (default), tap, or screencapturekit.
@@ -804,10 +821,18 @@ private func record(outputPath: String, selfPath: String?, othersPath: String?) 
                 }
             }
         }
-        let taken = mix.take(frames: frameCount)
+        // Pace by the microphone clock (or system audio without a mic), not
+        // by the sleep: a throttled sleep used to drop half the audio.
+        let available = mix.counts()
+        let clock = engine != nil ? available.mic : available.system
+        let count = min(clock, frameCount * 50)
+        if count <= 0 {
+            continue
+        }
+        let taken = mix.take(frames: count)
         var mixedSamples = [Float]()
-        mixedSamples.reserveCapacity(frameCount)
-        for index in 0..<frameCount {
+        mixedSamples.reserveCapacity(count)
+        for index in 0..<count {
             mixedSamples.append(taken.mic[index] * 0.7 + taken.system[index])
         }
         writer.append(pcm(mixedSamples))

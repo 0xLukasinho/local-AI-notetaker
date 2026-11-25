@@ -68,6 +68,35 @@ def _track_paths(output_path):
     )
 
 
+TAPFIX_SHIM = os.path.expanduser("~/.meeting-notes/shim/libtapfix.dylib")
+
+
+class _TapfixEnv:
+    """Load the tap-fix shim into the already-authorized helper for `record`.
+
+    Helpers built before the isExclusive fix tap no process (digital silence).
+    The shim forces the global tap to stay exclusive without rebuilding, so
+    the helper keeps its code signature and its existing TCC grants.
+    MEETING_NOTES_TAPFIX=0 turns it off.
+    """
+
+    def __enter__(self):
+        self.previous = os.environ.get("DYLD_INSERT_LIBRARIES")
+        self.applied = (
+            os.environ.get("MEETING_NOTES_TAPFIX", "1") != "0"
+            and self.previous is None
+            and os.path.isfile(TAPFIX_SHIM)
+        )
+        if self.applied:
+            os.environ["DYLD_INSERT_LIBRARIES"] = TAPFIX_SHIM
+        return self
+
+    def __exit__(self, *exc):
+        if self.applied:
+            os.environ.pop("DYLD_INSERT_LIBRARIES", None)
+        return False
+
+
 def _start_helper(helper, output_path, device_index, separate_tracks=False):
     """Record with the Swift helper. If it exits immediately, use ffmpeg.
 
@@ -75,16 +104,17 @@ def _start_helper(helper, output_path, device_index, separate_tracks=False):
     AVFoundation input and cannot hear other applications, so it is only the
     fallback when the helper is missing or refuses to start.
     """
-    process = popen_responsible(
-        helper_record_argv(
-            helper,
-            output_path,
-            *(_track_paths(output_path) if separate_tracks else (None, None)),
-        ),
-        stdin=subprocess.PIPE,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-    )
+    with _TapfixEnv():
+        process = popen_responsible(
+            helper_record_argv(
+                helper,
+                output_path,
+                *(_track_paths(output_path) if separate_tracks else (None, None)),
+            ),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
     try:
         process.wait(timeout=0.6)
     except subprocess.TimeoutExpired:

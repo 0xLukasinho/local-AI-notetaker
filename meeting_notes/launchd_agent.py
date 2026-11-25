@@ -66,7 +66,7 @@ def render_plist(python, control_dir, label=LABEL):
         "  <key>LimitLoadToSessionType</key>\n"
         "  <string>Aqua</string>\n"
         "  <key>ProcessType</key>\n"
-        "  <string>Background</string>\n"
+        "  <string>Interactive</string>\n"
         "  <key>EnvironmentVariables</key>\n"
         "  <dict>\n"
         "    <key>PATH</key>\n"
