@@ -21,6 +21,7 @@ segments and speaker samples in.
 import array
 import json
 import os
+import re
 import sys
 import wave
 from difflib import SequenceMatcher
@@ -840,16 +841,57 @@ def _unnamed(speaker, self_label):
     return all(part in ("", THEM, REMOTE, self_label) for part in parts)
 
 
+ECHO_WINDOW_SECONDS = 3.0
+ECHO_MIN_WORDS = 4
+ECHO_COVERAGE = 0.9
+
+
+def _words(text):
+    return re.findall(r"[a-z0-9']+", clean_text(text).lower())
+
+
+def _is_echo_of(self_segment, remote_segment):
+    """True when the microphone line is near-verbatim speaker bleed of a remote line.
+
+    Bleed shows up at or after the remote line starts, and no later than a few
+    seconds after it ends. Nearly every word of the microphone line (in
+    order) must be in the remote line; a short or loosely similar reply is
+    kept.
+    """
+    try:
+        start = float(self_segment["start"])
+        r_start = float(remote_segment["start"])
+        r_end = float(remote_segment["end"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if start < r_start - 0.5 or start > r_end + ECHO_WINDOW_SECONDS:
+        return False
+    mine = _words(self_segment.get("text"))
+    theirs = _words(remote_segment.get("text"))
+    if len(mine) < ECHO_MIN_WORDS or not theirs:
+        return False
+    matched = sum(block.size for block in SequenceMatcher(None, mine, theirs, autojunk=False).get_matching_blocks())
+    return matched / len(mine) >= ECHO_COVERAGE
+
+
 def resolve_cross_talk(self_segments, remote_segments, self_label):
     """Drop a duplicate when the same words landed on both tracks.
 
-    A named remote line wins over the microphone copy (speaker bleed).
+    A named remote line wins over the microphone copy (speaker bleed), also
+    when the copy is a near-verbatim repeat that arrives within a few
+    seconds without overlapping it much (see `_is_echo_of`).
     An unnamed remote line loses to the microphone (sidetone / echo).
     """
     drop_self = set()
     drop_remote = set()
     for index, segment in enumerate(self_segments):
         for other_index, other in enumerate(remote_segments):
+            if (
+                not _unnamed(other.get("speaker"), self_label)
+                and _is_echo_of(segment, other)
+            ):
+                drop_self.add(index)
+                continue
             if _overlap_fraction(segment, other) < BLEED_OVERLAP:
                 continue
             if not _similar(segment.get("text"), other.get("text")):
@@ -1526,6 +1568,33 @@ def _voice_labels(voice_segments, events, self_label):
     return {label: cluster for cluster, label in names.items()}
 
 
+def record_session_roster(folder, events, self_label, status=None):
+    """Write who Meet showed and whether captions were on into status.json.
+
+    `meet_participants` is what the watcher knew when the recording started
+    (often only the local user); the live speakers.jsonl samples see everyone
+    who joined later. Returns the merged participant list.
+    """
+    if not events:
+        return list((status or {}).get("meet_participants") or [])
+    from meeting_notes.session import update_status
+
+    merged = []
+    for name in list((status or {}).get("meet_participants") or []) + remote_parties(events, self_label)[0]:
+        text = clean_name(name)
+        if text and text.casefold() not in {item.casefold() for item in merged}:
+            merged.append(text)
+    changes = {"meet_participants": merged}
+    captions = caption_status(events)
+    if captions in ("on", "off"):
+        changes["captions_enabled"] = captions == "on"
+    try:
+        update_status(folder, changes)
+    except OSError:
+        pass
+    return merged
+
+
 def apply_naming(folder, labeled, voice_segments, voice_embeddings, events, self_label, naming):
     """Replace "Speaker N" with names where the evidence supports it.
 
@@ -1545,6 +1614,7 @@ def apply_naming(folder, labeled, voice_segments, voice_embeddings, events, self
         except (OSError, ValueError):
             status = {}
     aliases = list(naming.get("self_aliases") or []) + [self_label]
+    status = dict(status, meet_participants=record_session_roster(folder, events, self_label, status))
     title = status.get("window_title") or ""
     title_roster = sn.names_from_window_title(title, aliases, naming.get("organizations") or ())
     calendar_entries, event_title = [], None

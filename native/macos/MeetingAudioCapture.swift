@@ -592,7 +592,27 @@ private final class ScreenAudioOutput: NSObject, SCStreamOutput {
     }
 }
 
+// MEETING_NOTES_SCREEN_CAPTURE=deny (set by the recorder when the signed
+// helper has no Screen & System Audio Recording grant): never call
+// startCapture(). Without the grant it cannot work and only shows the
+// "would like to record this computer's screen and audio" prompt.
+private func screenCaptureDenied() -> Bool {
+    let value = ProcessInfo.processInfo.environment["MEETING_NOTES_SCREEN_CAPTURE"] ?? ""
+    return value.trimmingCharacters(in: .whitespaces).lowercased() == "deny"
+}
+
+private func deviceAlive(_ id: AudioObjectID) -> Bool {
+    if id == kAudioObjectUnknown {
+        return true
+    }
+    return (readUInt32(id, selector: kAudioDevicePropertyDeviceIsAlive) ?? 0) != 0
+}
+
 private func startScreenCapture(mix: MixBuffer) -> SystemCapture? {
+    if screenCaptureDenied() {
+        logLine("capture: ScreenCaptureKit is not used (no Screen Recording grant for this helper)")
+        return nil
+    }
     if #available(macOS 13.0, *) {
         let semaphore = DispatchSemaphore(value: 0)
         let capture = SystemCapture(mix: mix, backend: "screencapturekit")
@@ -801,24 +821,30 @@ private func record(outputPath: String, selfPath: String?, othersPath: String?) 
         logLine("capture: writing separate tracks audio-self.wav and audio-others.wav")
     }
     let frameCount = 1600
-    let silenceLimit = 150  // 15 s of 0.1 s steps
     var steps = 0
-    var silenceChecked = false
+    var tapRestarts = 0
     while !flag.isSet() {
         Thread.sleep(forTimeInterval: 0.1)
         steps += 1
-        if !silenceChecked && steps >= silenceLimit {
-            silenceChecked = true
-            if let current = system, current.backend == "coreaudio-tap", !current.signalSeen.isSet() {
-                logLine("capture: process tap delivered only digital silence for 15 s; switching to ScreenCaptureKit")
-                stopSystem(current)
-                system = nil
-                if let screen = startScreenCapture(mix: mix) {
-                    system = screen
-                } else if #available(macOS 14.2, *) {
-                    logLine("capture: ScreenCaptureKit failed; keeping the process tap")
-                    system = startProcessTap(mix: mix)
-                }
+        // A quiet start is normal: nobody has spoken yet, so the tap delivers
+        // zeros. That is not a reason to leave it. Only when a tap that had
+        // delivered audio dies (its device is gone) is it restarted, and
+        // ScreenCaptureKit is tried only if that restart fails.
+        if steps % 10 == 0, tapRestarts < 3, let current = system,
+           current.backend == "coreaudio-tap", current.signalSeen.isSet(),
+           !deviceAlive(current.aggregateID) {
+            tapRestarts += 1
+            logLine("capture: process tap stopped after delivering audio; restarting it (\(tapRestarts))")
+            stopSystem(current)
+            system = nil
+            if #available(macOS 14.2, *) {
+                system = startProcessTap(mix: mix)
+            }
+            if system == nil {
+                system = startScreenCapture(mix: mix)
+            }
+            if system == nil {
+                logLine("capture-error: system audio was lost and could not be restarted")
             }
         }
         // Pace by the microphone clock (or system audio without a mic), not

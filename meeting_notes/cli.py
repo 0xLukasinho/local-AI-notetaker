@@ -168,7 +168,10 @@ def _maybe_delete_audio(folder, keep_audio):
     """
     from meeting_notes.session_finish import delete_session_audio, transcript_ready, transcript_verified
 
-    if keep_audio or not transcript_ready(folder):
+    if not transcript_ready(folder):
+        return
+    if keep_audio:
+        update_status(folder, {"audio_kept": True, "audio_kept_reason": "keep_audio is set"})
         return
     ok, reason = transcript_verified(folder)
     if not ok:
@@ -319,16 +322,17 @@ def _finish_written_transcript(meeting_dir, text, document, TRANSCRIPT_JSON):
             print(f"Remote voices: {info['clusters']} via {info['backend']}.")
         elif info.get("reason"):
             print(f"Remote diarization skipped ({info['reason']}).")
-        others = [
-            name
-            for name in (document.get("participants") or [])
-            if name and name != document.get("self_name")
+        pending = [
+            str(entry.get("display") or label)
+            for label, entry in (document.get("speaker_map") or {}).items()
+            if isinstance(entry, dict) and entry.get("status") not in (None, "confirmed")
         ]
-        if document.get("captions") == "off" and others:
+        if pending:
             print(
-                "Meet captions were off, so remote speakers could not be named "
-                "from captions. Press CC in the Meet window next time. "
-                "Captions are only shown to you."
+                "Some speakers could not be named with confidence: "
+                + ", ".join(pending)
+                + ". Relabel with "
+                '`meeting-notes reprocess FOLDER --participants "A, B"` while the audio is still there.'
             )
         update_status(
             meeting_dir,

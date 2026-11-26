@@ -502,7 +502,10 @@ def _retire_audio(folder, config, keep_audio, deliver, delivered, archived, log)
     """
     pending = unconfirmed_speakers(folder)
     update_status(folder, {"needs_relabel": bool(pending), "unconfirmed_speakers": pending})
-    if keep_audio or not folder_has_audio(folder):
+    if not folder_has_audio(folder):
+        return []
+    if keep_audio:
+        update_status(folder, {"audio_kept": True, "audio_kept_reason": "keep_audio is set"})
         return []
     ok, reason = transcript_verified(folder)
     if ok and pending:

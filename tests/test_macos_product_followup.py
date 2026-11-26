@@ -164,3 +164,33 @@ def test_read_screen_permission_checks_probe_helper_and_falls_back(tmp_path, mon
         return 0, json.dumps({"screen_recording": granted})
 
     assert permissions_report.read_screen_permission(run=fake_run) == "granted"
+
+
+def test_screen_capture_is_denied_for_a_signed_helper_without_the_grant(tmp_path, monkeypatch):
+    from meeting_notes.macos_capture import SCREEN_CAPTURE_ENV, SIGNED_MARKER, screen_capture_policy
+    from meeting_notes.recorder_mac import _ScreenCaptureEnv
+
+    home = tmp_path / "home"
+    bindir = home / ".meeting-notes" / "bin"
+    signed = bindir / "MeetingAudioCapture-signed.app" / "Contents" / "MacOS"
+    signed.mkdir(parents=True)
+    helper = str(signed / "meeting-audio-capture")
+    marker = bindir / SIGNED_MARKER
+
+    marker.write_text(json.dumps({"record_ok": True, "screen_recording": False}), encoding="utf-8")
+    assert screen_capture_policy(helper, home=str(home)) == "deny"
+    marker.write_text(json.dumps({"record_ok": True, "screen_recording": True}), encoding="utf-8")
+    assert screen_capture_policy(helper, home=str(home)) == ""
+    # The older ad-hoc helper keeps its own default.
+    assert screen_capture_policy(str(bindir / "MeetingAudioCapture.app" / "x"), home=str(home)) == ""
+
+    monkeypatch.setattr("meeting_notes.macos_capture.screen_capture_policy", lambda path, home=None: "deny")
+    monkeypatch.delenv(SCREEN_CAPTURE_ENV, raising=False)
+    with _ScreenCaptureEnv(helper):
+        assert os.environ[SCREEN_CAPTURE_ENV] == "deny"
+    assert SCREEN_CAPTURE_ENV not in os.environ
+    # A value the user set explicitly is left alone.
+    monkeypatch.setenv(SCREEN_CAPTURE_ENV, "allow")
+    with _ScreenCaptureEnv(helper):
+        assert os.environ[SCREEN_CAPTURE_ENV] == "allow"
+    assert os.environ[SCREEN_CAPTURE_ENV] == "allow"

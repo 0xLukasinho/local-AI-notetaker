@@ -266,6 +266,50 @@ def test_echo_on_the_loopback_keeps_the_microphone_line():
     assert [(item["speaker"], item["track"]) for item in labeled] == [("Alex", "self")]
 
 
+def test_near_verbatim_repeat_a_moment_later_is_dropped_as_bleed():
+    events = _hold(0.0, 10.0, 0.5, active=["Ada Lovelace"])
+    labeled = align_tracks(
+        [{"start": 4.0, "end": 6.0, "text": "Yeah, fully agree with that. That works for us."}],
+        [{"start": 3.0, "end": 8.0, "text": "Okay, thank you. Yeah, I fully agree with that. That works for us."}],
+        events,
+        "Alex",
+    )
+    assert [(item["speaker"], item["track"]) for item in labeled] == [("Ada Lovelace", "others")]
+
+
+def test_short_or_loose_replies_after_a_remote_line_are_kept():
+    events = _hold(0.0, 14.0, 0.5, active=["Ada Lovelace"])
+    remote = [{"start": 3.0, "end": 8.0, "text": "Okay, thank you. Yeah, I fully agree with that. That works for us."}]
+    # Too short to call bleed.
+    labeled = align_tracks([{"start": 8.5, "end": 9.5, "text": "Works for us."}], remote, events, "Alex")
+    assert ("Alex", "self") in [(item["speaker"], item["track"]) for item in labeled]
+    # Starts before the remote line does: not bleed from it.
+    early = [{"start": 1.0, "end": 2.8, "text": "Yeah, fully agree with that. That works for us."}]
+    labeled = align_tracks(early, remote, events, "Alex")
+    assert ("Alex", "self") in [(item["speaker"], item["track"]) for item in labeled]
+    # Later than the window after the remote line ends.
+    late = [{"start": 12.5, "end": 14.0, "text": "Yeah, fully agree with that. That works for us."}]
+    labeled = align_tracks(late, remote, events, "Alex")
+    assert ("Alex", "self") in [(item["speaker"], item["track"]) for item in labeled]
+
+
+def test_record_session_roster_adds_people_who_joined_later_and_captions_flag(tmp_path):
+    import json as _json
+
+    from meeting_notes.speakers import coerce_event, record_session_roster
+
+    (tmp_path / "status.json").write_text(_json.dumps({"meet_participants": []}), encoding="utf-8")
+    events = [
+        coerce_event({"t": 0.0, "self": "Alex", "participants": ["Alex"], "captions_enabled": False}),
+        coerce_event({"t": 5.0, "self": "Alex", "participants": ["Alex", "Ada Lovelace"], "captions_enabled": False}),
+    ]
+    merged = record_session_roster(str(tmp_path), events, "Alex", {"meet_participants": []})
+    assert merged == ["Ada Lovelace"]
+    status = _json.loads((tmp_path / "status.json").read_text(encoding="utf-8"))
+    assert status["meet_participants"] == ["Ada Lovelace"]
+    assert status["captions_enabled"] is False
+
+
 def test_real_overlap_keeps_both_lines():
     events = _hold(0.0, 2.0, 0.5, active=["Ada Lovelace"])
     labeled = align_tracks(

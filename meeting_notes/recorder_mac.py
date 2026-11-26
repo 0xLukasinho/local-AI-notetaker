@@ -103,6 +103,30 @@ class _TapfixEnv:
         return False
 
 
+class _ScreenCaptureEnv:
+    """Tell the helper not to start ScreenCaptureKit when it has no grant."""
+
+    def __init__(self, helper=None):
+        self.helper = helper
+        self.applied = False
+
+    def __enter__(self):
+        from meeting_notes.macos_capture import SCREEN_CAPTURE_ENV, screen_capture_policy
+
+        self.name = SCREEN_CAPTURE_ENV
+        self.previous = os.environ.get(self.name)
+        policy = screen_capture_policy(self.helper)
+        if policy and self.previous is None:
+            os.environ[self.name] = policy
+            self.applied = True
+        return self
+
+    def __exit__(self, *exc):
+        if self.applied:
+            os.environ.pop(self.name, None)
+        return False
+
+
 def _start_helper(helper, output_path, device_index, separate_tracks=False):
     """Record with the Swift helper. If it exits immediately, use ffmpeg.
 
@@ -110,7 +134,7 @@ def _start_helper(helper, output_path, device_index, separate_tracks=False):
     AVFoundation input and cannot hear other applications, so it is only the
     fallback when the helper is missing or refuses to start.
     """
-    with _TapfixEnv(helper):
+    with _TapfixEnv(helper), _ScreenCaptureEnv(helper):
         process = popen_responsible(
             helper_record_argv(
                 helper,
@@ -154,7 +178,8 @@ def record_audio(output_path, device_index="1", separate_tracks=False):
     Windows and do not require captions.
 
     When ``scripts/setup_macos.sh`` has built the helper, that program
-    captures system audio (Core Audio process tap, then ScreenCaptureKit)
+    captures system audio (Core Audio process tap; ScreenCaptureKit only as a
+    last resort, and never without a Screen Recording grant)
     plus the microphone. Otherwise this is the original ffmpeg AVFoundation
     recording of one input device.
     """
