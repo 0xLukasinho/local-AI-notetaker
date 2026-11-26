@@ -136,7 +136,7 @@ def test_bridge_does_not_warn_for_a_solo_call_or_when_captions_are_on(tmp_path, 
     assert "Press CC" not in capsys.readouterr().out
 
 
-def test_bridge_warns_once_when_captions_stay_off(tmp_path, capsys):
+def test_bridge_never_asks_for_captions(tmp_path, capsys):
     path = tmp_path / "speakers.jsonl"
     bridge = SpeakerBridge(str(path), port=0, clock=lambda: 10.0)
     bridge.mark_audio_start()
@@ -144,7 +144,8 @@ def test_bridge_warns_once_when_captions_stay_off(tmp_path, capsys):
         bridge.record({"active": ["Ada Lovelace"], "participants": ["Ada Lovelace"]})
     assert "Press CC" not in capsys.readouterr().out
     bridge.record({"active": ["Ada Lovelace"], "participants": ["Ada Lovelace"]})
-    assert "Press CC" in capsys.readouterr().out
+    # Names come from the participant list and active tile; captions are optional.
+    assert capsys.readouterr().out == ""
     bridge.record({"caption_speaker": "Ada Lovelace", "active": ["Ada Lovelace"]})
     assert capsys.readouterr().out == ""
     events = load_speaker_events(str(path))

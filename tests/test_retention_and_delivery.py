@@ -129,3 +129,22 @@ def test_unconfirmed_speaker_keeps_audio_and_flags_relabel(tmp_path):
     assert status["needs_relabel"] is True
     assert status["audio_kept"] is True
     assert "not confident" in status["audio_kept_reason"]
+
+
+def test_keep_audio_sets_the_audio_kept_flag(tmp_path):
+    import json as _json
+    from types import SimpleNamespace
+
+    from meeting_notes import session_finish
+
+    folder = tmp_path / "2026-01-02_abc-defg-hij"
+    folder.mkdir()
+    (folder / "audio.wav").write_bytes(b"RIFF" + b"\0" * 64)
+    (folder / "transcript.txt").write_text("[00:01] Alex: hi\n", encoding="utf-8")
+    (folder / "status.json").write_text("{}", encoding="utf-8")
+    config = SimpleNamespace(delete_audio_requires_delivery=True)
+    removed = session_finish._retire_audio(str(folder), config, True, True, True, True, lambda *a, **k: None)
+    assert removed == [] and (folder / "audio.wav").exists()
+    status = _json.loads((folder / "status.json").read_text(encoding="utf-8"))
+    assert status["audio_kept"] is True
+    assert status["audio_kept_reason"] == "keep_audio is set"

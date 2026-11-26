@@ -254,11 +254,11 @@ On Windows the recorder writes three files that share one clock: `audio.wav` (th
 
 Real names come from Google Meet. A small unpacked Chrome extension reads the participant list, the active-speaker ring, and live captions (only if you turn captions on) from the Meet tab and POSTs them to `127.0.0.1` only while a recording is running. Nothing is injected into the page, so other participants cannot see it. There is no meeting bot and no Meet API.
 
-Remote lines are named from Meet live captions. Turn captions on with the CC button; they are shown only to you. Each remote stretch is labeled with the caption speaker on screen at that time. If no caption covers it, a tile that shows exactly one speaker is used. If several people are highlighted at once, the line is `Remote` rather than `Daniel Bronheim / Mahmoud Lababidi`. A two-person call has one other person, so that name is used when captions are off.
+Remote lines are named from the Meet participant list and the active-speaker tile; captions are optional and never needed. If live captions are on (CC button, shown only to you), the caption speaker on screen at that time is used first. If no caption covers a stretch, a tile that shows exactly one speaker is used. If several people are highlighted at once, the line is `Remote` rather than `Ada Lovelace / Grace Hopper`. A two-person call has one other person, so that name is used.
 
 People talking over each other stay whole sentences. A turn is built for each person on each track before the tracks are merged, so a short "yeah" is its own line and does not chop the other sentence into single words.
 
-While a call is recording, `speakers.jsonl` gets a `caption_speaker` field on every sample (empty when captions are off). If captions stay off, the watcher log says to press CC. The same note is printed when the transcript is written.
+While a call is recording, `speakers.jsonl` gets a `caption_speaker` field on every sample (empty when captions are off).
 
 ```bash
 meeting-notes speakers

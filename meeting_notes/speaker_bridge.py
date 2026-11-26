@@ -70,7 +70,6 @@ class SpeakerBridge:
         self._thread = None
         self._samples = 0
         self._samples_with_captions = 0
-        self._caption_notice = False
 
     def start(self):
         bridge = self
@@ -166,29 +165,15 @@ class SpeakerBridge:
             return event
 
     def _note_captions(self, body):
-        """Print once when a call is underway and Meet captions are not on.
+        """Count samples that carry caption lines.
 
-        The extension posts about once a second. Waiting for several samples
-        avoids a warning during the second before someone turns captions on.
+        No warning is printed when captions are off: remote speakers are named
+        from the Meet participant list and the active-speaker tile, which need
+        no captions, so nothing here depends on the CC button.
         """
         self._samples += 1
         if _body_has_caption(body):
             self._samples_with_captions += 1
-        if self._caption_notice or self._samples < 8 or self._samples_with_captions:
-            return
-        # Nobody else is on the call, so there is no remote line to name.
-        # Captions that are on with no speech also have no lines. Only warn
-        # when another person is present and the CC control is not on.
-        if not _remote_names(body):
-            return
-        if body.get("captions_enabled") is True:
-            return
-        self._caption_notice = True
-        print(
-            "Meet captions are off, so remote speakers cannot be named. "
-            "Press CC in the Meet window. Captions are only shown to you.",
-            flush=True,
-        )
 
     def _append(self, now, body):
         """Write one sample. Caller holds the lock and the audio clock is set."""

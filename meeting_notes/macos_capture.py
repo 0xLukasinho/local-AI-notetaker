@@ -65,6 +65,23 @@ def signed_helper_status(home=None):
     return data if isinstance(data, dict) else {}
 
 
+SCREEN_CAPTURE_ENV = "MEETING_NOTES_SCREEN_CAPTURE"
+
+
+def screen_capture_policy(path, home=None):
+    """"deny" when ScreenCaptureKit must never be started for this helper.
+
+    The signed helper's marker records whether it holds Screen & System Audio
+    Recording. Without it, ScreenCaptureKit cannot work and can only show a
+    "would like to record this computer's screen and audio" prompt, so the
+    helper is told not to call startCapture(). "" leaves the helper's own
+    default (ScreenCaptureKit only as a last resort when the tap fails).
+    """
+    if is_signed_helper(path, home) and not signed_helper_status(home).get("screen_recording"):
+        return "deny"
+    return ""
+
+
 def is_signed_helper(path, home=None):
     return bool(path) and os.path.abspath(path) == os.path.abspath(signed_helper_path(home))
 
