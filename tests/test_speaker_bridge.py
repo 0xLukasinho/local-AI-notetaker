@@ -189,8 +189,9 @@ def test_extension_install_copies_files_and_writes_the_port(tmp_path):
     assert "const BRIDGE_PORT = 9876;" in copied
     assert "const BRIDGE_PORT = 8765;" not in copied
     content = (Path(folder) / "content.js").read_text(encoding="utf-8")
-    assert "const PRESENCE_PORT = 9877;" in content
-    assert "const PRESENCE_PORT = 8766;" not in content
+    assert "var PRESENCE_PORT = 9877;" in content
+    assert "var BRIDGE_PORT = 9876;" in content
+    assert "var PRESENCE_PORT = 8766;" not in content
     with open(os.path.join(folder, "manifest.json"), encoding="utf-8") as handle:
         assert json.loads(handle.read())["name"]
 
@@ -238,14 +239,14 @@ def test_inspect_extension_state_detects_chrome_path_mismatch(tmp_path, capsys, 
 
     state = inspect_extension_state(str(control), chrome_dir=str(chrome_dir))
     assert state["chrome_accessible"] is True
-    assert state["installed_version"] == "1.4.0"
+    assert state["installed_version"] == "1.5.0"
     assert len(state["mismatches"]) == 1
     assert state["mismatches"][0]["path_differs"] is True
     assert state["mismatches"][0]["id"] == other_id
 
     # update_loaded=True updates non-git loaded copies in place to keep the Chrome ID.
     install_extension(str(control), 8765, update_loaded=True, chrome_dir=str(chrome_dir))
-    assert json.loads((other / "manifest.json").read_text(encoding="utf-8"))["version"] == "1.4.0"
+    assert json.loads((other / "manifest.json").read_text(encoding="utf-8"))["version"] == "1.5.0"
 
     monkeypatch.setattr(cli, "CONTROL_DIR", str(control))
     monkeypatch.setattr("meeting_notes.extension_install._default_chrome_dir", lambda: str(chrome_dir))

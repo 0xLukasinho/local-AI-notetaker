@@ -22,3 +22,24 @@ chrome.runtime.onMessage.addListener((message) => {
     }).catch(() => {});
   }
 });
+
+// After an install or reload, content scripts in Meet tabs that were already
+// open belong to the old version and cannot reach this worker. Inject the new
+// content.js into them so an update applies mid-call without a page refresh.
+function injectIntoOpenMeetTabs() {
+  if (!chrome.scripting || !chrome.tabs) {
+    return;
+  }
+  chrome.tabs.query({ url: "https://meet.google.com/*" }, (tabs) => {
+    for (const tab of tabs || []) {
+      if (!tab || tab.id == null) {
+        continue;
+      }
+      chrome.scripting
+        .executeScript({ target: { tabId: tab.id }, files: ["content.js"] })
+        .catch(() => {});
+    }
+  });
+}
+
+chrome.runtime.onInstalled.addListener(injectIntoOpenMeetTabs);

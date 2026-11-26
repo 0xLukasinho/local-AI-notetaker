@@ -11,9 +11,11 @@
 // Old speaking-class names matched layout on every tile after a Meet restyle,
 // so every remote person was reported as talking. The ring and a clearly
 // elevated audio level are the signals that still mean one person.
-const PRESENCE_PORT = 8766;
-const AUDIO_LEVEL_FLOOR = 8;
-const BLOCKED_NAMES = [
+var PRESENCE_PORT = 8766;
+var BRIDGE_PORT = 8765;
+var SCRIPT_VERSION = "1.5.0";
+var AUDIO_LEVEL_FLOOR = 8;
+var BLOCKED_NAMES = [
   "mute",
   "unmute",
   "camera",
@@ -34,7 +36,7 @@ const BLOCKED_NAMES = [
 
 // Meet toasts sit inside the same tile as the name. They are sentences, not
 // people. "Others might still see your full video." was stored as a participant.
-const TOAST_PHRASES = [
+var TOAST_PHRASES = [
   "might still",
   "your video",
   "your full video",
@@ -47,7 +49,7 @@ const TOAST_PHRASES = [
   "turned off",
 ];
 
-const DENY_NAMES = {
+var DENY_NAMES = {
   reframe: true,
   "font size": true,
   "others might still see your full video.": true,
@@ -164,6 +166,170 @@ function looksSpeaking(root) {
     maxChild = Math.max(maxChild, numericLevel(bars[i].getAttribute("data-audio-level")));
   }
   return maxChild >= AUDIO_LEVEL_FLOOR;
+}
+
+
+// Current Meet (Nov 2026) puts no aria-label and no data-self-name on the
+// [data-participant-id] tiles and no data-audio-level on them either. The
+// name is a plain text label inside the tile, and the speaking indicator is
+// an animated element whose classes and styles change many times a second
+// while that person talks. Read the label text, and measure DOM activity per
+// tile, instead of depending on class names Meet renames.
+var ICON_FONT = /material|icons|symbols/i;
+var ACTIVITY_WINDOW_MS = 1500;
+var ACTIVITY_MIN = 4;
+var tileActivity = new Map();
+
+function iconText(el, text) {
+  if (/_/.test(text)) {
+    return true;
+  }
+  if (!/^[a-z]+$/.test(text)) {
+    return false;
+  }
+  try {
+    return ICON_FONT.test(getComputedStyle(el).fontFamily || "");
+  } catch (err) {
+    return false;
+  }
+}
+
+function tileLabelTexts(tile) {
+  // Leaf text inside the tile that is not a control, menu, or icon glyph.
+  // Labels marked notranslate (Meet's name label) come first.
+  const marked = [];
+  const plain = [];
+  let nodes = [];
+  try {
+    nodes = tile.querySelectorAll("div, span");
+  } catch (err) {
+    nodes = [];
+  }
+  const limit = Math.min(nodes.length, 400);
+  for (let i = 0; i < limit; i++) {
+    const el = nodes[i];
+    if (el.children && el.children.length) {
+      continue;
+    }
+    try {
+      if (el.closest("button, [role='button'], [role='menu'], [role='menuitem'], [role='tooltip'], [role='dialog'], [role='alert'], [aria-live]")) {
+        continue;
+      }
+    } catch (err) {
+      continue;
+    }
+    const text = String(el.textContent || "").replace(/\s+/g, " ").trim();
+    if (!text || text.length > 80 || iconText(el, text)) {
+      continue;
+    }
+    let isMarked = false;
+    try {
+      isMarked = !!el.closest(".notranslate");
+    } catch (err) {
+      isMarked = false;
+    }
+    (isMarked ? marked : plain).push(text);
+  }
+  return marked.concat(plain);
+}
+
+function tileSaysYou(tile) {
+  const texts = tileLabelTexts(tile);
+  for (const text of texts) {
+    if (/^\(?\s*you\s*\)?$/i.test(text)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function noteActivity(id, now) {
+  let times = tileActivity.get(id);
+  if (!times) {
+    times = [];
+    tileActivity.set(id, times);
+  }
+  times.push(now);
+  while (times.length && now - times[0] > ACTIVITY_WINDOW_MS) {
+    times.shift();
+  }
+  if (times.length > 200) {
+    times.splice(0, times.length - 200);
+  }
+}
+
+function activityScore(id, now) {
+  const times = tileActivity.get(id);
+  if (!times) {
+    return 0;
+  }
+  while (times.length && now - times[0] > ACTIVITY_WINDOW_MS) {
+    times.shift();
+  }
+  return times.length;
+}
+
+function watchTileActivity() {
+  if (typeof MutationObserver === "undefined" || !document.body) {
+    return;
+  }
+  const observer = new MutationObserver((mutations) => {
+    const now = Date.now();
+    const seen = new Set();
+    for (const mutation of mutations) {
+      let node = mutation.target;
+      if (node && node.nodeType !== 1) {
+        node = node.parentElement;
+      }
+      if (!node || !node.closest || node.tagName === "VIDEO") {
+        continue;
+      }
+      let tile = null;
+      try {
+        tile = node.closest("[data-participant-id]");
+      } catch (err) {
+        tile = null;
+      }
+      if (!tile || tile === node) {
+        continue;
+      }
+      const id = tile.getAttribute("data-participant-id") || "";
+      // One count per tile per mutation batch, so a single relayout of a
+      // tile does not look like a second of speech.
+      if (id && !seen.has(id)) {
+        seen.add(id);
+        noteActivity(id, now);
+      }
+    }
+  });
+  observer.observe(document.body, {
+    subtree: true,
+    attributes: true,
+    attributeFilter: ["class", "style", "data-audio-level"],
+  });
+}
+
+function speakingByActivity(ids) {
+  // The tile(s) with clearly more indicator activity than the rest. A layout
+  // change touches every tile at once, so require a lead over the quietest.
+  const now = Date.now();
+  const scores = ids.map((id) => [id, activityScore(id, now)]);
+  if (!scores.length) {
+    return new Set();
+  }
+  const values = scores.map((pair) => pair[1]);
+  const max = Math.max.apply(null, values);
+  const min = Math.min.apply(null, values);
+  const out = new Set();
+  if (max < ACTIVITY_MIN) {
+    return out;
+  }
+  for (const [id, score] of scores) {
+    if (score >= ACTIVITY_MIN && score >= max * 0.6 && (scores.length === 1 || score - min >= ACTIVITY_MIN)) {
+      out.add(id);
+    }
+  }
+  return out;
 }
 
 function captionRoots() {
@@ -374,7 +540,7 @@ function collectCaptions() {
   return found;
 }
 
-const lastCaptionText = {};
+var lastCaptionText = {};
 
 function activeCaptionSpeaker(captions) {
   // The row Meet is updating is the person talking. A single visible row is
@@ -434,7 +600,10 @@ function markedSelf(tile) {
     return true;
   }
   const text = String(tile.textContent || "");
-  return /\(\s*you\s*\)/i.test(text);
+  if (/\(\s*you\s*\)/i.test(text)) {
+    return true;
+  }
+  return tileSaysYou(tile);
 }
 
 function selfIdentity() {
@@ -490,8 +659,11 @@ function nameFromTile(tile) {
     // Fall through to the tile's own aria-label.
   }
   add(tile.getAttribute && tile.getAttribute("aria-label"));
+  for (const text of tileLabelTexts(tile)) {
+    add(text);
+  }
   const people = ranked.filter((name) => name.toLowerCase() !== "you");
-  return (people.length ? people : ranked)[0] || "";
+  return people[0] || "";
 }
 
 function meetPresence() {
@@ -647,6 +819,13 @@ function collect() {
     byId.set(id, prev);
   }
 
+  const busy = speakingByActivity(Array.from(byId.keys()));
+  for (const person of byId.values()) {
+    if (busy.has(person.id)) {
+      person.speaking = true;
+    }
+  }
+
   const participants = [];
   const active = [];
   for (const person of byId.values()) {
@@ -696,8 +875,8 @@ function collect() {
   };
 }
 
-let lastKey = "";
-let lastSent = 0;
+var lastKey = "";
+var lastSent = 0;
 
 function sample() {
   let snapshot;
@@ -728,10 +907,24 @@ function sample() {
   }
   lastKey = key;
   lastSent = now;
+  let viaWorker = false;
   try {
-    chrome.runtime.sendMessage({ type: "speakers", payload });
+    if (chrome.runtime && chrome.runtime.id) {
+      chrome.runtime.sendMessage({ type: "speakers", payload });
+      viaWorker = true;
+    }
   } catch (err) {
     // The bridge is down whenever nothing is recording. That is expected.
+  }
+  if (!viaWorker) {
+    // After an extension reload the old worker is gone. Post directly.
+    try {
+      fetch("http://127.0.0.1:" + BRIDGE_PORT + "/speakers", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      }).catch(function () {});
+    } catch (err) {}
   }
 }
 
@@ -757,7 +950,23 @@ function sendPresence() {
   } catch (err) {}
 }
 
-if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.sendMessage) {
+// Top-level bindings are var so a second injection into the same world
+// cannot fail with a redeclaration error.
+// The worker re-injects this file into open Meet tabs after an update, so a
+// reload during a call takes effect without refreshing the call. Only one
+// copy of a given version runs per tab.
+var ALREADY_RUNNING =
+  typeof window !== "undefined" && window.__meetingNotesSpeakerTags === SCRIPT_VERSION;
+if (typeof window !== "undefined") {
+  window.__meetingNotesSpeakerTags = SCRIPT_VERSION;
+}
+
+if (!ALREADY_RUNNING && typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.sendMessage) {
+  try {
+    watchTileActivity();
+  } catch (err) {
+    // Without the observer, the older speaking signals still apply.
+  }
   setInterval(sample, 400);
   setInterval(sendPresence, 3000);
   sample();

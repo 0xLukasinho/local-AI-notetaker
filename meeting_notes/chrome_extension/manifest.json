@@ -1,8 +1,9 @@
 {
   "manifest_version": 3,
   "name": "Meeting Notes Speaker Tags",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Sends the Google Meet code, participant names, the active speaker, and live captions (when you turn them on) to meeting-notes on this computer. Other participants cannot see it.",
+  "permissions": ["scripting"],
   "host_permissions": [
     "https://meet.google.com/*",
     "http://127.0.0.1/*"

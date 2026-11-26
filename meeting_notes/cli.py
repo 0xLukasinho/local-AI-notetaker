@@ -617,6 +617,24 @@ def cmd_reprocess(args):
     transcript_file = session_transcript_path(meeting_dir)
     notes_path = os.path.join(meeting_dir, "notes.md")
 
+    extra_people = _parse_name_list(getattr(args, "participants", None))
+    if extra_people:
+        # Names known after the call (the Meet participant list, the invite)
+        # feed speaker naming the same way the extension's roster does.
+        import json
+
+        known = []
+        try:
+            with open(os.path.join(meeting_dir, "status.json"), encoding="utf-8") as handle:
+                known = list(json.load(handle).get("meet_participants") or [])
+        except (OSError, ValueError):
+            known = []
+        for name in extra_people:
+            if name.casefold() not in {item.casefold() for item in known}:
+                known.append(name)
+        update_status(meeting_dir, {"meet_participants": known})
+        print("Participants for speaker naming: " + ", ".join(known))
+
     folder_name = os.path.basename(meeting_dir)
     parts = folder_name.split("_", 1)
     meeting_date = parts[0] if len(parts) > 0 else "unknown"
@@ -1208,6 +1226,11 @@ def build_parser():
         help="Re-run transcription and note generation on an existing meeting",
     )
     reprocess_parser.add_argument("folder", help="Meeting folder name (from 'meeting-notes list')")
+    reprocess_parser.add_argument(
+        "--participants",
+        help="Comma-separated names of the people in the call, added to the "
+        "participant list used to name speakers (e.g. from the Meet people panel)",
+    )
     reprocess_parser.add_argument(
         "--model", help=f"Claude model for note generation (default: {DEFAULT_MODEL})"
     )
