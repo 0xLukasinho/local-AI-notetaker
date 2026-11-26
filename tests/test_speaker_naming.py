@@ -355,3 +355,23 @@ def test_vocabulary_includes_people_names(tmp_path):
     text = session_finish._vocabulary_with_names(str(folder), config, "Greek, Bebop.")
     assert "Mahmoud" in text and "Priya" in text and "Alex Rivera" in text
     assert session_finish._vocabulary_with_names(str(folder), Config(whisper_vocabulary=""), "x") == ""
+
+
+def test_e2e_regression_intro_drowned_out_but_addressing_names_the_voice():
+    # Real e2e run 2026-11-25: other system audio covered Alex's intro, so
+    # only people addressing him identify the voice.
+    turns = [
+        t(0, "Speaker 2", "So it might feel difficult to keep up with the landscape."),
+        t(8, "Speaker 3", "Hey Alex, I'm Mahmoud. Can you walk us through the timeline?"),
+        t(15, "Speaker 2", "Sure. We plan to ship in the first quarter."),
+        t(23, "Speaker 4", "Hi, my name is Ravi. Mahmoud, do you have the latest numbers?"),
+        t(31, "Speaker 3", "Yes Ravi, weekly volume is up."),
+        t(37, "Speaker 2", "That is great to hear. Ravi, could you send a deck after this call?"),
+        t(43, "Speaker 4", "Absolutely Alex, I will send it tonight."),
+        t(47, "Speaker 3", "Perfect. Alex, one more question about the settlement layer."),
+        t(54, "Speaker 2", "Good question. Fees are split evenly for now."),
+    ]
+    speaker_map, _ = sn.resolve_speakers(turns, "Lukas")
+    assert display(speaker_map, "Speaker 2") == "Alex"
+    assert display(speaker_map, "Speaker 3") == "Mahmoud"
+    assert display(speaker_map, "Speaker 4") == "Ravi"

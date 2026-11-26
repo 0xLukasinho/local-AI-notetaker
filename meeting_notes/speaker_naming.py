@@ -212,6 +212,28 @@ def self_introductions(text):
     return names
 
 
+_LEAD = r"(?:hey|hi|hello|yes|yeah|yep|thanks|thank you|ok|okay|sure|absolutely|perfect|great|so|well|no|right|exactly)"
+_ONE = r"([A-Z][a-z][a-zA-Z'\-]+)"
+VOCATIVE_PATTERNS = [
+    re.compile(r"(?i:^" + _LEAD + r"[,!.]?\s+)" + _ONE + r"[,!.?]"),
+    re.compile(r"^" + _ONE + r",\s+\w"),
+    re.compile(r"[.?!]\s+" + _ONE + r",\s+\w"),
+    re.compile(r",\s+" + _ONE + r"\s*[?.!]?\s*$"),
+]
+
+
+def vocative_names(text):
+    """Names someone is addressed by in `text` ("Hey Alex," / "Ravi, could you")."""
+    found = []
+    text = clean_name(text)
+    for pattern in VOCATIVE_PATTERNS:
+        for match in pattern.finditer(text):
+            name = match.group(1)
+            if plausible_person(name) and name not in found:
+                found.append(name)
+    return found
+
+
 def _vocative_positions(text, name):
     """Where `name` (or its first name) is used to address someone in `text`.
 
@@ -224,13 +246,16 @@ def _vocative_positions(text, name):
         if not option:
             continue
         token = re.escape(option)
-        start = re.compile(r"^(?:(?:yes|yeah|yep|no|sure|thanks|thank you|hey|hi|hello|ok|okay|so|and|well|right|great|perfect|absolutely|exactly|good question)[,!.]?\s+)?" + token + r"\b[,!.?]")
-        end = re.compile(r"(?:,|\b(?:thanks|thank you|hey|hi|right|so|and|over to you|what about you|how about you|you))\s+" + token + r"\s*[?.!]?\s*$")
+        start = re.compile(r"(?i:^(?:(?:yes|yeah|yep|no|sure|thanks|thank you|hey|hi|hello|ok|okay|so|and|well|right|great|perfect|absolutely|exactly|good question)[,!.]?\s+)?)" + token + r"\b[,!.?]")
+        end = re.compile(r"(?i:(?:,|\b(?:thanks|thank you|hey|hi|right|so|and|over to you|what about you|how about you|you))\s+)" + token + r"\s*[?.!]?\s*$")
         question = re.compile(r"(?:^|[.?!]\s+)" + token + r",\s+[^.?!]*\?")
-        middle = re.compile(r"(?:,\s+|\bthanks\s+|\bthank you\s+)" + token + r"[,.!?]")
+        # "Perfect. Alex, one more question about ..." - a later sentence
+        # that opens with the name hands the floor to that person.
+        handoff = re.compile(r"[.?!]\s+" + token + r",\s+\w")
+        middle = re.compile(r"(?i:(?:,\s+|\bthanks\s+|\bthank you\s+))" + token + r"[,.!?]")
         if start.search(text):
             hits.append("start")
-        if end.search(text) or question.search(text):
+        if end.search(text) or question.search(text) or handoff.search(text):
             hits.append("end")
         elif middle.search(text) and "start" not in hits:
             hits.append("middle")
@@ -382,6 +407,15 @@ def resolve_speakers(
     for name in roster_names + known + intro_names + [n for matches in voice_matches.values() for n, _ in matches]:
         if name and name not in candidates:
             candidates.append(name)
+    # Names people were addressed by are evidence too (they were said), but
+    # only through the addressing rule below, so one mention never confirms.
+    for turn in turns or []:
+        for name in vocative_names(turn.get("text")):
+            canonical = _canonical(name, candidates)
+            if canonical.casefold() in aliases or first_name(canonical).casefold() in aliases:
+                continue
+            if canonical not in candidates:
+                candidates.append(canonical)
 
     # Addressing by name (spelling drift normalised to the candidate names).
     ordered = [t for t in _normalise_spellings(turns, candidates) if clean_name(t.get("text"))]
