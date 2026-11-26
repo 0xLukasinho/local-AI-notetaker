@@ -19,7 +19,7 @@ else. Google Meet keeps priority for ``chrome.exe``.
 import re
 
 from meeting_notes.meet_detect import MicStatus, Sighting
-from meeting_notes.platform_match import process_matches
+from meeting_notes.platform_match import display_label, process_matches
 
 
 SOURCE_SLACK_HUDDLE = "slack-huddle"
@@ -146,7 +146,7 @@ def _format_mic(status):
     else:
         detail = "no"
     state = "in use" if status.in_use else "not in use"
-    return "Slack microphone %s (%s, %s)" % (state, DESKTOP_MARKER, detail)
+    return "Slack microphone %s (%s, %s)" % (state, display_label(DESKTOP_MARKER), detail)
 
 
 def _best_name(windows):
@@ -242,7 +242,7 @@ class SlackHuddleDetector:
             return MicStatus(
                 False,
                 (),
-                notice="Slack microphone probe failed for %s (%s)" % (DESKTOP_MARKER, exc),
+                notice="Slack microphone probe failed for %s (%s)" % (display_label(DESKTOP_MARKER), exc),
             )
 
     def _read_windows(self):

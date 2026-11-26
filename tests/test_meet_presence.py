@@ -114,3 +114,39 @@ def test_heartbeat_records_screen_permission_and_extension_presence(tmp_path):
     text = describe_heartbeat(str(tmp_path), now=10.0)
     assert "screen_permission=missing" in text
     assert "extension_presence=never" in text
+
+
+def test_presence_keeps_participant_names_and_puts_them_on_the_sighting():
+    parsed = parse_presence(
+        {
+            "meet_code": "abc-defg-hij",
+            "phase": "in-call",
+            "in_call": True,
+            "title": "Meet - Design Review",
+            "participants": [
+                {"name": "Alex Rivera", "self": True},
+                {"name": "Jordan Blake"},
+                "Jordan Blake",
+                {"name": "  "},
+            ],
+        }
+    )
+    assert parsed["participants"] == ["Alex Rivera", "Jordan Blake"]
+    sighting = sighting_from_presence(parsed)
+    assert sighting.meet_code == "abc-defg-hij"
+    assert sighting.participants == ("Alex Rivera", "Jordan Blake")
+
+
+def test_in_call_presence_without_a_leave_button_still_counts_when_names_or_code_are_present():
+    # The extension reports in-call from participant tiles even if the leave
+    # button label has changed.
+    parsed = parse_presence(
+        {
+            "meet_code": "abc-defg-hij",
+            "phase": "in-call",
+            "in_call": True,
+            "participants": [{"name": "Priya Shah"}],
+        }
+    )
+    assert parsed["in_call"] is True
+    assert sighting_from_presence(parsed).participants == ("Priya Shah",)

@@ -1,0 +1,55 @@
+// Read upcoming Calendar.app events as JSON. days is argv[0] (default 14).
+function iso(d) {
+  if (!d) { return null; }
+  return d.toISOString();
+}
+function run(argv) {
+  var days = parseInt(argv[0] || "14", 10);
+  if (!(days > 0)) { days = 14; }
+  var app = Application("Calendar");
+  var now = new Date();
+  var startBound = new Date(now.getTime() - 1 * 86400000);
+  var endBound = new Date(now.getTime() + days * 86400000);
+  var cals = app.calendars();
+  var out = [];
+  for (var i = 0; i < cals.length; i++) {
+    var evs;
+    try {
+      evs = cals[i].events.whose({
+        _and: [
+          {startDate: {_greaterThan: startBound}},
+          {startDate: {_lessThan: endBound}}
+        ]
+      })();
+    } catch (e) {
+      continue;
+    }
+    for (var j = 0; j < evs.length; j++) {
+      var ev = evs[j];
+      var attendees = [];
+      try {
+        var atts = ev.attendees();
+        for (var k = 0; k < atts.length; k++) {
+          var nm = "";
+          try { nm = atts[k].name(); } catch (e2) { nm = ""; }
+          if (nm) { attendees.push({name: String(nm)}); }
+        }
+      } catch (e3) {}
+      var title = "";
+      var loc = "";
+      var url = "";
+      try { title = ev.summary(); } catch (e4) {}
+      try { loc = ev.location(); } catch (e5) {}
+      try { url = ev.url(); } catch (e6) {}
+      out.push({
+        title: title ? String(title) : "",
+        start: iso(ev.startDate()),
+        end: iso(ev.endDate()),
+        location: loc ? String(loc) : "",
+        url: url ? String(url) : "",
+        attendees: attendees
+      });
+    }
+  }
+  return JSON.stringify({ok: true, events: out});
+}

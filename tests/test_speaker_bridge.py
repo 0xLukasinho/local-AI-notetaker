@@ -2,6 +2,7 @@
 
 import json
 import os
+from pathlib import Path
 import urllib.error
 import urllib.request
 
@@ -159,7 +160,8 @@ def test_speakers_command_prints_the_one_time_chrome_steps(tmp_path, monkeypatch
     out = capsys.readouterr().out
     assert "chrome://extensions" in out
     assert "Load unpacked" in out
-    assert "Them" in out
+    assert "Reload" in out
+    assert "/presence" in out
     assert (tmp_path / "chrome-extension" / "manifest.json").is_file()
     assert (tmp_path / "chrome-extension" / "content.js").is_file()
 
@@ -186,5 +188,68 @@ def test_extension_install_copies_files_and_writes_the_port(tmp_path):
         copied = handle.read()
     assert "const BRIDGE_PORT = 9876;" in copied
     assert "const BRIDGE_PORT = 8765;" not in copied
+    content = (Path(folder) / "content.js").read_text(encoding="utf-8")
+    assert "const PRESENCE_PORT = 9877;" in content
+    assert "const PRESENCE_PORT = 8766;" not in content
     with open(os.path.join(folder, "manifest.json"), encoding="utf-8") as handle:
         assert json.loads(handle.read())["name"]
+
+
+def test_chrome_unpacked_extension_id_is_deterministic(tmp_path):
+    from meeting_notes.extension_install import chrome_unpacked_extension_id
+
+    folder = tmp_path / "chrome-extension"
+    folder.mkdir()
+    ext_id = chrome_unpacked_extension_id(str(folder))
+    assert len(ext_id) == 32
+    assert set(ext_id) <= set("abcdefghijklmnop")
+    assert chrome_unpacked_extension_id(str(folder)) == ext_id
+
+
+def test_inspect_extension_state_detects_chrome_path_mismatch(tmp_path, capsys, monkeypatch):
+    import meeting_notes.cli as cli
+    from meeting_notes.extension_install import chrome_unpacked_extension_id, inspect_extension_state
+
+    control = tmp_path / "control"
+    install_extension(str(control), 8765)
+
+    other = tmp_path / "other-ext"
+    other.mkdir()
+    (other / "manifest.json").write_text('{"name":"Meeting Notes Speaker Tags","version":"1.3.0"}', encoding="utf-8")
+    chrome_dir = tmp_path / "Chrome"
+    default_prof = chrome_dir / "Default"
+    default_prof.mkdir(parents=True)
+    other_id = chrome_unpacked_extension_id(str(other))
+    (default_prof / "Preferences").write_text(
+        json.dumps(
+            {
+                "extensions": {
+                    "settings": {
+                        other_id: {
+                            "path": str(other),
+                            "manifest": {"name": "Meeting Notes Speaker Tags", "version": "1.3.0"},
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    state = inspect_extension_state(str(control), chrome_dir=str(chrome_dir))
+    assert state["chrome_accessible"] is True
+    assert state["installed_version"] == "1.4.0"
+    assert len(state["mismatches"]) == 1
+    assert state["mismatches"][0]["path_differs"] is True
+    assert state["mismatches"][0]["id"] == other_id
+
+    # update_loaded=True updates non-git loaded copies in place to keep the Chrome ID.
+    install_extension(str(control), 8765, update_loaded=True, chrome_dir=str(chrome_dir))
+    assert json.loads((other / "manifest.json").read_text(encoding="utf-8"))["version"] == "1.4.0"
+
+    monkeypatch.setattr(cli, "CONTROL_DIR", str(control))
+    monkeypatch.setattr("meeting_notes.extension_install._default_chrome_dir", lambda: str(chrome_dir))
+    cli.cmd_extension_status(cli.build_parser().parse_args(["extension", "status"]))
+    out = capsys.readouterr().out
+    assert "Mismatch:" in out
+    assert other_id in out

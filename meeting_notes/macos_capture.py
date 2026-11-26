@@ -236,3 +236,77 @@ def titles_need_permission(payload):
     if not windows:
         return False
     return all(not str(item.get("title") or "").strip() for item in windows)
+
+
+def retire_shim(home=None):
+    """Move the legacy DYLD shim aside and point the helper symlink at the signed app.
+
+    Safe to call more than once. Returns the backup path, or None when there
+    was no shim directory to move.
+    """
+    import time
+
+    root = os.path.join(home or os.path.expanduser("~"), ".meeting-notes")
+    shim = os.path.join(root, "shim")
+    moved = None
+    if os.path.isdir(shim):
+        backups = os.path.join(root, "backups")
+        os.makedirs(backups, exist_ok=True)
+        dest = os.path.join(backups, "shim-" + time.strftime("%Y%m%d%H%M%S"))
+        os.rename(shim, dest)
+        moved = dest
+    signed = signed_helper_path(home)
+    link = os.path.join(root, "bin", "meeting-audio-capture")
+    if os.path.isfile(signed):
+        if os.path.islink(link) or os.path.isfile(link):
+            os.remove(link)
+        os.symlink(signed, link)
+    return moved
+
+def fallback_probe_helper(exclude=None, home=None):
+    """Older capture helper candidate when the signed helper lacks Screen Recording."""
+    excluded = os.path.abspath(exclude) if exclude else None
+    for path in capture_helper_candidates(home):
+        if os.path.isfile(path) and (excluded is None or os.path.abspath(path) != excluded):
+            return path
+    return None
+
+
+def refresh_signed_screen_recording(home=None, run=None):
+    """Re-check the signed helper's Screen Recording grant via disclaimed spawn.
+
+    Fixes a stale marker written before responsible_spawn was used (which could
+    inherit Terminal's grant). Never touches record_ok. Returns the updated dict
+    or {} when no marker exists.
+    """
+    status = signed_helper_status(home)
+    if not status:
+        return {}
+    signed = signed_helper_path(home)
+    if not os.path.isfile(signed):
+        return status
+    if run is None:
+        from meeting_notes.responsible_spawn import run_responsible
+
+        code, text = run_responsible([signed, "permissions"], timeout=8)
+    else:
+        code, text = run([signed, "permissions"])
+    if code not in (0, None):
+        return status
+    try:
+        payload = json.loads((text or "").strip() or "{}")
+    except json.JSONDecodeError:
+        return status
+    if "screen_recording" not in payload:
+        return status
+    actual = bool(payload.get("screen_recording"))
+    if bool(status.get("screen_recording")) == actual:
+        return status
+    updated = dict(status)
+    updated["screen_recording"] = actual
+    root = home or os.path.expanduser("~")
+    marker = os.path.join(root, ".meeting-notes", "bin", SIGNED_MARKER)
+    from meeting_notes.atomic_io import atomic_write_json
+
+    atomic_write_json(marker, updated)
+    return updated

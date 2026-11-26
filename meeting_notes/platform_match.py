@@ -36,3 +36,17 @@ def process_matches(process_name, marker, platform=None):
         if alias in name:
             return True
     return False
+
+# Human labels for logs. The config/marker values stay chrome.exe / slack.exe.
+_DISPLAY = {
+    "chrome.exe": "Google Chrome",
+    "slack.exe": "Slack",
+}
+
+
+def display_label(marker, platform=None):
+    """A readable app name for logs. Markers themselves stay Windows-style."""
+    needle = (marker or "").lower()
+    if (platform or sys.platform) == "darwin" and needle in _DISPLAY:
+        return _DISPLAY[needle]
+    return marker or ""
