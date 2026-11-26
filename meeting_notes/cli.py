@@ -1468,20 +1468,42 @@ def cmd_extension_status(args):
     import json
     import urllib.request
 
-    from meeting_notes.extension_install import installed_extension_dir
+    from meeting_notes.extension_install import inspect_extension_state
     from meeting_notes.meet_presence import presence_port
 
-    folder = installed_extension_dir(CONTROL_DIR)
-    manifest = os.path.join(folder, "manifest.json")
-    if os.path.isfile(manifest):
-        try:
-            with open(manifest, encoding="utf-8") as handle:
-                version = json.load(handle).get("version") or "?"
-        except (OSError, ValueError):
-            version = "?"
-        print(f"Installed copy: {folder} (version {version})")
+    state = inspect_extension_state(CONTROL_DIR)
+    folder = state["installed_dir"]
+    if state["installed_version"]:
+        print(
+            f"Installed copy: {folder} "
+            f"(version {state['installed_version']}, expected Chrome ID {state['installed_id']})"
+        )
     else:
         print(f"Installed copy not found at {folder}. Run: meeting-notes extension install")
+    if state["chrome_accessible"]:
+        for entry in state["loaded_entries"]:
+            print(
+                f"Chrome loaded ({entry['profile']}): ID {entry['id']} "
+                f"version {entry.get('version') or '?'} from {entry.get('path') or '?'}"
+            )
+        for item in state["mismatches"]:
+            if item.get("path_differs"):
+                print(
+                    f"Mismatch: Chrome loads a different folder than {folder}. "
+                    "Reloading in chrome://extensions reads that folder's manifest, not the installed copy."
+                )
+            elif item.get("version_differs"):
+                print(
+                    f"Out of date in Chrome: Chrome still holds version {item.get('version')}, "
+                    f"disk has {state['installed_version']}. Click Reload in chrome://extensions."
+                )
+        if not state["loaded_entries"]:
+            print("Chrome Preferences readable: extension is not loaded in any Chrome profile.")
+    else:
+        print(
+            "Chrome Preferences not readable from this shell (macOS App Data protection). "
+            f"Verify in chrome://extensions that the ID is {state['installed_id']}."
+        )
     config = _load_config_lenient()
     port = presence_port(getattr(config, "speaker_bridge_port", 8765))
     health = "http://127.0.0.1:%s/health" % port
@@ -1504,7 +1526,6 @@ def cmd_extension_status(args):
         print("If Chrome already has the extension, click Reload on")
         print("chrome://extensions, then join a Meet. If it is not loaded,")
         print("run: meeting-notes extension install")
-
 
 def cmd_calendar(args):
     """Refresh calendar.json from macOS Calendar (and the configured ICS URL)."""
