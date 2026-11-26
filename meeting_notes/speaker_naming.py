@@ -102,7 +102,7 @@ def roster_entry(name, source, strength=1.0, email=""):
 def names_from_window_title(title, self_aliases=(), organizations=()):
     """Roster guesses from a Meet or Slack window title.
 
-    - "Meet - Partnerships Sync (Alex Rivera)" -> Alex Rivera (strong)
+    - "Meet - Partnerships Sync (Alex Rivera)" -> Alex Rivera (candidate)
     - "Mahmoud Ali (DM) - Greek - Slack" -> Mahmoud Ali (strong)
     - "Alex, Mahmoud - Greek - Slack" -> both (strong, group DM)
     - "Lukas <> Alex" -> Alex (weak; could be a company)
@@ -137,9 +137,12 @@ def names_from_window_title(title, self_aliases=(), organizations=()):
                 add(part, 1.0, "slack-group-dm")
             return found
         return found
+    # A name in parentheses is often the organizer or booking host (Calendly
+    # style "Partnerships Sync (Alex Rivera)"), who may be a teammate and
+    # not the only other person. It is a candidate, never proof on its own.
     for inner in re.findall(r"\(([^()]+)\)", body):
         for part in re.split(r",|&| and ", inner):
-            add(part, 0.9, "meeting-title")
+            add(part, 0.6, "meeting-title")
     if "<>" in body or " x " in body or " X " in body:
         stripped = re.sub(r"\([^()]*\)", "", body)
         for part in re.split(r"<>| x | X |/|\|", stripped):
@@ -364,7 +367,9 @@ def resolve_speakers(
     aliases |= {first_name(a).casefold() for a in list(self_aliases) + [self_label] if first_name(a)}
     roster = [entry for entry in (roster or []) if entry.get("name") and entry["name"].casefold() not in aliases]
     roster_names = [entry["name"] for entry in roster]
-    strong_roster = [entry["name"] for entry in roster if entry.get("strength", 1.0) >= 0.9]
+    # Rosters good enough for elimination: calendar, Slack DM / channel
+    # members, roster.json, Meet participants. Not names guessed from titles.
+    strong_roster = [entry["name"] for entry in roster if entry.get("strength", 1.0) >= 0.8]
     known = [clean_name(n) for n in known_people or [] if clean_name(n) and clean_name(n).casefold() not in aliases]
     voice_matches = voice_matches or {}
 
@@ -480,8 +485,8 @@ def resolve_speakers(
 
     # Elimination: one voice and one attendee left over.
     leftover_labels = [lab for lab in remote_labels if lab not in assigned]
-    leftover_names = [n for n in (strong_roster if roster_complete or strong_roster else []) if n.casefold() not in used]
-    if len(leftover_labels) == 1 and len(leftover_names) == 1 and len(remote_labels) > 1 and roster_complete:
+    leftover_names = [n for n in strong_roster if n.casefold() not in used]
+    if len(leftover_labels) == 1 and len(leftover_names) == 1 and len(remote_labels) > 1 and len(remote_labels) <= len(strong_roster):
         label, name = leftover_labels[0], leftover_names[0]
         if evidence.score(label, name) >= 0 and not evidence.negative.get((label, name)):
             evidence.add(label, name, 0.75, "the only attendee left after the other voices were named")
@@ -567,3 +572,26 @@ def _neighbour(turns, index, step, speaker, self_label):
 def _stamp(turn):
     seconds = max(0.0, float(turn.get("start", 0.0)))
     return f"{int(seconds // 60):02d}:{int(seconds % 60):02d}"
+
+
+def parse_channel_rosters(value):
+    """"executive: Mahmoud Lababidi, Alex Rivera; gtm: Alex" -> dict."""
+    rosters = {}
+    for chunk in str(value or "").split(";"):
+        if ":" not in chunk:
+            continue
+        channel, names = chunk.split(":", 1)
+        channel = clean_name(channel).lstrip("#").casefold()
+        people = [clean_name(n) for n in names.split(",") if clean_name(n)]
+        if channel and people:
+            rosters[channel] = people
+    return rosters
+
+
+def slack_channel_roster(title, rosters):
+    """Roster for a Slack channel huddle from `slack_channel_rosters`."""
+    title = clean_name(title)
+    if " - Slack" not in title:
+        return []
+    channel = title.split(" - ")[0].lstrip("#").casefold()
+    return [roster_entry(name, "slack-channel", 0.8) for name in (rosters or {}).get(channel, [])]

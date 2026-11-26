@@ -265,6 +265,7 @@ def naming_options(config):
         "self_aliases": config_list(getattr(config, "self_aliases", "")),
         "known_people": config_list(getattr(config, "known_people", "")),
         "organizations": config_list(getattr(config, "organizations", "")),
+        "slack_channel_rosters": getattr(config, "slack_channel_rosters", "") or "",
         "calendar": config,
         "profiles_path": None if bool(getattr(config, "voice_profiles", True)) else False,
         "update_profiles": bool(getattr(config, "voice_profiles", True)),

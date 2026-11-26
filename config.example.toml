@@ -122,6 +122,8 @@ self_aliases = ""
 # People you talk to often (first names are fine). Lets "thanks, Mahmoud"
 # name a voice even without a calendar entry.
 known_people = ""
+# Who can be in a Slack channel huddle (channel: names; channel: names).
+slack_channel_rosters = ""
 # Company / product names that are never read as a person in a title.
 organizations = "Greek, greek.fi, Bebop, Base, Coinbase"
 # Calendar attendees. A JSON events file (for example one synced into Google

@@ -1546,8 +1546,9 @@ def apply_naming(folder, labeled, voice_segments, voice_embeddings, events, self
         title_roster = sn.names_from_window_title(event_title, aliases, naming.get("organizations") or ())
     meet_names, _anons = remote_parties(events, self_label)
     meet_roster = [sn.roster_entry(name, "meet-participants") for name in meet_names]
+    channel_roster = sn.slack_channel_roster(title, sn.parse_channel_rosters(naming.get("slack_channel_rosters") or ""))
     roster = sn.merge_roster(
-        calendar_entries, sn.load_roster_file(folder), meet_roster, title_roster, self_aliases=aliases
+        calendar_entries, sn.load_roster_file(folder), meet_roster, title_roster, channel_roster, self_aliases=aliases
     )
     roster_complete = bool(calendar_entries) or any(
         entry.get("source") in ("slack-dm", "slack-group-dm", "roster-file", "meet-participants") for entry in roster

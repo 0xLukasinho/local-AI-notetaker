@@ -139,9 +139,38 @@ def test_nobody_is_named_after_a_name_they_addressed():
 
 def test_generic_remote_label_without_diarization_is_numbered():
     turns = [t(0, "Them", "Hello there."), t(5, "Lukas", "Hi.")]
-    speaker_map, renamed = sn.resolve_speakers(turns, "Lukas", roster=[sn.roster_entry("Jordan Blake", "meeting-title", 0.9)])
+    speaker_map, renamed = sn.resolve_speakers(turns, "Lukas", roster=[sn.roster_entry("Jordan Blake", "slack-dm", 1.0)])
     assert display(speaker_map, "Them") == "Jordan Blake"
     assert renamed[0]["speaker"] == "Jordan Blake"
+
+
+def test_title_name_alone_is_only_a_likely_name():
+    # "Partnerships Sync (Alex Rivera)": Alex is Greek's CGO and may be the
+    # host, not the Northwind guest. A single voice must not become Alex on
+    # the title alone.
+    roster = sn.names_from_window_title("Meet - Partnerships Sync (Alex Rivera)", ["Lukas"])
+    turns = [t(0, "Speaker 2", "Thanks for having us, the integration is on track.")]
+    speaker_map, _ = sn.resolve_speakers(turns, "Lukas", roster=roster)
+    assert speaker_map["Speaker 2"]["status"] == "unconfirmed"
+    assert display(speaker_map, "Speaker 2") == "Speaker 2 (unconfirmed: likely Alex Rivera)"
+
+
+def test_slack_channel_roster():
+    rosters = sn.parse_channel_rosters("executive: Mahmoud Lababidi, Alex Rivera; #gtm: Alex Rivera")
+    assert rosters == {"executive": ["Mahmoud Lababidi", "Alex Rivera"], "gtm": ["Alex Rivera"]}
+    roster = sn.slack_channel_roster("executive - Greek - Slack", rosters)
+    assert [e["name"] for e in roster] == ["Mahmoud Lababidi", "Alex Rivera"]
+    turns = [
+        t(0, "Lukas", "Mahmoud, where are we on the audit?"),
+        t(4, "Speaker 2", "Cyfrin signed off yesterday."),
+        t(8, "Speaker 3", "Great. Mahmoud, can you share the report?"),
+        t(12, "Speaker 2", "Sure, posting it now."),
+        t(16, "Speaker 2", "Alex, what's the launch date looking like?"),
+        t(20, "Speaker 3", "Second week of December."),
+    ]
+    speaker_map, _ = sn.resolve_speakers(turns, "Lukas", roster=roster)
+    assert display(speaker_map, "Speaker 2") == "Mahmoud Lababidi"
+    assert display(speaker_map, "Speaker 3") == "Alex Rivera"
 
 
 @pytest.mark.parametrize(

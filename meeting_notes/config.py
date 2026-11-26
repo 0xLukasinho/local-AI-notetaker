@@ -104,6 +104,8 @@ class Config:
     # People you talk to often. Names here can be matched when someone is
     # addressed by name, even with no calendar entry.
     known_people: str = ""
+    # Who can be in a Slack channel huddle: "executive: A B, C D; gtm: C D".
+    slack_channel_rosters: str = ""
     # Company / product names that must never be read as a person in titles.
     organizations: str = "Greek, greek.fi, Bebop, Base, Coinbase"
     # Calendar attendees: a JSON events file (e.g. synced into Google Drive)
