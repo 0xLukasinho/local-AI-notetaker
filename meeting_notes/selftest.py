@@ -286,7 +286,7 @@ def check_helper(report):
     try:
         requirement = subprocess.run(["codesign", "-d", "-r-", helper], capture_output=True, text=True, timeout=10)
         lines = (requirement.stdout + "\n" + requirement.stderr).splitlines()
-        designated = [line for line in lines if line.startswith("designated")]
+        designated = [line.lstrip("# ").strip() for line in lines if "designated" in line]
         report.add(PASS, "helper signature", designated[0] if designated else "unsigned or unreadable")
     except Exception:
         pass
@@ -310,8 +310,16 @@ def check_config(report, config):
     else:
         report.add(WARN, "transcript archive", "off (set transcript_archive_dir for a complete copy per call)")
     report.add(PASS if config.diarize else WARN, "diarize", str(config.diarize))
-    calendar = bool(config.calendar_json_path or config.calendar_ics_url)
-    report.add(PASS if calendar else WARN, "calendar roster", "configured" if calendar else "off: names come from titles, intros, addressing, voice profiles")
+    path = os.path.expanduser(config.calendar_json_path or "")
+    if config.calendar_ics_url:
+        report.add(PASS, "calendar roster", "private iCal URL configured")
+    elif path and os.path.isfile(path):
+        age = (time.time() - os.path.getmtime(path)) / 3600.0
+        report.add(PASS if age < 48 else WARN, "calendar roster", f"{path} (updated {age:.0f} h ago)")
+    elif path:
+        report.add(WARN, "calendar roster", f"{path} not there yet: names come from titles, intros, addressing, voice profiles")
+    else:
+        report.add(WARN, "calendar roster", "off: names come from titles, intros, addressing, voice profiles")
 
 
 def check_sessions(report, base=None, limit=5):
