@@ -1,0 +1,10 @@
+# voice|line   (three remote voices with clearly different timbre; see tests/test_e2e_capture.py)
+Ralph|Hi everyone, this is Alex from Northwind. Thanks for making the time today.
+Karen|Hey Alex, I'm Mahmoud. Good to finally meet you. Can you walk us through the integration timeline?
+Ralph|Sure. We are planning to ship the options vault integration in the first quarter, pending the security review.
+Aman|Hi, my name is Ravi, I run partnerships on the Base side. Mahmoud, do you have the latest volume numbers?
+Karen|Yes Ravi, weekly volume on Bebop is up about forty percent, mostly from the Coinbase wallet flow.
+Ralph|That is great to hear. Ravi, could you send the deck after this call?
+Aman|Absolutely Alex, I will send it tonight along with the onboarding checklist.
+Karen|Perfect. Alex, one more question about the settlement layer and how fees are split between the two teams.
+Ralph|Good question. Fees are split evenly for now, and we will revisit that after the pilot ends in March.

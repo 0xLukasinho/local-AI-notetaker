@@ -267,8 +267,19 @@ class Evidence:
         return sorted({name for (lab, name) in self.positive if lab == label})
 
 
+def similar_name(left, right, minimum=0.75):
+    """Whisper spelling drift: "Mahmood" ~ "Mahmoud", "Rafi" !~ "Ravi"."""
+    from difflib import SequenceMatcher
+
+    left, right = clean_name(left).casefold(), clean_name(right).casefold()
+    if not left or not right or left[0] != right[0]:
+        return False
+    return left == right or SequenceMatcher(None, left, right).ratio() >= minimum
+
+
 def _canonical(name, candidates):
-    """Map "Alex" to "Alex Rivera" when the roster has the full name."""
+    """Map "Alex" to "Alex Rivera" when the roster has the full name,
+    and a Whisper misspelling to the listed spelling."""
     name = clean_name(name)
     for candidate in candidates:
         if candidate.casefold() == name.casefold():
@@ -276,7 +287,35 @@ def _canonical(name, candidates):
     matches = [c for c in candidates if first_name(c).casefold() == name.casefold()]
     if len(matches) == 1:
         return matches[0]
+    fuzzy = [c for c in candidates if similar_name(c, name) or similar_name(first_name(c), name)]
+    if len(fuzzy) == 1:
+        return fuzzy[0]
     return name
+
+
+def _normalise_spellings(turns, candidates):
+    """Copy of `turns` with capitalised words that are near-misses of a known
+    first name rewritten to it, for evidence matching only."""
+    firsts = {}
+    for candidate in candidates:
+        first = first_name(candidate)
+        if first:
+            firsts[first] = candidate
+    if not firsts:
+        return turns
+    fixed = []
+    for turn in turns or []:
+        text = clean_name(turn.get("text"))
+
+        def swap(match):
+            word = match.group(0)
+            if word in firsts:
+                return word
+            hits = [first for first in firsts if similar_name(first, word)]
+            return hits[0] if len(hits) == 1 else word
+
+        fixed.append(dict(turn, text=re.sub(r"\b[A-Z][a-z]{2,}\b", swap, text)))
+    return fixed
 
 
 def resolve_speakers(
@@ -344,8 +383,8 @@ def resolve_speakers(
         if name and name not in candidates:
             candidates.append(name)
 
-    # Addressing by name.
-    ordered = [t for t in (turns or []) if clean_name(t.get("text"))]
+    # Addressing by name (spelling drift normalised to the candidate names).
+    ordered = [t for t in _normalise_spellings(turns, candidates) if clean_name(t.get("text"))]
     for index, turn in enumerate(ordered):
         speaker = clean_name(turn.get("speaker"))
         for name in candidates:

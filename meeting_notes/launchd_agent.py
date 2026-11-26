@@ -195,7 +195,7 @@ def wait_for_session_event(helper=None, run=None, sleep=None):
     sleep = sleep or time.sleep
     run = run or subprocess.run
     if helper is None:
-        helper = find_capture_helper()
+        helper = find_capture_helper(purpose="probe")
     if not helper:
         sleep(60)
         return "helper-missing"

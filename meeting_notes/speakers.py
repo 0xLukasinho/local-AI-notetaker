@@ -1194,6 +1194,8 @@ def build_document(segments, events, self_label, source, diarization=None):
                 "track": segment.get("track") or "",
             }
         )
+        if segment.get("voice"):
+            rounded[-1]["voice"] = segment["voice"]
     observed = meet_self_name(events)
     document = {
         "self_name": self_label,
@@ -1252,6 +1254,21 @@ def speaker_webhook_fields(folder):
     source = document.get("speaker_source")
     if source:
         fields["speaker_source"] = str(source)
+    speaker_map = document.get("speaker_map")
+    if isinstance(speaker_map, dict) and speaker_map:
+        fields["speaker_map"] = {
+            str(label): {
+                "display": entry.get("display"),
+                "name": entry.get("name"),
+                "confidence": entry.get("confidence"),
+                "status": entry.get("status"),
+                "evidence": list(entry.get("evidence") or [])[:5],
+            }
+            for label, entry in speaker_map.items()
+            if isinstance(entry, dict)
+        }
+    if document.get("warning"):
+        fields["warning"] = str(document["warning"])
     return fields
 
 
@@ -1603,3 +1620,55 @@ def apply_naming(folder, labeled, voice_segments, voice_embeddings, events, self
         "window_title": title,
     }
     return turns, report
+
+
+def rename_voice(folder, voice, name, profiles=None):
+    """Put `name` on every line of `voice` ("Speaker 3") in a finished session.
+
+    Rewrites transcript.txt and transcript.json, marks the voice confirmed by
+    the user, and (when `profiles` is given and voices.json has an embedding)
+    saves the voice profile so the person is recognised next time.
+    """
+    from meeting_notes.atomic_io import atomic_write_json, atomic_write_text
+
+    name = clean_name(name)
+    path = os.path.join(folder, TRANSCRIPT_JSON)
+    with open(path, "r", encoding="utf-8") as handle:
+        document = json.load(handle)
+    smap = document.get("speaker_map") or {}
+    label = voice
+    if label not in smap:
+        for key, entry in smap.items():
+            if entry.get("display") == voice:
+                label = key
+                break
+    if label not in smap:
+        raise KeyError(f"no voice {voice!r} in {path}")
+    old_display = smap[label].get("display")
+    changed = 0
+    for segment in document.get("segments") or []:
+        if segment.get("voice") == label or (not segment.get("voice") and segment.get("speaker") == old_display):
+            segment["speaker"] = name
+            changed += 1
+    smap[label] = {
+        "name": name,
+        "display": name,
+        "confidence": 1.0,
+        "status": "confirmed",
+        "evidence": ["named by the user"],
+    }
+    document["speaker_map"] = smap
+    document["participants"] = participant_list(document.get("self_name"), document.get("segments"), [])
+    atomic_write_json(path, document)
+    atomic_write_text(os.path.join(folder, "transcript.txt"), render_transcript(document.get("segments"), labeled=True))
+    if profiles is not None:
+        try:
+            with open(os.path.join(folder, VOICES_JSON), "r", encoding="utf-8") as handle:
+                voices = json.load(handle).get("voices") or {}
+        except (OSError, ValueError):
+            voices = {}
+        vector = (voices.get(label) or {}).get("embedding")
+        if vector:
+            profiles.update(name, vector, session=os.path.basename(os.path.abspath(folder)))
+            profiles.save()
+    return changed

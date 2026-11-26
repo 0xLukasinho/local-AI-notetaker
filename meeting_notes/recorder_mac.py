@@ -80,10 +80,16 @@ class _TapfixEnv:
     MEETING_NOTES_TAPFIX=0 turns it off.
     """
 
+    def __init__(self, helper=None):
+        self.helper = helper
+
     def __enter__(self):
+        from meeting_notes.macos_capture import is_signed_helper
+
         self.previous = os.environ.get("DYLD_INSERT_LIBRARIES")
         self.applied = (
-            os.environ.get("MEETING_NOTES_TAPFIX", "1") != "0"
+            not is_signed_helper(self.helper)  # built from fixed source; no shim
+            and os.environ.get("MEETING_NOTES_TAPFIX", "1") != "0"
             and self.previous is None
             and os.path.isfile(TAPFIX_SHIM)
         )
@@ -104,7 +110,7 @@ def _start_helper(helper, output_path, device_index, separate_tracks=False):
     AVFoundation input and cannot hear other applications, so it is only the
     fallback when the helper is missing or refuses to start.
     """
-    with _TapfixEnv():
+    with _TapfixEnv(helper):
         process = popen_responsible(
             helper_record_argv(
                 helper,

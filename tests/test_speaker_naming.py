@@ -331,3 +331,27 @@ def test_produce_transcript_puts_names_on_every_line(tmp_path, monkeypatch):
     assert (folder / "voices.json").exists()
     profiles = VoiceProfiles(str(tmp_path / "voices.json"))
     assert profiles.names() == ["Alex Rivera"]  # Mahmoud (0.80, self-intro only) not yet saved
+
+
+def test_whisper_misspelling_is_mapped_to_the_known_spelling():
+    turns = [
+        t(0, "Speaker 2", "Hey, I'm Mahmood. Good to meet you."),
+        t(5, "Speaker 3", "Yes Mahmood, volume is up."),
+    ]
+    speaker_map, _ = sn.resolve_speakers(turns, "Lukas", known_people=["Mahmoud"])
+    assert display(speaker_map, "Speaker 2") == "Mahmoud"
+    assert sn.similar_name("Mahmoud", "Mahmood")
+    assert not sn.similar_name("Ravi", "Dave")
+
+
+def test_vocabulary_includes_people_names(tmp_path):
+    from meeting_notes import session_finish
+    from meeting_notes.config import Config
+
+    folder = tmp_path / "s"
+    folder.mkdir()
+    (folder / "status.json").write_text(json.dumps({"window_title": "Meet - Partnerships Sync (Alex Rivera)"}))
+    config = Config(known_people="Mahmoud, Priya", voice_profiles=False, self_name="Lukas")
+    text = session_finish._vocabulary_with_names(str(folder), config, "Greek, Bebop.")
+    assert "Mahmoud" in text and "Priya" in text and "Alex Rivera" in text
+    assert session_finish._vocabulary_with_names(str(folder), Config(whisper_vocabulary=""), "x") == ""

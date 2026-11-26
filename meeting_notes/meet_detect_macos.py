@@ -34,7 +34,7 @@ def _read(now=None, runner=None, helper=None):
     if cached is not None and current - float(_cache["at"]) < _CACHE_SECONDS:
         return cached
     if helper is None:
-        helper = find_capture_helper()
+        helper = find_capture_helper(purpose="probe")
     payload = run_probe(helper, runner)
     _cache["at"] = current
     _cache["payload"] = payload
