@@ -2,6 +2,7 @@
 
 import json
 import os
+from pathlib import Path
 import urllib.error
 import urllib.request
 
@@ -159,7 +160,8 @@ def test_speakers_command_prints_the_one_time_chrome_steps(tmp_path, monkeypatch
     out = capsys.readouterr().out
     assert "chrome://extensions" in out
     assert "Load unpacked" in out
-    assert "Them" in out
+    assert "Reload" in out
+    assert "/presence" in out
     assert (tmp_path / "chrome-extension" / "manifest.json").is_file()
     assert (tmp_path / "chrome-extension" / "content.js").is_file()
 
@@ -186,5 +188,8 @@ def test_extension_install_copies_files_and_writes_the_port(tmp_path):
         copied = handle.read()
     assert "const BRIDGE_PORT = 9876;" in copied
     assert "const BRIDGE_PORT = 8765;" not in copied
+    content = (Path(folder) / "content.js").read_text(encoding="utf-8")
+    assert "const PRESENCE_PORT = 9877;" in content
+    assert "const PRESENCE_PORT = 8766;" not in content
     with open(os.path.join(folder, "manifest.json"), encoding="utf-8") as handle:
         assert json.loads(handle.read())["name"]

@@ -135,6 +135,7 @@ class SessionSpec:
     whisper_model: str
     language: str
     source: str = ""
+    meet_participants: tuple = ()
 
 
 @dataclass
@@ -524,6 +525,7 @@ class MeetWatcher:
             folder=folder,
             meet_code=sighting.meet_code,
             window_title=sighting.window_title,
+            meet_participants=tuple(getattr(sighting, "participants", None) or ()),
             joined_at=self.wall_iso(),
             transcript_only=bool(self.config.watcher_transcript_only),
             whisper_model=self.config.whisper_model,

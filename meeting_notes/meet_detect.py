@@ -42,6 +42,8 @@ class Sighting:
     # clock time when it names the session (a Huddle window with no channel).
     source: str = "google-meet"
     unnamed: bool = False
+    # Names the Meet extension reported (may be empty). Never inferred here.
+    participants: tuple = ()
 
 
 @dataclass(frozen=True)

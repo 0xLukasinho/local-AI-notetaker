@@ -236,3 +236,29 @@ def titles_need_permission(payload):
     if not windows:
         return False
     return all(not str(item.get("title") or "").strip() for item in windows)
+
+
+def retire_shim(home=None):
+    """Move the legacy DYLD shim aside and point the helper symlink at the signed app.
+
+    Safe to call more than once. Returns the backup path, or None when there
+    was no shim directory to move.
+    """
+    import time
+
+    root = os.path.join(home or os.path.expanduser("~"), ".meeting-notes")
+    shim = os.path.join(root, "shim")
+    moved = None
+    if os.path.isdir(shim):
+        backups = os.path.join(root, "backups")
+        os.makedirs(backups, exist_ok=True)
+        dest = os.path.join(backups, "shim-" + time.strftime("%Y%m%d%H%M%S"))
+        os.rename(shim, dest)
+        moved = dest
+    signed = signed_helper_path(home)
+    link = os.path.join(root, "bin", "meeting-audio-capture")
+    if os.path.isfile(signed):
+        if os.path.islink(link) or os.path.isfile(link):
+            os.remove(link)
+        os.symlink(signed, link)
+    return moved

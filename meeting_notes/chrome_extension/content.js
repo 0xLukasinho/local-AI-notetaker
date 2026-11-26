@@ -11,6 +11,7 @@
 // Old speaking-class names matched layout on every tile after a Meet restyle,
 // so every remote person was reported as talking. The ring and a clearly
 // elevated audio level are the signals that still mean one person.
+const PRESENCE_PORT = 8766;
 const AUDIO_LEVEL_FLOOR = 8;
 const BLOCKED_NAMES = [
   "mute",
@@ -521,15 +522,29 @@ function meetPresence() {
     const label = String(
       (button.getAttribute && button.getAttribute("aria-label")) || button.textContent || ""
     ).toLowerCase();
-    if (label.indexOf("leave call") !== -1 || label.indexOf("leave meeting") !== -1) {
+    if (
+      label.indexOf("leave call") !== -1 ||
+      label.indexOf("leave meeting") !== -1 ||
+      label.indexOf("hang up") !== -1 ||
+      label.indexOf("end call") !== -1 ||
+      label === "leave"
+    ) {
       leave = true;
     }
     if (label.indexOf("join now") !== -1 || label.indexOf("ask to join") !== -1) {
       lobby = true;
     }
   }
+  // Tiles with data-participant-id mean the call UI is up. Do not treat a
+  // live call as the lobby just because the leave button's label changed.
+  let tiles = 0;
+  try {
+    tiles = document.querySelectorAll("[data-participant-id]").length;
+  } catch (err) {
+    tiles = 0;
+  }
   let phase = "left";
-  if (leave) {
+  if (leave || tiles > 0) {
     phase = "in-call";
   } else if (lobby || code) {
     phase = "lobby";
@@ -546,12 +561,24 @@ function meetPresence() {
   } catch (err) {
     title = "";
   }
+  const people = [];
+  try {
+    const snapshot = collect();
+    for (const person of snapshot.participants || []) {
+      if (person && person.name) {
+        people.push({ name: person.name, self: !!person.self });
+      }
+    }
+  } catch (err) {
+    // Presence still reports the code and phase without names.
+  }
   return {
     meet_code: code,
     in_call: phase === "in-call",
     phase: phase,
     visible: visible,
     title: title,
+    participants: people,
   };
 }
 
@@ -720,6 +747,14 @@ function sendPresence() {
   } catch (err) {
     // The watcher is down. The next heartbeat tries again.
   }
+  // Fallback if the service worker is asleep or Chrome blocks the SW fetch.
+  try {
+    fetch("http://127.0.0.1:" + PRESENCE_PORT + "/presence", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }).catch(function () {});
+  } catch (err) {}
 }
 
 if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.sendMessage) {

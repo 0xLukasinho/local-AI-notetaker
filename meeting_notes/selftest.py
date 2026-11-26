@@ -362,8 +362,12 @@ def run(args, config, out=None):
             if not os.path.isfile(helper):
                 report.add(FAIL, "signed helper", f"{helper} not built (run scripts/install_macos.sh)")
                 return report
-            perm = subprocess.run([helper, "permissions", "--request"], capture_output=True, text=True, timeout=120)
-            report.add(PASS, "signed helper permissions", perm.stdout.strip() or perm.stderr.strip()[-200:])
+            from meeting_notes.responsible_spawn import run_responsible
+
+            # Must disclaim Python/Terminal, otherwise this inherits Terminal's
+            # Screen Recording grant and writes a false "granted" marker.
+            code, text = run_responsible([helper, "permissions", "--request"], timeout=120)
+            report.add(PASS, "signed helper permissions", (text or "").strip() or f"exit {code}")
         work = tempfile.mkdtemp(prefix="meeting-notes-selftest-")
         try:
             clip, turns = build_clip(work)
@@ -374,7 +378,13 @@ def run(args, config, out=None):
             captured = judge_capture(result, report)
             if captured and args.verify_signed:
                 _write_signed_marker(helper)
-                report.add(PASS, "signed helper", "verified; recording now uses it (shim no longer loaded)")
+                from meeting_notes.macos_capture import retire_shim
+
+                backup = retire_shim()
+                note = "verified; recording now uses it (shim no longer loaded)"
+                if backup:
+                    note += f"; shim moved to {backup}"
+                report.add(PASS, "signed helper", note)
             if captured and args.e2e:
                 text, document = name_capture(folder, config, model=args.model)
                 print("--- transcript ---", file=report.out)
@@ -395,8 +405,10 @@ def _write_signed_marker(helper):
 
     screen = False
     try:
-        perm = subprocess.run([helper, "permissions"], capture_output=True, text=True, timeout=30)
-        screen = bool(json.loads(perm.stdout.strip() or "{}").get("screen_recording"))
+        from meeting_notes.responsible_spawn import run_responsible
+
+        _code, text = run_responsible([helper, "permissions"], timeout=30)
+        screen = bool(json.loads((text or "").strip() or "{}").get("screen_recording"))
     except Exception:
         screen = False
     atomic_write_json(

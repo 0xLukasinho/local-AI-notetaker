@@ -347,6 +347,22 @@ def _wants_transcript_only(args, config):
     return bool(config.transcript_only)
 
 
+def _parse_name_list(value):
+    """Comma-separated display names. Empty or missing becomes []."""
+    if not value:
+        return []
+    names = []
+    seen = set()
+    for part in str(value).split(","):
+        name = " ".join(part.split())
+        key = name.casefold()
+        if not name or key in seen:
+            continue
+        seen.add(key)
+        names.append(name)
+    return names
+
+
 def _optional_text(value):
     if value is None:
         return None
@@ -466,6 +482,7 @@ def cmd_start(args):
         language=language,
         meet_code=_optional_text(getattr(args, "meet_code", None)),
         window_title=_optional_text(getattr(args, "window_title", None)),
+        meet_participants=_parse_name_list(getattr(args, "meet_participants", None)),
         joined_at=_optional_text(getattr(args, "joined_at", None)),
         break_ok=False,
         honor_existing_stop=bool(automated or output_dir),
@@ -1045,19 +1062,20 @@ def cmd_speakers(args):
     print("  3. Click Load unpacked")
     print("  4. Choose the folder above")
     print()
+    presence = int(config.speaker_bridge_port) + 1
     print(
-        "The extension reads participant names and, if you turn captions on,"
+        "The extension sends the Meet code and participant names to"
     )
-    print("the caption speaker on meet.google.com, and sends them")
+    print(f"127.0.0.1:{presence}/presence so the watcher can start the session")
+    print("and name speakers. If you turn captions on (CC button, visible only")
     print(
-        f"to 127.0.0.1:{config.speaker_bridge_port} on this computer while a recording"
+        f"to you), caption speakers also go to 127.0.0.1:{config.speaker_bridge_port}"
     )
-    print("is running. Other people in the call cannot see it.")
-    print("Turn on captions with the CC button in Meet. That is what names")
-    print("each remote speaker. Captions are only shown to you.")
-    print("Run this command again after you change speaker_bridge_port, then click")
-    print("Reload on the extension.")
-    print("Recording works without the extension: you are self_name, everyone else is Them.")
+    print("while a recording is running. Other people in the call cannot see it.")
+    print("After every update of this folder, open chrome://extensions and click")
+    print("Reload on Meeting Notes Speaker Tags.")
+    print("Recording still works without the extension; names then come from")
+    print("calendar, titles, intros, addressing, and voice profiles.")
 
 
 def cmd_watch(args):
@@ -1170,6 +1188,10 @@ def build_parser():
     )
     start_parser.add_argument("--meet-code", help="Google Meet code, stored in status.json")
     start_parser.add_argument("--window-title", help="Browser window title, stored in status.json")
+    start_parser.add_argument(
+        "--meet-participants",
+        help="Comma-separated Meet participant names from the Chrome extension, stored in status.json",
+    )
     start_parser.add_argument(
         "--joined-at",
         help="ISO 8601 join time with offset, stored in status.json",
@@ -1332,6 +1354,25 @@ def build_parser():
     )
     speakers_parser.set_defaults(func=cmd_speakers)
 
+    extension_parser = subparsers.add_parser(
+        "extension",
+        help="Install or check the Chrome extension that reports Meet participants",
+    )
+    extension_subs = extension_parser.add_subparsers(dest="extension_command")
+    ext_install = extension_subs.add_parser("install", help="Copy the extension and print Chrome reload steps")
+    ext_install.add_argument("--path", action="store_true", help="Print the extension folder only")
+    extension_subs.add_parser("status", help="Whether the watcher has heard from the extension")
+    extension_parser.set_defaults(func=cmd_extension, extension_command="install")
+
+    calendar_parser = subparsers.add_parser(
+        "calendar",
+        help="Refresh calendar attendees used to name speakers",
+    )
+    calendar_subs = calendar_parser.add_subparsers(dest="calendar_command", required=True)
+    cal_sync = calendar_subs.add_parser("sync", help="Write upcoming Calendar.app events to calendar.json")
+    cal_sync.add_argument("--days", type=int, default=14, help="How many days ahead to include (default 14)")
+    calendar_parser.set_defaults(func=cmd_calendar)
+
     selftest_parser = subparsers.add_parser(
         "selftest",
         help="Health check: watcher, helper, models, config; --capture/--e2e record a test clip",
@@ -1351,7 +1392,7 @@ def build_parser():
     voices_subs.add_parser("list", help="People with a saved voice profile")
     show = voices_subs.add_parser("show", help="Speaker map of one session")
     show.add_argument("folder")
-    name = voices_subs.add_parser("name", help='Name a voice in a session: voices name FOLDER "Speaker 3" "Mahmoud"')
+    name = voices_subs.add_parser("name", help='Name a voice in a session: voices name FOLDER "Speaker 3" "Jordan"')
     name.add_argument("folder")
     name.add_argument("voice")
     name.add_argument("name")
@@ -1413,6 +1454,71 @@ def cmd_voices(args):
 
     changed = rename_voice(folder, args.voice, args.name, profiles=store)
     print(f"Renamed {changed} line(s) to {args.name}. Voice profile saved when available.")
+
+
+def cmd_extension(args):
+    """Install or report the Meet Chrome extension."""
+    if getattr(args, "extension_command", None) == "status":
+        return cmd_extension_status(args)
+    return cmd_speakers(args)
+
+
+def cmd_extension_status(args):
+    """Show whether the watcher has heard from the Meet extension."""
+    import json
+    import urllib.request
+
+    from meeting_notes.extension_install import installed_extension_dir
+    from meeting_notes.meet_presence import presence_port
+
+    folder = installed_extension_dir(CONTROL_DIR)
+    manifest = os.path.join(folder, "manifest.json")
+    if os.path.isfile(manifest):
+        try:
+            with open(manifest, encoding="utf-8") as handle:
+                version = json.load(handle).get("version") or "?"
+        except (OSError, ValueError):
+            version = "?"
+        print(f"Installed copy: {folder} (version {version})")
+    else:
+        print(f"Installed copy not found at {folder}. Run: meeting-notes extension install")
+    config = _load_config_lenient()
+    port = presence_port(getattr(config, "speaker_bridge_port", 8765))
+    health = "http://127.0.0.1:%s/health" % port
+    try:
+        with urllib.request.urlopen(health, timeout=2) as resp:
+            body = resp.read().decode("utf-8", "replace")
+        print(f"Presence listener: {health} -> {body.strip()}")
+    except OSError:
+        print(f"Presence listener: {health} not reachable (is the watcher running?)")
+    beat = os.path.join(CONTROL_DIR, "heartbeat.json")
+    seen = "unknown"
+    if os.path.isfile(beat):
+        try:
+            with open(beat, encoding="utf-8") as handle:
+                seen = json.load(handle).get("extension_presence") or "never"
+        except (OSError, ValueError):
+            seen = "unknown"
+    print(f"Watcher last heard from the extension: {seen}")
+    if seen == "never":
+        print("If Chrome already has the extension, click Reload on")
+        print("chrome://extensions, then join a Meet. If it is not loaded,")
+        print("run: meeting-notes extension install")
+
+
+def cmd_calendar(args):
+    """Refresh calendar.json from macOS Calendar (and the configured ICS URL)."""
+    from meeting_notes.calendar_sync import sync_calendar
+
+    config = _load_config_lenient()
+    days = int(getattr(args, "days", 14) or 14)
+    try:
+        path, count = sync_calendar(config, days=days)
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    print(f"Wrote {count} event(s) to {path}")
+    print("Attendee names stay in that file (not in the repo) and are used to name speakers.")
 
 
 def cmd_models(args):

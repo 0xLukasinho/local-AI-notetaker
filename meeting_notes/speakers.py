@@ -1545,6 +1545,10 @@ def apply_naming(folder, labeled, voice_segments, voice_embeddings, events, self
     if event_title and not title_roster:
         title_roster = sn.names_from_window_title(event_title, aliases, naming.get("organizations") or ())
     meet_names, _anons = remote_parties(events, self_label)
+    for name in status.get("meet_participants") or []:
+        text = " ".join(str(name).split())
+        if text and text.casefold() not in {n.casefold() for n in meet_names}:
+            meet_names.append(text)
     meet_roster = [sn.roster_entry(name, "meet-participants") for name in meet_names]
     channel_roster = sn.slack_channel_roster(title, sn.parse_channel_rosters(naming.get("slack_channel_rosters") or ""))
     roster = sn.merge_roster(

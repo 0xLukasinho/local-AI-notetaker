@@ -12,6 +12,7 @@ from meeting_notes.atomic_io import atomic_write_text
 
 _FILES = ("manifest.json", "content.js", "background.js")
 _PORT_LINE = "const BRIDGE_PORT = 8765;"
+_PRESENCE_LINE = "const PRESENCE_PORT = 8766;"
 
 
 def extension_source_dir():
@@ -41,5 +42,11 @@ def install_extension(control_dir, port):
             if needle not in text:
                 raise RuntimeError("background.js is missing the BRIDGE_PORT line")
             text = text.replace(needle, f"const BRIDGE_PORT = {port};", 1)
+        if name == "content.js":
+            needle = _PRESENCE_LINE
+            if needle not in text:
+                raise RuntimeError("content.js is missing the PRESENCE_PORT line")
+            presence_port = port + 1 if port < 65535 else port - 1
+            text = text.replace(needle, f"const PRESENCE_PORT = {presence_port};", 1)
         atomic_write_text(os.path.join(destination, name), text)
     return destination

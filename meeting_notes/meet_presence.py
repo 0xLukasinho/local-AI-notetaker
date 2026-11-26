@@ -32,6 +32,26 @@ def presence_port(speaker_bridge_port):
     return port
 
 
+
+def _presence_names(raw):
+    """Display names from the extension payload. Never invents a name."""
+    names = []
+    seen = set()
+    for item in raw or []:
+        if isinstance(item, str):
+            name = " ".join(item.split())
+        elif isinstance(item, dict):
+            name = " ".join(str(item.get("name") or "").split())
+        else:
+            continue
+        key = name.casefold()
+        if not name or key in seen:
+            continue
+        seen.add(key)
+        names.append(name)
+    return names
+
+
 def parse_presence(body):
     """Normalize one heartbeat. None when it is not an object."""
     if not isinstance(body, dict):
@@ -43,12 +63,14 @@ def parse_presence(body):
     code = extract_meet_code(str(body.get("meet_code") or "")) or ""
     title = " ".join(str(body.get("title") or "").split())
     visible = body.get("visible")
+    participants = _presence_names(body.get("participants"))
     return {
         "meet_code": code,
         "phase": phase,
-        "in_call": phase == "in-call" and bool(code or title),
+        "in_call": phase == "in-call" and bool(code or title or participants),
         "visible": bool(visible) if visible is not None else None,
         "title": title[:200],
+        "participants": participants,
     }
 
 
@@ -71,6 +93,7 @@ def sighting_from_presence(parsed):
         meet_code=code or None,
         window_title=window,
         source="google-meet",
+        participants=tuple(parsed.get("participants") or ()),
     )
 
 
