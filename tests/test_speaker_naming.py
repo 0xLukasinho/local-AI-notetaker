@@ -79,7 +79,10 @@ def test_slack_huddle_without_calendar_uses_transcript_evidence():
         t(15, "Speaker 2", "No worries Dina, we just started."),
     ]
     speaker_map, _ = sn.resolve_speakers(turns, "Lukas", roster=[], known_people=["Mahmoud"])
-    # "Dina here" is a self-introduction: confirmed even though nobody listed her.
+    # "Dina here" names nobody on a list (participants, configured people, or
+    # the voice store), so the voice stays unnamed instead of trusting a word.
+    assert display(speaker_map, "Speaker 3") == "Speaker 3"
+    speaker_map, _ = sn.resolve_speakers(turns, "Lukas", roster=[], known_people=["Mahmoud", "Dina"])
     assert display(speaker_map, "Speaker 3") == "Dina"
     # Mahmoud was asked a question and this voice answered: one weak-ish signal,
     # plus Speaker 2 addressed "Dina" so it is not Dina. Not enough to confirm.
@@ -335,7 +338,7 @@ def test_produce_transcript_puts_names_on_every_line(tmp_path, monkeypatch):
     monkeypatch.setattr(
         speakers,
         "_utterance_timeline",
-        lambda folder, segs, models_dir=None: (voices, {"backend": "fake", "clusters": 2}, {"0": _unit([1, 0]), "1": _unit([0, 1])}),
+        lambda folder, segs, models_dir=None, min_clusters=1: (voices, {"backend": "fake", "clusters": 2}, {"0": _unit([1, 0]), "1": _unit([0, 1])}),
     )
     text, document = speakers.produce_transcript(
         str(folder),
@@ -344,7 +347,7 @@ def test_produce_transcript_puts_names_on_every_line(tmp_path, monkeypatch):
         transcribe_plain=lambda path: "",
         transcribe_paths=lambda paths: [mine, others],
         diarize=True,
-        naming={"profiles_path": str(tmp_path / "voices.json")},
+        naming={"profiles_path": str(tmp_path / "voices.json"), "known_people": ["Mahmoud"]},
     )
     lines = text.splitlines()
     assert lines == [
@@ -359,7 +362,7 @@ def test_produce_transcript_puts_names_on_every_line(tmp_path, monkeypatch):
     assert document["speaker_naming"]["roster"] == [{"name": "Alex Rivera", "source": "meeting-title"}]
     assert (folder / "voices.json").exists()
     profiles = VoiceProfiles(str(tmp_path / "voices.json"))
-    assert profiles.names() == ["Alex Rivera"]  # Mahmoud (0.80, self-intro only) not yet saved
+    assert profiles.names() == ["Alex Rivera", "Mahmoud"]  # both listed and confirmed
 
 
 def test_whisper_misspelling_is_mapped_to_the_known_spelling():
@@ -400,7 +403,30 @@ def test_e2e_regression_intro_drowned_out_but_addressing_names_the_voice():
         t(47, "Speaker 3", "Perfect. Alex, one more question about the settlement layer."),
         t(54, "Speaker 2", "Good question. Fees are split evenly for now."),
     ]
-    speaker_map, _ = sn.resolve_speakers(turns, "Lukas")
+    speaker_map, _ = sn.resolve_speakers(turns, "Lukas", known_people=["Alex", "Mahmoud", "Ravi"])
     assert display(speaker_map, "Speaker 2") == "Alex"
     assert display(speaker_map, "Speaker 3") == "Mahmoud"
     assert display(speaker_map, "Speaker 4") == "Ravi"
+
+
+def test_common_words_are_never_names():
+    turns = [
+        t(0, "Lukas", "Awesome, yeah. Anything you need from us?"),
+        t(4, "Speaker 2", "Yeah, I think the diagrams would be good."),
+        t(9, "Speaker 2", "Awesome, thanks."),
+    ]
+    speaker_map, _ = sn.resolve_speakers(turns, "Lukas", roster=[])
+    assert display(speaker_map, "Speaker 2") == "Speaker 2"
+
+
+def test_unlisted_addressed_name_is_not_used_but_listed_one_is():
+    turns = [
+        t(0, "Speaker 2", "Hey Lukas."),
+        t(1, "Lukas", "Hey Bill, how's it going?"),
+        t(3, "Speaker 2", "Good, thanks. How are you?"),
+    ]
+    speaker_map, _ = sn.resolve_speakers(turns, "Lukas", roster=[])
+    assert "Bill" not in display(speaker_map, "Speaker 2")
+    roster = [sn.roster_entry("Bill Liang", "meet"), sn.roster_entry("Katia Banina", "meet")]
+    speaker_map, _ = sn.resolve_speakers(turns, "Lukas", roster=roster)
+    assert "Bill Liang" in display(speaker_map, "Speaker 2")

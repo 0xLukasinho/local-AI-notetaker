@@ -98,3 +98,34 @@ def test_chunks_reassemble_to_the_exact_transcript():
     rebuilt = "".join(body["transcript"] for body in sorted(bodies, key=lambda b: b["chunk_index"]))
     assert hashlib.sha256(rebuilt.encode()).hexdigest() == bodies[0]["transcript_sha256"]
     assert {body["chunk_count"] for body in bodies} == {len(bodies)}
+
+
+def test_unconfirmed_speaker_keeps_audio_and_flags_relabel(tmp_path):
+    import json as _json
+    from types import SimpleNamespace
+
+    from meeting_notes import session_finish
+
+    folder = tmp_path / "2026-01-02_abc-defg-hij"
+    folder.mkdir()
+    (folder / "audio.wav").write_bytes(b"RIFF" + b"\0" * 64)
+    (folder / "transcript.txt").write_text("[00:01] Lukas: hi\n[00:02] Speaker 2: hello\n", encoding="utf-8")
+    (folder / "status.json").write_text(
+        _json.dumps(
+            {
+                "speaker_map": {
+                    "Lukas": {"status": "confirmed", "display": "Lukas"},
+                    "Speaker 2": {"status": "unconfirmed", "display": "Speaker 2 (unconfirmed: likely Bill Liang)"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = SimpleNamespace(delete_audio_requires_delivery=True)
+    removed = session_finish._retire_audio(str(folder), config, False, True, True, True, lambda *a, **k: None)
+    assert removed == []
+    assert (folder / "audio.wav").exists()
+    status = _json.loads((folder / "status.json").read_text(encoding="utf-8"))
+    assert status["needs_relabel"] is True
+    assert status["audio_kept"] is True
+    assert "not confident" in status["audio_kept_reason"]

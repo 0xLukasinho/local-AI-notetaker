@@ -81,3 +81,13 @@ def test_macos_calendar_denied_is_an_error():
         assert "Calendar" in str(exc)
     else:
         raise AssertionError("expected RuntimeError")
+
+
+def test_missing_calendar_is_optional(tmp_path):
+    from types import SimpleNamespace
+
+    from meeting_notes.calendar_roster import calendar_roster
+
+    config = SimpleNamespace(calendar_json_path=str(tmp_path / "missing.json"), calendar_ics_url="")
+    entries, title = calendar_roster({"meet_code": "abc-defg-hij", "joined_at": "2026-01-02T10:00:00-05:00"}, config)
+    assert entries == [] and title is None
