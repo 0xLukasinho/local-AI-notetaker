@@ -833,8 +833,12 @@ MIN_UTTERANCE_SECONDS = 0.8
 MAX_UTTERANCE_SECONDS = 20.0
 
 
-def average_linkage(vectors, threshold=UTTERANCE_SIMILARITY):
-    """Group L2-normalised vectors; returns one integer label per vector."""
+def average_linkage(vectors, threshold=UTTERANCE_SIMILARITY, min_clusters=1):
+    """Group L2-normalised vectors; returns one integer label per vector.
+
+    Merging stops at `threshold`, or earlier once only `min_clusters` groups
+    are left (when Meet showed that many different remote speakers).
+    """
     import numpy as np
 
     count = len(vectors)
@@ -848,7 +852,8 @@ def average_linkage(vectors, threshold=UTTERANCE_SIMILARITY):
     active = np.ones(count, dtype=bool)
     members = {index: [index] for index in range(count)}
     np.fill_diagonal(sims, -np.inf)
-    while active.sum() > 1:
+    floor = max(1, min(int(min_clusters or 1), count))
+    while active.sum() > floor:
         masked = np.where(np.outer(active, active), sims, -np.inf)
         flat = int(np.argmax(masked))
         left, right = divmod(flat, count)
@@ -872,7 +877,7 @@ def average_linkage(vectors, threshold=UTTERANCE_SIMILARITY):
     return labels
 
 
-def diarize_utterances(path, spans, models_dir=None, threshold=UTTERANCE_SIMILARITY, extractor=None):
+def diarize_utterances(path, spans, models_dir=None, threshold=UTTERANCE_SIMILARITY, extractor=None, min_clusters=1):
     """Cluster Whisper utterances of the remote track into voices.
 
     `spans` is a list of `(start, end)` seconds. Returns the same shape as
@@ -913,7 +918,7 @@ def diarize_utterances(path, spans, models_dir=None, threshold=UTTERANCE_SIMILAR
             owners.append(index)
     if not vectors:
         return {"backend": None, "segments": [], "reason": "no utterance long enough to embed"}
-    labels = average_linkage(vectors, threshold)
+    labels = average_linkage(vectors, threshold, min_clusters=min_clusters)
     label_of = dict(zip(owners, labels))
     segments = []
     for index, (start, end) in enumerate(clean):

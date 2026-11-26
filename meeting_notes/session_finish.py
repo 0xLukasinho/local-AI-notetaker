@@ -479,11 +479,34 @@ def _archive(folder, config, log):
     return False
 
 
+def unconfirmed_speakers(folder):
+    """Labels in status.json's speaker_map that are not confidently named."""
+    status = read_status(folder) or {}
+    speaker_map = status.get("speaker_map") or {}
+    if not isinstance(speaker_map, dict):
+        return []
+    pending = []
+    for label, entry in speaker_map.items():
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("status") != "confirmed":
+            pending.append(str(entry.get("display") or label))
+    return pending
+
+
 def _retire_audio(folder, config, keep_audio, deliver, delivered, archived, log):
-    """Delete the WAVs only after a verified transcript is safely stored."""
+    """Delete the WAVs only after a verified, confidently named transcript is stored.
+
+    A transcript with an unconfirmed or unknown speaker keeps its audio and is
+    flagged `needs_relabel`, so it can be re-labelled later (`reprocess`).
+    """
+    pending = unconfirmed_speakers(folder)
+    update_status(folder, {"needs_relabel": bool(pending), "unconfirmed_speakers": pending})
     if keep_audio or not folder_has_audio(folder):
         return []
     ok, reason = transcript_verified(folder)
+    if ok and pending:
+        ok, reason = False, "speaker naming not confident (" + ", ".join(pending)[:120] + ")"
     if ok and deliver and bool(getattr(config, "delete_audio_requires_delivery", True)):
         if not (delivered or archived):
             ok, reason = False, "transcript not delivered or archived yet"

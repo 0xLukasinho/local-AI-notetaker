@@ -46,6 +46,10 @@ NOT_NAMES = {
     Coming Calling Speaking Talking Working Joining Muted Unmuted Late Early Sharing Here's
     Google Meet Slack Zoom Huddle Bebop Base Coinbase Greek Ethereum Bitcoin Solana DeFi
     Options Vault Vaults Hyperliquid Uniswap Aave Northwind Telegram Notion Discord Twitter
+    Awesome Amazing Wow Oh Ah Um Uh Hmm Huh Wait Anyway Anyways Honestly Literally Agreed Fair
+    Got Interesting Indeed Sweet Brilliant Lovely Super Fantastic Excellent Wonderful Love
+    Fuck Shit Damn Gosh Bro Dude Man Mate Sir Buddy Folks Morning Afternoon Evening Night
+    Cheers Ciao Later Bingo Totally True Fine Noted Understood Makes Sense Now Then Thursday
     """.split()
 }
 
@@ -372,6 +376,7 @@ def resolve_speakers(
     strong_roster = [entry["name"] for entry in roster if entry.get("strength", 1.0) >= 0.8]
     known = [clean_name(n) for n in known_people or [] if clean_name(n) and clean_name(n).casefold() not in aliases]
     voice_matches = voice_matches or {}
+    voice_names = [clean_name(n) for matches in voice_matches.values() for n, _ in matches if clean_name(n)]
 
     remote_labels = []
     speaking = {}
@@ -400,10 +405,14 @@ def resolve_speakers(
         for name in self_introductions(turn.get("text")):
             if name.casefold() in aliases or first_name(name).casefold() in aliases:
                 continue
-            canonical = _canonical(name, roster_names + known)
-            listed = canonical in roster_names or canonical in known
-            weight = 0.95 if listed else 0.8
-            where = "attendee" if listed else "not on the attendee list"
+            canonical = _canonical(name, roster_names + known + voice_names)
+            listed = canonical in roster_names or canonical in known or canonical in voice_names
+            if not listed:
+                # Only names from the participant list, configured people, or
+                # the voice store. A word Whisper heard is not a person.
+                continue
+            weight = 0.95
+            where = "attendee"
             evidence.add(label, canonical, weight, f'introduced themselves ("{name}", {where}) at {_stamp(turn)}')
             if canonical not in intro_names:
                 intro_names.append(canonical)
@@ -419,8 +428,9 @@ def resolve_speakers(
             canonical = _canonical(name, candidates)
             if canonical.casefold() in aliases or first_name(canonical).casefold() in aliases:
                 continue
+            # Addressed names count only when they are someone on a list.
             if canonical not in candidates:
-                candidates.append(canonical)
+                continue
 
     # Addressing by name (spelling drift normalised to the candidate names).
     ordered = [t for t in _normalise_spellings(turns, candidates) if clean_name(t.get("text"))]
@@ -470,9 +480,12 @@ def resolve_speakers(
                 evidence.add(dominant, entry["name"], 0.3, f"the only listed attendee ({entry['source']}); this voice spoke most")
 
     # Greedy assignment by score, one name per voice.
+    allowed = {name.casefold() for name in candidates} | {name.casefold() for name in preset.values()}
     pairs = []
     for label in remote_labels:
         for name in evidence.names_for(label):
+            if name.casefold() not in allowed:
+                continue
             pairs.append((evidence.score(label, name), label, name))
     pairs.sort(key=lambda item: (-item[0], item[1], item[2]))
     assigned = {}

@@ -283,6 +283,17 @@ def check_helper(report):
         return
     if is_signed_helper(helper):
         report.add(PASS, "capture helper", f"signed helper (stable identity), verified {signed_helper_status().get('verified_at')}")
+        if not signed_helper_status().get("screen_recording"):
+            # The recorder uses the Core Audio process tap. Only when the tap
+            # delivers digital silence does it try ScreenCaptureKit, which
+            # needs Screen & System Audio Recording for this helper (TCC -3801
+            # otherwise) and then keeps the tap.
+            report.add(
+                WARN,
+                "ScreenCaptureKit fallback",
+                "unavailable: MeetingAudioCapture-signed has no Screen & System Audio Recording grant "
+                "(one-time, System Settings > Privacy & Security). The process tap still records.",
+            )
     else:
         shim = os.path.expanduser("~/.meeting-notes/shim/libtapfix.dylib")
         if os.path.isfile(shim):
