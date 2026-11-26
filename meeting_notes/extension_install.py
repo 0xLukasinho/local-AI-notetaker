@@ -15,7 +15,8 @@ from meeting_notes.atomic_io import atomic_write_text
 
 _FILES = ("manifest.json", "content.js", "background.js")
 _PORT_LINE = "const BRIDGE_PORT = 8765;"
-_PRESENCE_LINE = "const PRESENCE_PORT = 8766;"
+_PRESENCE_LINE = "var PRESENCE_PORT = 8766;"
+_CONTENT_BRIDGE_LINE = "var BRIDGE_PORT = 8765;"
 EXTENSION_NAME = "Meeting Notes Speaker Tags"
 
 
@@ -132,7 +133,12 @@ def _write_extension_files(source, destination, port):
         if name == "content.js":
             if _PRESENCE_LINE not in text:
                 raise RuntimeError("content.js is missing the PRESENCE_PORT line")
-            text = text.replace(_PRESENCE_LINE, f"const PRESENCE_PORT = {presence_port};", 1)
+            text = text.replace(_PRESENCE_LINE, f"var PRESENCE_PORT = {presence_port};", 1)
+            # content.js posts straight to the bridge after an update, while
+            # the old worker is gone, so it carries the bridge port as well.
+            if _CONTENT_BRIDGE_LINE not in text:
+                raise RuntimeError("content.js is missing the BRIDGE_PORT line")
+            text = text.replace(_CONTENT_BRIDGE_LINE, f"var BRIDGE_PORT = {port};", 1)
         atomic_write_text(os.path.join(destination, name), text)
 
 
