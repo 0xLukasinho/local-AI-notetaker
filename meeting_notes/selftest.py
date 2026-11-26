@@ -269,8 +269,14 @@ def check_watcher(report):
 
 
 def check_helper(report):
-    from meeting_notes.macos_capture import find_capture_helper, is_signed_helper, signed_helper_status
+    from meeting_notes.macos_capture import (
+        find_capture_helper,
+        is_signed_helper,
+        refresh_signed_screen_recording,
+        signed_helper_status,
+    )
 
+    refresh_signed_screen_recording()
     helper = find_capture_helper(purpose="record")
     if not helper:
         report.add(FAIL, "capture helper", "not installed")

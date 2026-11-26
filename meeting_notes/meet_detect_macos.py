@@ -14,7 +14,9 @@ one failed probe cannot start a recording.
 import time
 
 from meeting_notes.macos_capture import (
+    fallback_probe_helper,
     find_capture_helper,
+    is_signed_helper,
     mic_status_from_probe,
     run_probe,
     titles_need_permission,
@@ -23,7 +25,7 @@ from meeting_notes.macos_capture import (
 
 
 _CACHE_SECONDS = 1.0
-_cache = {"at": 0.0, "payload": None}
+_cache = {"at": 0.0, "payload": None, "helper": None}
 _title_warning_sent = False
 
 
@@ -34,8 +36,15 @@ def _read(now=None, runner=None, helper=None):
     if cached is not None and current - float(_cache["at"]) < _CACHE_SECONDS:
         return cached
     if helper is None:
-        helper = find_capture_helper(purpose="probe")
+        helper = _cache.get("helper") or find_capture_helper(purpose="probe")
     payload = run_probe(helper, runner)
+    if titles_need_permission(payload) and is_signed_helper(helper):
+        fallback = fallback_probe_helper(exclude=helper)
+        if fallback:
+            alt_payload = run_probe(fallback, runner)
+            if not titles_need_permission(alt_payload) and (alt_payload.get("windows") or []):
+                payload = alt_payload
+                _cache["helper"] = fallback
     _cache["at"] = current
     _cache["payload"] = payload
     return payload
@@ -76,4 +85,5 @@ def reset_probe_cache():
     global _title_warning_sent
     _cache["at"] = 0.0
     _cache["payload"] = None
+    _cache["helper"] = None
     _title_warning_sent = False

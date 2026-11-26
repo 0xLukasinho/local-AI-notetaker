@@ -37,14 +37,7 @@ def screen_permission_for_platform(platform=None):
     return None
 
 
-def read_screen_permission(helper=None, run=None):
-    """Return granted, missing, unknown, or not-applicable."""
-    forced = screen_permission_for_platform()
-    if forced:
-        return forced
-    helper = find_capture_helper() if helper is None else helper
-    if not helper:
-        return "missing"
+def _check_one_helper(helper, run):
     argv = [helper, "permissions"]
     if run is None:
         code, text = run_responsible(argv, timeout=8)
@@ -57,6 +50,26 @@ def read_screen_permission(helper=None, run=None):
     except json.JSONDecodeError:
         return "unknown"
     return interpret_screen_report(payload)
+
+
+def read_screen_permission(helper=None, run=None):
+    """Return granted, missing, unknown, or not-applicable."""
+    forced = screen_permission_for_platform()
+    if forced:
+        return forced
+    explicit = helper is not None
+    helper = find_capture_helper(purpose="probe") if helper is None else helper
+    if not helper:
+        return "missing"
+    status = _check_one_helper(helper, run)
+    if not explicit and status == "missing":
+        from meeting_notes.macos_capture import fallback_probe_helper, is_signed_helper
+
+        if is_signed_helper(helper):
+            fallback = fallback_probe_helper(exclude=helper)
+            if fallback and _check_one_helper(fallback, run) == "granted":
+                return "granted"
+    return status
 
 
 def request_screen_permission(helper=None, run=None):
