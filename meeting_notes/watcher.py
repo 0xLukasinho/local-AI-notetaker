@@ -14,8 +14,10 @@ import logging.handlers
 import os
 import subprocess
 import sys
+import shutil
 import threading
 import time
+import traceback
 from dataclasses import dataclass
 
 from meeting_notes.autostart import find_pythonw
@@ -69,6 +71,57 @@ def _folder_has_audio(folder):
 _RUNNING = {"recording", "transcribing", "running"}
 _FINISHED_OK = {"done"}
 _FINISHED_BAD = {"failed", "exited", "timeout"}
+
+# Background transcription runs at low priority so a live recording is not hurt.
+BACKGROUND_NICE = 10
+TICK_ERROR_PAUSE_SECONDS = 2.0
+
+
+def _thread_background(fn):
+    """Run ``fn`` on a daemon thread (delivery must never block tick())."""
+    thread = threading.Thread(target=fn, name="watcher-background", daemon=True)
+    thread.start()
+    return thread
+
+
+def _default_background():
+    return _thread_background
+
+
+def build_process_argv(folder, executable=None):
+    """Argv for a low-priority `meeting-notes process <folder>`."""
+    program = executable or find_pythonw()
+    argv = [program, "-m", "meeting_notes.cli", "process", folder]
+    if sys.platform != "win32":
+        nice = shutil.which("nice")
+        if nice:
+            argv = [nice, "-n", str(BACKGROUND_NICE)] + argv
+    return argv
+
+
+def spawn_process_folder(folder, popen=None):
+    """Transcribe an unfinished folder in a separate, niced, detached process."""
+    log_handle = open(os.path.join(folder, "resume.log"), "a", encoding="utf-8")
+    kwargs = hidden_popen_kwargs()
+    if sys.platform != "win32":
+        kwargs["start_new_session"] = True
+    try:
+        proc = (popen or subprocess.Popen)(
+            build_process_argv(folder),
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            **kwargs,
+        )
+    except Exception:
+        log_handle.close()
+        raise
+    log_handle.close()  # the child holds its own copy of the descriptor
+    return proc
+
+
+def _default_resumer():
+    return spawn_process_folder
 
 
 @dataclass
@@ -157,6 +210,10 @@ class SubprocessLauncher:
         log_handle = open(log_path, "a", encoding="utf-8")
         argv = build_start_argv(spec)
         kwargs = hidden_popen_kwargs()
+        if sys.platform != "win32":
+            # Own session: a launchd kill of the watcher must not take down a
+            # recording or the transcription that follows it.
+            kwargs["start_new_session"] = True
         try:
             proc = self._popen(
                 argv,
@@ -234,6 +291,8 @@ class MeetWatcher:
         output_dir,
         log,
         heartbeat=None,
+        background=None,
+        resumer=None,
     ):
         self.config = config
         self.detector = detector
@@ -265,19 +324,67 @@ class MeetWatcher:
         self._last_seen_key = None
         self._device_log_offsets = {}
         self._stop_requested_for = None
+        self._background = background if background is not None else _default_background()
+        self._resumer = resumer if resumer is not None else _default_resumer()
+        # Sessions whose recorder was told to stop and is still transcribing.
+        self._finishing = []
+        # Folders waiting for, or running, a background `process` child.
+        self._resume_queue = []
+        self._resume_running = None
+        self._resume_started = set()
+        self._started = False
+        self.tick_errors = 0
 
-    def run(self, stop_event=None, max_ticks=None):
-        self._resume_unfinished()
+    def start(self):
+        """One-time startup. Never blocks on transcription."""
+        if self._started:
+            return
+        self._started = True
+        try:
+            self._resume_unfinished()
+        except Exception:
+            self.log.error("Could not queue unfinished sessions: %s", traceback.format_exc())
         self._retry_outbox()
         self._last_outbox = self.monotonic()
+
+    def run(self, stop_event=None, max_ticks=None):
+        self.start()
         ticks = 0
         while max_ticks is None or ticks < max_ticks:
             if stop_event is not None and stop_event.is_set():
                 self.shutdown()
                 return
-            self.tick()
+            self.safe_tick()
             ticks += 1
-            self.sleep(self.config.poll_interval_seconds)
+            self._safe_sleep(self.config.poll_interval_seconds)
+
+    def safe_tick(self):
+        """tick() that logs an exception and keeps the loop alive."""
+        try:
+            self.tick()
+            self.tick_errors = 0
+        except Exception:
+            self.tick_errors += 1
+            self.log.error(
+                "Watcher tick failed (%s in a row); continuing: %s",
+                self.tick_errors,
+                traceback.format_exc(),
+            )
+            try:
+                self._beat()
+            except Exception:
+                pass
+            self._safe_sleep(TICK_ERROR_PAUSE_SECONDS)
+
+    def _safe_sleep(self, seconds):
+        try:
+            self.sleep(max(0.0, float(seconds)))
+        except Exception:
+            self.log.error("Sleep failed; continuing: %s", traceback.format_exc())
+            try:
+                time.sleep(max(0.0, min(float(seconds), 5.0)))
+            except Exception:
+                pass
 
     def tick(self):
         now = self.monotonic()
@@ -300,6 +407,8 @@ class MeetWatcher:
             elif event == "leave":
                 self._on_leave()
         self._poll_child()
+        self._poll_finishing()
+        self._poll_resume()
         if self.session is not None:
             self._mirror_device_log(self.session.folder)
         self._beat()
@@ -366,6 +475,7 @@ class MeetWatcher:
         """Stop a recording we started and deliver it before the process exits."""
         if self.session is not None and not self.delivered:
             self._on_leave()
+            self._poll_finishing()
         else:
             self.session = None
 
@@ -457,7 +567,6 @@ class MeetWatcher:
             self._beat()
             return
         self._stop_requested_for = session.folder
-        self.activity = "recording"
         self.log.info("Call ended; stopping %s", session.folder)
         try:
             self._mirror_device_log(session.folder)
@@ -465,21 +574,66 @@ class MeetWatcher:
                 self.launcher.request_stop(session)
             except Exception as exc:
                 self.log.error("Failed to signal stop for %s: %s", session.folder, exc)
-            state = self._wait_until_finished(session)
-            self._mirror_device_log(session.folder)
-            self._finish_if_recorder_died(session.folder, state)
-            if state in _FINISHED_OK or _transcript_ready(session.folder):
-                self._deliver(session.folder)
-            else:
-                self.log.error(
-                    "Session %s finished with state %s; not delivering.",
-                    session.folder,
-                    state,
-                )
+            # Transcription and delivery continue in the recorder child (or a
+            # background process). Return to watching at once so a back-to-back
+            # call is picked up; _poll_finishing() collects the result later.
+            self._finishing.append(
+                {
+                    "session": session,
+                    "deadline": self.monotonic() + float(self.config.transcribe_timeout_seconds),
+                }
+            )
             self.delivered = True
         finally:
             self.activity = "idle"
             self._beat()
+
+    def _poll_finishing(self):
+        """Collect sessions whose recorder is transcribing in the background."""
+        remaining = []
+        for entry in self._finishing:
+            session = entry["session"]
+            try:
+                state = self.launcher.state(session)
+            except Exception as exc:
+                self.log.error("Could not read session state: %s", exc)
+                remaining.append(entry)
+                continue
+            popen = getattr(session, "popen", None)
+            if state in _RUNNING and popen is not None:
+                try:
+                    if popen.poll() is not None:
+                        state = "exited"
+                except Exception:
+                    pass
+            if state in _RUNNING or state is None:
+                if self.monotonic() >= entry["deadline"]:
+                    self.log.error(
+                        "Still transcribing %s after %ss; no longer waiting on it.",
+                        session.folder,
+                        int(float(self.config.transcribe_timeout_seconds)),
+                    )
+                else:
+                    remaining.append(entry)
+                continue
+            self._mirror_device_log(session.folder)
+            if state in _FINISHED_OK or _transcript_ready(session.folder):
+                self._deliver_background(session.folder)
+            else:
+                self._finish_if_recorder_died(session.folder, state)
+                if state not in _FINISHED_OK:
+                    self.log.error(
+                        "Session %s finished with state %s; not delivering.",
+                        session.folder,
+                        state,
+                    )
+        self._finishing = remaining
+
+    def _deliver_background(self, folder):
+        try:
+            self._background(lambda: self._deliver(folder))
+        except Exception:
+            self.log.error("Could not start delivery of %s: %s", folder, traceback.format_exc())
 
     def _poll_child(self):
         if self.session is None or self.delivered:
@@ -505,22 +659,6 @@ class MeetWatcher:
                 self._deliver(self.session.folder)
             self.delivered = True
             self.activity = "idle"
-
-    def _wait_until_finished(self, session):
-        deadline = self.monotonic() + float(self.config.transcribe_timeout_seconds)
-        while True:
-            self._beat()
-            try:
-                state = self.launcher.state(session)
-            except Exception as exc:
-                self.log.error("Could not read session state: %s", exc)
-                return "failed"
-            if state in _FINISHED_OK or state in _FINISHED_BAD:
-                return state
-            if self.monotonic() >= deadline:
-                self.log.error("Timed out waiting for transcription of %s", session.folder)
-                return "timeout"
-            self.sleep(min(0.5, float(self.config.poll_interval_seconds) or 0.5))
 
     def _mirror_device_log(self, folder):
         """Copy new recorder device lines into the watcher log."""
@@ -557,7 +695,11 @@ class MeetWatcher:
         self._resume_one(folder)
 
     def _resume_unfinished(self):
-        """Finish folders left behind when a recorder or this watcher died."""
+        """Queue folders left behind when a recorder or this watcher died.
+
+        Nothing is transcribed here: each folder is handed to a niced
+        background process, one at a time, so watching starts at once.
+        """
         from meeting_notes.session_finish import unfinished_folders
 
         skip = None
@@ -568,21 +710,44 @@ class MeetWatcher:
         if active:
             skip = active.get("folder")
         for folder in unfinished_folders(self.output_dir, skip_folder=skip):
-            self.log.info("Resuming unfinished session %s", folder)
             self._resume_one(folder)
 
     def _resume_one(self, folder):
-        from meeting_notes.session_finish import finish_folder
+        """Queue one folder for background transcription (never blocks)."""
+        folder = os.path.abspath(folder)
+        if folder in self._resume_started or folder in self._resume_queue:
+            return
+        if self._resume_running is not None and self._resume_running[0] == folder:
+            return
+        self._resume_queue.append(folder)
+        self.log.info("Queued unfinished session for background transcription: %s", folder)
 
+    def _poll_resume(self):
+        running = self._resume_running
+        if running is not None:
+            folder, proc = running
+            try:
+                code = proc.poll()
+            except Exception:
+                code = -1
+            if code is None:
+                return
+            self._resume_running = None
+            if code == 0:
+                self.log.info("Background transcription finished: %s", folder)
+            else:
+                self.log.error("Background transcription of %s exited with code %s", folder, code)
+        if not self._resume_queue:
+            return
+        folder = self._resume_queue.pop(0)
+        self._resume_started.add(folder)
         try:
-            finish_folder(
-                folder,
-                self.config,
-                log=self.log,
-                deliver_fn=self._deliver,
-            )
+            proc = self._resumer(folder)
         except Exception as exc:
-            self.log.error("Could not finish %s: %s", folder, exc)
+            self.log.error("Could not start background transcription of %s: %s", folder, exc)
+            return
+        self._resume_running = (folder, proc)
+        self.log.info("Background transcription started: %s", folder)
 
     def _deliver(self, folder):
         from meeting_notes.session import read_status
@@ -838,16 +1003,9 @@ def serve(config, control_dir, output_dir, sleep=None, monotonic=None):
             previous_signal = None
 
         def _sleep(seconds):
-            fn = sleep or time.sleep
-            if stop_event.is_set():
-                return
-            # Wake promptly on Ctrl+C without busy-spinning.
-            end = (monotonic or time.monotonic)() + seconds
-            while (monotonic or time.monotonic)() < end:
-                if stop_event.is_set():
-                    return
-                remaining = end - (monotonic or time.monotonic)()
-                fn(min(0.2, remaining))
+            interruptible_sleep(
+                seconds, stop_event, sleep or time.sleep, monotonic or time.monotonic
+            )
 
         box = outbox_dir(control_dir)
 
@@ -880,11 +1038,7 @@ def serve(config, control_dir, output_dir, sleep=None, monotonic=None):
         )
         stop_reason = "stop requested"
         try:
-            watcher.run(stop_event=stop_event)
-        except Exception:
-            stop_reason = "unhandled exception"
-            logger.exception("Unhandled exception in watcher")
-            raise
+            run_forever(watcher, stop_event, logger)
         finally:
             try:
                 import signal
@@ -907,6 +1061,37 @@ def serve(config, control_dir, output_dir, sleep=None, monotonic=None):
         clear_instance(control_dir, pid=os.getpid())
         logger.info("Watcher stopped: pid=%s reason=%s", os.getpid(), stop_reason)
         lock.release()
+
+
+def interruptible_sleep(seconds, stop_event, sleep_fn, monotonic_fn):
+    """Sleep in 0.2 s slices, waking on stop. Never passes a negative length."""
+    if stop_event.is_set():
+        return
+    end = monotonic_fn() + max(0.0, float(seconds))
+    while monotonic_fn() < end:
+        if stop_event.is_set():
+            return
+        remaining = end - monotonic_fn()
+        sleep_fn(max(0.0, min(0.2, remaining)))
+
+
+def run_forever(watcher, stop_event, log, pause=5.0, sleep=None):
+    """watcher.run() that survives anything short of a stop request.
+
+    run() already survives a failing tick. This is the second net: if run()
+    itself raises, log it and start the loop again.
+    """
+    nap = sleep or time.sleep
+    while not stop_event.is_set():
+        try:
+            watcher.run(stop_event=stop_event)
+            return
+        except Exception:
+            log.error("Unhandled exception in watcher; restarting the loop: %s", traceback.format_exc())
+            try:
+                nap(pause)
+            except Exception:
+                pass
 
 
 def _format_seen(unix):

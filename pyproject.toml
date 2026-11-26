@@ -33,6 +33,11 @@ cuda = [
 app = [
     "PySide6",
 ]
+# Local speaker diarization + voice profiles (scripts/install_macos.sh).
+speakers = [
+    "sherpa-onnx>=1.10",
+    "numpy",
+]
 dev = [
     "pytest",
 ]
@@ -41,7 +46,7 @@ dev = [
 include = ["meeting_notes*"]
 
 [tool.setuptools.package-data]
-meeting_notes = ["chrome_extension/*"]
+meeting_notes = ["chrome_extension/*", "data/*"]
 
 [project.scripts]
 meeting-notes = "meeting_notes.cli:main"

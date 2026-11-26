@@ -289,6 +289,7 @@ class ChromeMeetDetector:
         self.source = "google-meet"
         self._last_extension = _UNSEEN
         self._latched = None
+        self._latched_from_extension = False
         self._last_mic = _UNSEEN
         self._last_window = _UNSEEN
         self._last_notice = ""
@@ -361,18 +362,38 @@ class ChromeMeetDetector:
         # when the extension is not loaded.
         if extension is not None:
             self._latched = extension
+            self._latched_from_extension = True
             return extension
+        if in_call and mic.in_use and self._is_same_call_by_title(window):
+            # The extension went quiet and the title has no meet code, so the
+            # window key (a slug of the title) differs from the code the call
+            # started under. Same call: keep the original key, or the
+            # debouncer would end it and start a second session.
+            return self._latched
         if self._join_ok(mic, window):
             self._latched = window
+            self._latched_from_extension = False
             return window
         if not in_call or self._latched is None:
             return None
         if window is not None and window.key == self._latched.key:
             self._latched = window
+            self._latched_from_extension = False
             return window
         if mic.in_use:
             return self._latched
         return None
+
+    def _is_same_call_by_title(self, window):
+        latched = self._latched
+        return (
+            latched is not None
+            and self._latched_from_extension
+            and window is not None
+            and bool(latched.meet_code)
+            and not window.meet_code
+            and window.key != latched.key
+        )
 
     def _log_mic(self, mic):
         current = (mic.in_use, mic.registry, mic.wasapi, mic.sources)

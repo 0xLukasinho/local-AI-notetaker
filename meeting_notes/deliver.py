@@ -333,7 +333,7 @@ def urllib_poster(url, payload, header_name, header_value, timeout):
         request.add_header(header_name, header_value)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            response.read()
+            raw = response.read()
             status = getattr(response, "status", 200)
     except urllib.error.HTTPError as exc:
         raise DeliveryError(f"HTTP {exc.code}") from exc
@@ -342,7 +342,30 @@ def urllib_poster(url, payload, header_name, header_value, timeout):
         raise DeliveryError(f"request failed: {reason}") from exc
     if status >= 400:
         raise DeliveryError(f"HTTP {status}")
+    check_receiver_ack(payload, raw)
     return status
+
+
+def check_receiver_ack(payload, raw):
+    """Optional ack: a receiver that echoes the transcript checksum must agree.
+
+    A JSON response with `transcript_sha256` (or `sha256`) that differs from
+    what was sent on the last chunk is a failed delivery, so it is retried and
+    kept in the outbox instead of being marked delivered.
+    """
+    if not raw:
+        return
+    try:
+        answer = json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        return
+    if not isinstance(answer, dict):
+        return
+    sent = payload.get("transcript_sha256")
+    echoed = answer.get("transcript_sha256") or answer.get("sha256")
+    last = int(payload.get("chunk_index") or 0) + 1 >= int(payload.get("chunk_count") or 1)
+    if sent and echoed and last and str(echoed).lower() != str(sent).lower():
+        raise DeliveryError("receiver checksum mismatch")
 
 
 def post_with_retry(config, payload, poster, sleep, attempts=None, backoff=None):
@@ -394,6 +417,8 @@ def deliver_folder(folder, config, poster=None, sleep=None, outbox=None, control
         transcript = handle.read()
     status = read_status(folder) or {}
     payload = build_payload(status, transcript, folder)
+    if status.get("archived_to"):
+        payload["transcript_archive_path"] = status.get("archived_to")
     if not config.webhook_url:
         return False
     ok, error = send_payload(config, payload, poster, sleep, log=log)
@@ -460,7 +485,46 @@ def _remove_outbox_entry(directory, folder_name):
         pass
 
 
+def archive_transcript(folder, config):
+    """Write the complete transcript to `transcript_archive_dir/<folder>/`.
+
+    transcript.txt, transcript.json (when present) and transcript.sha256 are
+    written atomically, read back and checked against the source hash. One
+    complete file per call, so a receiver that truncates webhook bodies can
+    always fall back to it (e.g. a Google Drive synced folder). Returns the
+    archived transcript path, or "" when archiving is off.
+    """
+    base = os.path.expanduser(getattr(config, "transcript_archive_dir", "") or "")
+    if not base:
+        return ""
+    folder = os.path.abspath(folder)
+    source = transcript_path(folder)
+    with open(source, "rb") as handle:
+        data = handle.read()
+    digest = hashlib.sha256(data).hexdigest()
+    target_dir = os.path.join(base, os.path.basename(folder))
+    os.makedirs(target_dir, exist_ok=True)
+    target = os.path.join(target_dir, "transcript.txt")
+    from meeting_notes.atomic_io import atomic_write_text
+
+    atomic_write_text(target, data.decode("utf-8"))
+    extra = os.path.join(folder, "transcript.json")
+    if os.path.isfile(extra):
+        with open(extra, "r", encoding="utf-8") as handle:
+            atomic_write_text(os.path.join(target_dir, "transcript.json"), handle.read())
+    atomic_write_text(os.path.join(target_dir, "transcript.sha256"), f"{digest}  transcript.txt\n")
+    with open(target, "rb") as handle:
+        if hashlib.sha256(handle.read()).hexdigest() != digest:
+            raise DeliveryError("archived transcript does not match (checksum)")
+    return target
+
+
 def _delete_audio(folder):
+    from meeting_notes.session_finish import transcript_verified
+
+    ok, _reason = transcript_verified(folder)
+    if not ok:
+        return
     for name in ("audio.wav", "audio-self.wav", "audio-others.wav"):
         path = os.path.join(folder, name)
         try:

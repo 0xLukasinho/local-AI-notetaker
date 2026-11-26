@@ -412,6 +412,13 @@ Limits:
 - The replacement watcher is started with WMI (`Win32_Process.Create`) so it keeps running after the scheduled task exits. The command uses the real `pythonw.exe` (`sys.executable`, or `sys._base_executable` and the `pythonw.exe` beside it when the Microsoft Store path is an app-execution alias). That alias cannot be launched by `Win32_Process.Create`. If WMI still fails, `--ensure` starts a detached process instead and logs one INFO line, `using popen fallback`, without the PowerShell error record. A detached process can be stopped when the task exits. The same `--ensure` run retries after 30, 60, and 120 seconds when the start does not stick. The task's time limit is 10 minutes, which covers those waits.
 - Windows autostart is the scheduled task above. macOS autostart is a LaunchAgent; see [macOS automatic recording](#macos-automatic-recording).
 
+## macOS: install, health check, named speakers
+
+See **[docs/RUNBOOK-macos.md](docs/RUNBOOK-macos.md)**: `scripts/install_macos.sh`
+(installer/updater), `meeting-notes selftest [--capture|--e2e|--verify-signed]`,
+how remote voices get real names with a confidence, delivery/archive, and when
+audio is deleted.
+
 ## macOS automatic recording
 
 Manual `meeting-notes start`, transcription, and Claude notes already ran on macOS. What was Windows-only was noticing a call by itself, starting and stopping the recording, and coming back after login, wake, or a crash. That path now uses the same watcher. Windows Task Scheduler is unchanged.

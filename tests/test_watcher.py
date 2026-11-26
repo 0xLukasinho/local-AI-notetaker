@@ -429,9 +429,10 @@ def test_build_windows_detector_keeps_the_registry_when_pycaw_is_missing(monkeyp
     assert any("registry=yes" in message and "wasapi=unavailable" in message for _level, message in log.messages)
 
 
-def test_heartbeat_stays_recording_while_transcription_finishes(tmp_path):
+def test_leave_returns_to_watching_at_once_and_finishes_in_the_background(tmp_path):
     clock = Clock()
     beats = []
+    delivered = []
 
     class RememberHeartbeat:
         def beat(self, force=False, state=None, session_folder=None, session_pid=None):
@@ -447,15 +448,13 @@ def test_heartbeat_stays_recording_while_transcription_finishes(tmp_path):
 
         def state(self, _session):
             self.polls += 1
-            if self.polls < 3:
-                return "transcribing"
-            return "done"
+            return "transcribing" if self.polls < 3 else "done"
 
     watcher = MeetWatcher(
         config=_config(),
         detector=ScriptDetector(clock, present_until=-1),
         launcher=SlowFinish(),
-        deliver_fn=lambda _folder: True,
+        deliver_fn=lambda folder: delivered.append(folder) or True,
         lock_store=Lock(),
         outbox_retry=lambda: 0,
         sleep=clock.sleep,
@@ -471,10 +470,16 @@ def test_heartbeat_stays_recording_while_transcription_finishes(tmp_path):
     watcher.activity = "recording"
     watcher.session = RunningSession(folder=folder, pid=1)
     watcher._on_leave()
-    assert beats
+    # Back to watching straight away: no session, idle, nothing delivered yet.
+    assert watcher.session is None
+    assert watcher.activity == "idle"
     assert beats[-1] == "idle"
-    assert "idle" not in beats[:-1]
-    assert "recording" in beats
+    assert delivered == []
+    watcher.tick()
+    watcher.tick()
+    assert delivered == []
+    watcher.tick()
+    assert delivered == [folder]
 
 
 def test_outbox_is_retried_when_the_watcher_starts(tmp_path):

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key>
+  <string>Meeting Audio Capture</string>
+  <key>CFBundleDisplayName</key>
+  <string>Meeting Audio Capture</string>
+  <key>CFBundleIdentifier</key>
+  <string>com.meeting-notes.audio-capture</string>
+  <key>CFBundleExecutable</key>
+  <string>meeting-audio-capture</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleVersion</key>
+  <string>2</string>
+  <key>CFBundleShortVersionString</key>
+  <string>2.0</string>
+  <key>LSUIElement</key>
+  <true/>
+  <key>NSAppSleepDisabled</key>
+  <true/>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Meeting Notes records your microphone so the transcript includes what you say. Other people in the call do not see this.</string>
+  <key>NSAudioCaptureUsageDescription</key>
+  <string>Meeting Notes records system audio on this Mac so the transcript includes other people. Nothing joins the meeting.</string>
+  <key>NSScreenCaptureUsageDescription</key>
+  <string>Meeting Notes reads window titles to tell when a Google Meet tab is active, and can capture system audio. The screen is not saved.</string>
+</dict>
+</plist>

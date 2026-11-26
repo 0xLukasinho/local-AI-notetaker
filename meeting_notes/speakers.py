@@ -28,6 +28,15 @@ from difflib import SequenceMatcher
 
 THEM = "Them"
 REMOTE = "Remote"
+# Used when the system-audio track was recorded but is digital silence (every
+# sample is 0). The microphone then also hears remote voices from the
+# speakers, so its lines cannot be attributed to self_name.
+UNATTRIBUTED = "Unattributed"
+MIC_ONLY_WARNING = (
+    "System audio was not captured (audio-others.wav is digital silence). "
+    "All lines come from the microphone, which also picks up remote voices "
+    "from the speakers, so they are labeled Unattributed instead of self_name."
+)
 TRANSCRIPT_JSON = "transcript.json"
 SPEAKER_LOG = "speakers.jsonl"
 SELF_TRACK = "audio-self.wav"
@@ -149,6 +158,27 @@ def track_has_speech(path, threshold=SILENT_TRACK_RMS):
     if rms is None:
         return True
     return rms >= threshold
+
+
+def track_is_digital_silence(path):
+    """True when `path` is a readable 16-bit WAV whose samples are all 0.
+
+    A Core Audio process tap without the System Audio Recording grant writes
+    exact zeros. Real loopback audio, even a quiet call, has non-zero samples.
+    False on any read problem, an empty file, or another sample format.
+    """
+    try:
+        with wave.open(str(path), "rb") as handle:
+            if handle.getsampwidth() != 2 or handle.getnframes() == 0:
+                return False
+            while True:
+                raw = handle.readframes(160000)
+                if not raw:
+                    return True
+                if raw.count(0) != len(raw):
+                    return False
+    except (OSError, wave.Error, EOFError):
+        return False
 
 
 def _unique(items):
@@ -1164,6 +1194,8 @@ def build_document(segments, events, self_label, source, diarization=None):
                 "track": segment.get("track") or "",
             }
         )
+        if segment.get("voice"):
+            rounded[-1]["voice"] = segment["voice"]
     observed = meet_self_name(events)
     document = {
         "self_name": self_label,
@@ -1222,6 +1254,21 @@ def speaker_webhook_fields(folder):
     source = document.get("speaker_source")
     if source:
         fields["speaker_source"] = str(source)
+    speaker_map = document.get("speaker_map")
+    if isinstance(speaker_map, dict) and speaker_map:
+        fields["speaker_map"] = {
+            str(label): {
+                "display": entry.get("display"),
+                "name": entry.get("name"),
+                "confidence": entry.get("confidence"),
+                "status": entry.get("status"),
+                "evidence": list(entry.get("evidence") or [])[:5],
+            }
+            for label, entry in speaker_map.items()
+            if isinstance(entry, dict)
+        }
+    if document.get("warning"):
+        fields["warning"] = str(document["warning"])
     return fields
 
 
@@ -1242,6 +1289,38 @@ def _existing_track(folder, name):
 def _needs_remote_diarization(events, self_label):
     names, anons = remote_parties(events, self_label)
     return len(names) + len(anons) >= 2
+
+
+def _utterance_timeline(folder, others_segments, models_dir=None):
+    """Voices on the remote track from Whisper utterances (sherpa-onnx).
+
+    Returns `(segments, diarization, embeddings)` or None when the neural
+    backend is not installed, so callers fall back to the older path.
+    """
+    try:
+        from meeting_notes.diarize import diarize_utterances, sherpa_available
+    except Exception:
+        return None
+    if not sherpa_available(models_dir):
+        return None
+    others = _existing_track(folder, OTHERS_TRACK)
+    if not others:
+        return None, {"backend": None, "clusters": 0, "reason": "no remote audio track"}, {}
+    spans = []
+    for segment in others_segments or []:
+        try:
+            spans.append((float(segment["start"]), float(segment["end"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    try:
+        result = diarize_utterances(others, spans, models_dir=models_dir)
+    except Exception as exc:
+        return None, {"backend": None, "clusters": 0, "reason": " ".join(str(exc).split())[:180]}, {}
+    segments = result.get("segments") or []
+    if not segments:
+        return None, {"backend": None, "clusters": 0, "reason": result.get("reason") or "no voices"}, {}
+    clusters = sorted({segment["cluster"] for segment in segments})
+    return segments, {"backend": result.get("backend"), "clusters": len(clusters)}, result.get("embeddings") or {}
 
 
 def _voice_timeline(folder, events, self_label, diarize, diarize_backend, diarize_max_speakers, hf_token, diarizer):
@@ -1321,6 +1400,7 @@ def produce_transcript(
     diarize_max_speakers=8,
     hf_token="",
     diarizer=None,
+    naming=None,
 ):
     """Return `(text, document_or_none)`.
 
@@ -1337,6 +1417,13 @@ def produce_transcript(
     self_label = choose_self_label(self_name, events)
     self_path = _existing_track(folder, SELF_TRACK)
     others_path = _existing_track(folder, OTHERS_TRACK)
+    others_raw = os.path.join(folder, OTHERS_TRACK)
+    remote_capture_failed = bool(
+        self_path
+        and not others_path
+        and os.path.isfile(others_raw)
+        and track_is_digital_silence(others_raw)
+    )
 
     if self_path or others_path:
         paths = []
@@ -1351,16 +1438,23 @@ def produce_transcript(
         by_role = {}
         for role, segments in zip(roles, detailed):
             by_role[role] = segments or []
-        voice_segments, diarization = _voice_timeline(
-            folder,
-            events,
-            self_label,
-            diarize,
-            diarize_backend,
-            diarize_max_speakers,
-            hf_token,
-            diarizer,
-        )
+        voice_embeddings = {}
+        utterance = None
+        if diarize and diarizer is None and by_role.get("others") and (diarize_backend or "auto") in ("auto", "sherpa"):
+            utterance = _utterance_timeline(folder, by_role.get("others"), (naming or {}).get("models_dir"))
+        if utterance is not None:
+            voice_segments, diarization, voice_embeddings = utterance
+        else:
+            voice_segments, diarization = _voice_timeline(
+                folder,
+                events,
+                self_label,
+                diarize,
+                diarize_backend,
+                diarize_max_speakers,
+                hf_token,
+                diarizer,
+            )
         labeled = align_tracks(
             by_role.get("self") or [],
             by_role.get("others") or [],
@@ -1371,7 +1465,27 @@ def produce_transcript(
         source = classify_source(
             labeled, events, used_tracks=True, used_mix=False, self_label=self_label
         )
+        if remote_capture_failed:
+            for segment in labeled:
+                if segment.get("speaker") in (self_label, "", None):
+                    segment["speaker"] = UNATTRIBUTED
+            source = "mic-only"
+        naming_report = None
+        if naming is not None and not remote_capture_failed and by_role.get("others"):
+            labeled, naming_report = apply_naming(
+                folder, labeled, voice_segments, voice_embeddings, events, self_label, naming
+            )
+            if naming_report and naming_report.get("named"):
+                source = "named"
         document = build_document(labeled, events, self_label, source, diarization=diarization)
+        if naming_report:
+            document["speaker_map"] = naming_report["speaker_map"]
+            document["speaker_naming"] = {
+                key: value for key, value in naming_report.items() if key not in ("speaker_map", "named")
+            }
+        if remote_capture_failed:
+            document["warning"] = MIC_ONLY_WARNING
+            print("Warning: " + MIC_ONLY_WARNING, file=sys.stderr)
         return render_transcript(labeled, labeled=True), document
 
     if events:
@@ -1385,3 +1499,177 @@ def produce_transcript(
         return render_transcript(labeled, labeled=True), document
 
     return transcribe_plain(audio), None
+
+
+VOICES_JSON = "voices.json"
+
+
+def _voice_labels(voice_segments, events, self_label):
+    """{label shown in the transcript: cluster id} for diarized voices."""
+    if not voice_segments:
+        return {}
+    names = name_voice_clusters(voice_segments, events, self_label)
+    return {label: cluster for cluster, label in names.items()}
+
+
+def apply_naming(folder, labeled, voice_segments, voice_embeddings, events, self_label, naming):
+    """Replace "Speaker N" with names where the evidence supports it.
+
+    `naming` keys (all optional): self_aliases, known_people, organizations,
+    calendar (an object with calendar_json_path / calendar_ics_url),
+    profiles_path, update_profiles (bool), status (status.json dict).
+    Returns `(turns, report)`.
+    """
+    from meeting_notes import speaker_naming as sn
+
+    naming = naming or {}
+    status = naming.get("status")
+    if status is None:
+        try:
+            with open(os.path.join(folder, "status.json"), "r", encoding="utf-8") as handle:
+                status = json.load(handle)
+        except (OSError, ValueError):
+            status = {}
+    aliases = list(naming.get("self_aliases") or []) + [self_label]
+    title = status.get("window_title") or ""
+    title_roster = sn.names_from_window_title(title, aliases, naming.get("organizations") or ())
+    calendar_entries, event_title = [], None
+    calendar = naming.get("calendar")
+    if calendar is not None:
+        try:
+            from meeting_notes.calendar_roster import calendar_roster
+
+            calendar_entries, event_title = calendar_roster(status, calendar)
+        except Exception:
+            calendar_entries, event_title = [], None
+    if event_title and not title_roster:
+        title_roster = sn.names_from_window_title(event_title, aliases, naming.get("organizations") or ())
+    meet_names, _anons = remote_parties(events, self_label)
+    meet_roster = [sn.roster_entry(name, "meet-participants") for name in meet_names]
+    channel_roster = sn.slack_channel_roster(title, sn.parse_channel_rosters(naming.get("slack_channel_rosters") or ""))
+    roster = sn.merge_roster(
+        calendar_entries, sn.load_roster_file(folder), meet_roster, title_roster, channel_roster, self_aliases=aliases
+    )
+    roster_complete = bool(calendar_entries) or any(
+        entry.get("source") in ("slack-dm", "slack-group-dm", "roster-file", "meet-participants") for entry in roster
+    )
+
+    label_cluster = _voice_labels(voice_segments, events, self_label)
+    profiles = None
+    voice_matches = {}
+    if naming.get("profiles_path") is not False:
+        try:
+            from meeting_notes.voice_profiles import VoiceProfiles
+
+            profiles = VoiceProfiles(naming.get("profiles_path") or None)
+        except Exception:
+            profiles = None
+    label_embedding = {}
+    for label, cluster in label_cluster.items():
+        vector = (voice_embeddings or {}).get(str(cluster))
+        if vector:
+            label_embedding[label] = vector
+            if profiles is not None:
+                voice_matches[label] = profiles.match(vector)
+
+    known = list(naming.get("known_people") or [])
+    if profiles is not None:
+        known += profiles.names()
+    speaker_map, turns = sn.resolve_speakers(
+        labeled,
+        self_label,
+        roster=roster,
+        self_aliases=aliases,
+        known_people=known,
+        voice_matches=voice_matches,
+        roster_complete=roster_complete,
+    )
+
+    session = os.path.basename(os.path.abspath(folder))
+    voices = {}
+    for label, vector in label_embedding.items():
+        entry = speaker_map.get(label) or {}
+        voices[label] = {"cluster": label_cluster.get(label), "embedding": vector, "name": entry.get("name")}
+        if (
+            profiles is not None
+            and naming.get("update_profiles", True)
+            and entry.get("status") == "confirmed"
+            and float(entry.get("confidence") or 0) >= 0.85
+        ):
+            profiles.update(entry["name"], vector, session=session)
+    if profiles is not None and naming.get("update_profiles", True) and voices:
+        try:
+            profiles.save()
+        except OSError:
+            pass
+    if voices:
+        try:
+            from meeting_notes.atomic_io import atomic_write_json
+
+            atomic_write_json(os.path.join(folder, VOICES_JSON), {"voices": voices})
+        except OSError:
+            pass
+    named = any(
+        entry.get("status") == "confirmed" and entry.get("display") != self_label
+        for entry in speaker_map.values()
+    )
+    report = {
+        "speaker_map": speaker_map,
+        "named": named,
+        "roster": [{"name": e["name"], "source": e["source"]} for e in roster],
+        "calendar_event": event_title,
+        "window_title": title,
+    }
+    return turns, report
+
+
+def rename_voice(folder, voice, name, profiles=None):
+    """Put `name` on every line of `voice` ("Speaker 3") in a finished session.
+
+    Rewrites transcript.txt and transcript.json, marks the voice confirmed by
+    the user, and (when `profiles` is given and voices.json has an embedding)
+    saves the voice profile so the person is recognised next time.
+    """
+    from meeting_notes.atomic_io import atomic_write_json, atomic_write_text
+
+    name = clean_name(name)
+    path = os.path.join(folder, TRANSCRIPT_JSON)
+    with open(path, "r", encoding="utf-8") as handle:
+        document = json.load(handle)
+    smap = document.get("speaker_map") or {}
+    label = voice
+    if label not in smap:
+        for key, entry in smap.items():
+            if entry.get("display") == voice:
+                label = key
+                break
+    if label not in smap:
+        raise KeyError(f"no voice {voice!r} in {path}")
+    old_display = smap[label].get("display")
+    changed = 0
+    for segment in document.get("segments") or []:
+        if segment.get("voice") == label or (not segment.get("voice") and segment.get("speaker") == old_display):
+            segment["speaker"] = name
+            changed += 1
+    smap[label] = {
+        "name": name,
+        "display": name,
+        "confidence": 1.0,
+        "status": "confirmed",
+        "evidence": ["named by the user"],
+    }
+    document["speaker_map"] = smap
+    document["participants"] = participant_list(document.get("self_name"), document.get("segments"), [])
+    atomic_write_json(path, document)
+    atomic_write_text(os.path.join(folder, "transcript.txt"), render_transcript(document.get("segments"), labeled=True))
+    if profiles is not None:
+        try:
+            with open(os.path.join(folder, VOICES_JSON), "r", encoding="utf-8") as handle:
+                voices = json.load(handle).get("voices") or {}
+        except (OSError, ValueError):
+            voices = {}
+        vector = (voices.get(label) or {}).get("embedding")
+        if vector:
+            profiles.update(name, vector, session=os.path.basename(os.path.abspath(folder)))
+            profiles.save()
+    return changed

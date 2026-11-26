@@ -37,12 +37,53 @@ def capture_helper_candidates(home=None):
     return (bundled, os.path.join(bindir, HELPER_BINARY))
 
 
-def find_capture_helper(environ=None, home=None):
-    """Return the helper executable, or None when it has not been built."""
+# Built from source by scripts/install_macos.sh and signed with a local,
+# stable code-signing identity, so its TCC grants survive rebuilds. Used for
+# recording once `meeting-notes selftest --verify-signed` proved it captures
+# real system audio (that writes SIGNED_MARKER); used for window probing only
+# when the marker also records a Screen Recording grant.
+SIGNED_HELPER_APP = "MeetingAudioCapture-signed.app"
+SIGNED_MARKER = ".signed-helper-verified.json"
+
+
+def signed_helper_path(home=None):
+    root = home or os.path.expanduser("~")
+    return os.path.join(root, ".meeting-notes", "bin", SIGNED_HELPER_APP, "Contents", "MacOS", HELPER_BINARY)
+
+
+def signed_helper_status(home=None):
+    """The verification marker as a dict, or {} when not verified."""
+    import json
+
+    root = home or os.path.expanduser("~")
+    marker = os.path.join(root, ".meeting-notes", "bin", SIGNED_MARKER)
+    try:
+        with open(marker, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def is_signed_helper(path, home=None):
+    return bool(path) and os.path.abspath(path) == os.path.abspath(signed_helper_path(home))
+
+
+def find_capture_helper(environ=None, home=None, purpose="record"):
+    """Return the helper executable, or None when it has not been built.
+
+    `purpose` is "record" or "probe". The signed helper is preferred once
+    verified for that purpose; otherwise the older ad-hoc helper is used.
+    """
     environ = os.environ if environ is None else environ
     override = (environ.get(HELPER_ENV) or "").strip()
     if override:
         return override if os.path.isfile(override) else None
+    signed = signed_helper_path(home)
+    status = signed_helper_status(home)
+    if os.path.isfile(signed) and status.get("record_ok"):
+        if purpose == "record" or status.get("screen_recording"):
+            return signed
     for path in capture_helper_candidates(home):
         if os.path.isfile(path):
             return path

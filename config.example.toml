@@ -64,6 +64,13 @@ watch_slack_huddle = true
 # Whisper settings for sessions started by the watcher.
 whisper_model = "medium"
 language = "en"
+# auto (CUDA if usable, else CPU int8), cpu, cuda, or mps (experimental
+# Metal backend on Apple Silicon; falls back to CPU on error).
+whisper_device = "auto"
+# Spelling hint passed to Whisper. Empty turns it off.
+# whisper_vocabulary = "Greek, Bebop, Base Batches, Uniswap, ..."
+# Run one Whisper transcription at a time; later sessions wait their turn.
+serial_transcription = true
 
 # Name the microphone track with this label. The default "You" is replaced
 # by your Google Meet display name when the Chrome extension reports it.
@@ -78,17 +85,17 @@ speaker_labels = true
 # `meeting-notes speakers` copies that port into the extension folder.
 speaker_bridge_port = 8765
 
-# Leave this false. Remote speakers are named from Meet live captions
-# (press CC; only you see them), then from a single active tile.
-# true also tries to split the remote mix by voice. That needs extra
-# packages (numpy, and optionally resemblyzer / speechbrain / pyannote)
-# and is not part of the normal install.
-diarize = false
+# Split the remote (system-audio) track into voices on this machine and put
+# names on them (calendar attendees, Meet/Slack window title, people
+# introducing themselves or being addressed by name, saved voice profiles).
+# Uses sherpa-onnx + two public ONNX models that scripts/install_macos.sh
+# downloads into ~/.meeting-notes/models. No account or token.
+diarize = true
 
-# Used only when diarize is true. auto: pyannote if hf_token or HF_TOKEN is
-# set and pyannote is installed, otherwise speechbrain, otherwise resemblyzer,
-# otherwise a built-in numpy clusterer. Also: builtin, speechbrain,
-# resemblyzer, pyannote, off.
+# auto: sherpa-onnx when installed, then pyannote if hf_token or HF_TOKEN is
+# set and pyannote is installed, otherwise speechbrain, resemblyzer, or a
+# built-in numpy clusterer. Also: sherpa, builtin, speechbrain, resemblyzer,
+# pyannote, off.
 diarize_backend = "auto"
 
 # Hint for pyannote. Voices that still sound different are not merged to fit.
@@ -107,3 +114,30 @@ hf_token = ""
 # to the transcript outbox, and a gap that crosses local midnight (the computer
 # was off overnight) does not send one.
 watcher_health_ping = false
+
+# --- Speaker naming --------------------------------------------------------
+# Lists are comma-separated strings.
+# Other names you go by; never given to a remote voice.
+self_aliases = ""
+# People you talk to often (first names are fine). Lets "thanks, Mahmoud"
+# name a voice even without a calendar entry.
+known_people = ""
+# Who can be in a Slack channel huddle (channel: names; channel: names).
+slack_channel_rosters = ""
+# Company / product names that are never read as a person in a title.
+organizations = "Greek, greek.fi, Bebop, Base, Coinbase"
+# Calendar attendees. A JSON events file (for example one synced into Google
+# Drive) and/or the calendar's private iCal URL. The URL is a secret: keep it
+# out of git and logs.
+calendar_json_path = ""
+calendar_ics_url = ""
+# Remember the voices of confirmed people in ~/.meeting-notes/voices.
+voice_profiles = true
+
+# --- Delivery and retention -------------------------------------------------
+# Also write the complete transcript (txt, json and a .sha256) here, for
+# example a Google Drive synced folder. Empty turns it off.
+transcript_archive_dir = ""
+# Watcher sessions keep their audio until the transcript passed verification
+# and was delivered or archived.
+delete_audio_requires_delivery = true

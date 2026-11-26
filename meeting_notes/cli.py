@@ -166,9 +166,13 @@ def _maybe_delete_audio(folder, keep_audio):
 
     ``--keep-audio`` and config ``keep_audio`` both retain the files.
     """
-    from meeting_notes.session_finish import delete_session_audio, transcript_ready
+    from meeting_notes.session_finish import delete_session_audio, transcript_ready, transcript_verified
 
     if keep_audio or not transcript_ready(folder):
+        return
+    ok, reason = transcript_verified(folder)
+    if not ok:
+        print(f"Audio kept ({reason}). Re-run `meeting-notes reprocess` after fixing capture.")
         return
     removed, _freed = delete_session_audio(folder)
     for path in removed:
@@ -253,10 +257,25 @@ def _stop_speaker_bridge(bridge):
         pass
 
 
+def _configure_whisper(config):
+    """Apply config whisper_vocabulary / whisper_device to the transcriber."""
+    from meeting_notes.transcriber import DEFAULT_VOCABULARY, configure, vocabulary_prompt
+
+    configure(
+        initial_prompt=vocabulary_prompt(
+            getattr(config, "whisper_vocabulary", DEFAULT_VOCABULARY)
+        ),
+        device=getattr(config, "whisper_device", None) or None,
+    )
+
+
 def _write_transcript(meeting_dir, config, whisper_model, language):
     """Transcribe and, when speaker labels are possible, name each line."""
+    from meeting_notes.session_finish import _transcription_slot
     from meeting_notes.speakers import TRANSCRIPT_JSON, produce_transcript
     from meeting_notes.transcriber import transcribe_paths
+
+    _configure_whisper(config)
 
     def plain(path):
         return transcribe(path, model_size=whisper_model, language=language)
@@ -269,7 +288,13 @@ def _write_transcript(meeting_dir, config, whisper_model, language):
             word_timestamps=True,
         )
 
-    text, document = produce_transcript(
+    with _transcription_slot(bool(getattr(config, "serial_transcription", False))):
+        text, document = _produce_labeled(meeting_dir, config, plain, many, produce_transcript)
+    return _finish_written_transcript(meeting_dir, text, document, TRANSCRIPT_JSON)
+
+
+def _produce_labeled(meeting_dir, config, plain, many, produce_transcript):
+    return produce_transcript(
         meeting_dir,
         self_name=getattr(config, "self_name", "You"),
         enabled=bool(getattr(config, "speaker_labels", True)),
@@ -280,6 +305,9 @@ def _write_transcript(meeting_dir, config, whisper_model, language):
         diarize_max_speakers=int(getattr(config, "diarize_max_speakers", 8) or 8),
         hf_token=getattr(config, "hf_token", "") or "",
     )
+
+
+def _finish_written_transcript(meeting_dir, text, document, TRANSCRIPT_JSON):
     atomic_write_text(session_transcript_path(meeting_dir), text)
     if document is not None:
         atomic_write_json(os.path.join(meeting_dir, TRANSCRIPT_JSON), document)
@@ -376,6 +404,17 @@ def _resolve_folder(folder):
     if os.path.isabs(folder):
         return folder
     return os.path.join(OUTPUT_DIR, folder)
+
+
+def _lower_priority(increment=10):
+    """Best-effort nice for the transcription phase (POSIX only)."""
+    nice = getattr(os, "nice", None)
+    if nice is None:
+        return
+    try:
+        nice(increment)
+    except OSError:
+        pass
 
 
 def cmd_start(args):
@@ -488,6 +527,11 @@ def cmd_start(args):
         from meeting_notes.session_finish import SessionFinishError, finish_folder
         from meeting_notes.transcriber import transcribe_paths
 
+        # Recording is over. Free the session lock so the watcher can record
+        # the next call while this one transcribes, and drop priority so the
+        # transcription does not starve that new recording.
+        clear_active(CONTROL_DIR, pid=os.getpid())
+        _lower_priority()
         try:
             result = finish_folder(
                 meeting_dir,
@@ -1288,7 +1332,98 @@ def build_parser():
     )
     speakers_parser.set_defaults(func=cmd_speakers)
 
+    selftest_parser = subparsers.add_parser(
+        "selftest",
+        help="Health check: watcher, helper, models, config; --capture/--e2e record a test clip",
+    )
+    selftest_parser.add_argument("--capture", action="store_true", help="Record a 3-voice clip through the real capture path")
+    selftest_parser.add_argument("--e2e", action="store_true", help="--capture, then transcribe and name the speakers")
+    selftest_parser.add_argument("--verify-signed", action="store_true", help="Prove the signed helper captures audio and switch to it")
+    selftest_parser.add_argument("--model", default=None, help="Whisper model for --e2e (default: config whisper_model)")
+    selftest_parser.add_argument("--keep", action="store_true", help="Keep the temporary recording")
+    selftest_parser.set_defaults(func=cmd_selftest)
+
+    voices_parser = subparsers.add_parser(
+        "voices",
+        help="Show or fix who a voice is; manage saved voice profiles",
+    )
+    voices_subs = voices_parser.add_subparsers(dest="voices_command", required=True)
+    voices_subs.add_parser("list", help="People with a saved voice profile")
+    show = voices_subs.add_parser("show", help="Speaker map of one session")
+    show.add_argument("folder")
+    name = voices_subs.add_parser("name", help='Name a voice in a session: voices name FOLDER "Speaker 3" "Mahmoud"')
+    name.add_argument("folder")
+    name.add_argument("voice")
+    name.add_argument("name")
+    forget = voices_subs.add_parser("forget", help="Delete a saved voice profile")
+    forget.add_argument("name")
+    voices_parser.set_defaults(func=cmd_voices)
+
+    models_parser = subparsers.add_parser("models", help="Speaker-diarization models (sherpa-onnx)")
+    models_parser.add_argument("--download", action="store_true", help="Fetch the public ONNX models if missing")
+    models_parser.set_defaults(func=cmd_models)
+
     return parser
+
+
+def cmd_selftest(args):
+    from meeting_notes.selftest import run
+
+    report = run(args, _load_config_lenient())
+    sys.exit(0 if report.ok else 1)
+
+
+def _session_folder(value):
+    if os.path.isdir(value):
+        return os.path.abspath(value)
+    candidate = os.path.join(os.path.expanduser("~/meeting-notes"), value)
+    if os.path.isdir(candidate):
+        return candidate
+    print(f"Error: session folder not found: {value}", file=sys.stderr)
+    sys.exit(1)
+
+
+def cmd_voices(args):
+    from meeting_notes.voice_profiles import VoiceProfiles
+
+    store = VoiceProfiles()
+    if args.voices_command == "list":
+        for person in store.names():
+            item = store.people[person]
+            print(f"{person}: {item.get('count', 1)} call(s), updated {item.get('updated_at', '?')}")
+        if not store.names():
+            print("No voice profiles yet. They are saved when a name is confirmed.")
+        return
+    if args.voices_command == "forget":
+        print("Forgot." if store.forget(args.name) else "No such profile.")
+        store.save()
+        return
+    folder = _session_folder(args.folder)
+    if args.voices_command == "show":
+        import json as _json
+
+        with open(os.path.join(folder, "transcript.json"), "r", encoding="utf-8") as handle:
+            document = _json.load(handle)
+        for label, entry in (document.get("speaker_map") or {}).items():
+            print(f"{label}: {entry.get('display')}  [{entry.get('status')}, confidence {entry.get('confidence')}]")
+            for why in entry.get("evidence") or []:
+                print(f"    - {why}")
+        return
+    from meeting_notes.speakers import rename_voice
+
+    changed = rename_voice(folder, args.voice, args.name, profiles=store)
+    print(f"Renamed {changed} line(s) to {args.name}. Voice profile saved when available.")
+
+
+def cmd_models(args):
+    from meeting_notes.diarize import download_models, model_paths, sherpa_available
+
+    if args.download:
+        download_models()
+    seg, emb = model_paths()
+    print(f"segmentation: {seg} ({'ok' if os.path.isfile(seg) else 'missing'})")
+    print(f"embedding:    {emb} ({'ok' if os.path.isfile(emb) else 'missing'})")
+    print("sherpa-onnx ready" if sherpa_available() else "sherpa-onnx not ready")
 
 
 def main(argv=None):

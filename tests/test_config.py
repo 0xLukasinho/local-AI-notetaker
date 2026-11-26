@@ -22,7 +22,7 @@ def test_missing_file_keeps_manual_summary_and_watcher_notes(tmp_path):
     assert config.speaker_labels is True
     assert config.self_name == "You"
     assert config.speaker_bridge_port == 8765
-    assert config.diarize is False
+    assert config.diarize is True  # local voice split + naming is on by default
     assert config.diarize_backend == "auto"
     assert config.diarize_max_speakers == 8
     assert config.hf_token == ""
@@ -100,7 +100,7 @@ def test_example_config_loads(tmp_path):
     assert config.speaker_labels is True
     assert config.self_name == "You"
     assert config.speaker_bridge_port == 8765
-    assert config.diarize is False
+    assert config.diarize is True  # local voice split + naming is on by default
     assert config.diarize_backend == "auto"
     assert config.diarize_max_speakers == 8
     assert config.hf_token == ""
