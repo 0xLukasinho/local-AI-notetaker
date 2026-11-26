@@ -70,6 +70,25 @@ uses the signed helper (no shim is loaded), and the next installer run moves
 the shim to `~/.meeting-notes/backups/`. Window-title probing keeps using the
 old helper unless the signed one also has Screen Recording.
 
+### ScreenCaptureKit fallback (TCC -3801)
+
+Recording uses the Core Audio process tap. If the tap delivers only digital
+silence for 15 s (often just the seconds before anyone in the call speaks),
+the helper tries ScreenCaptureKit. Without a *Screen & System Audio
+Recording* grant for `MeetingAudioCapture-signed` that fails with
+`SCStreamErrorDomain -3801` and the helper keeps the tap, which picks up the
+call as soon as Chrome plays audio. The recording is not affected. To make
+the fallback usable, grant the signed helper once in System Settings >
+Privacy & Security > Screen & System Audio Recording; `selftest` shows a WARN
+until then.
+
+### Audio is kept until names are confident
+
+WAVs are deleted only after the transcript is verified, delivered/archived,
+and every speaker in `speaker_map` is `confirmed`. Otherwise status.json gets
+`needs_relabel: true`, `unconfirmed_speakers`, and `audio_kept_reason`, and
+`meeting-notes reprocess FOLDER --participants "A, B"` can re-label it.
+
 ## Speaker names
 
 Mic track = you (`self_name`). The remote track is split into voices with

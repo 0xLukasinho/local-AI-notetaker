@@ -254,3 +254,25 @@ def test_inspect_extension_state_detects_chrome_path_mismatch(tmp_path, capsys, 
     out = capsys.readouterr().out
     assert "Mismatch:" in out
     assert other_id in out
+
+
+def test_min_clusters_splits_voices_meet_saw_as_different_people():
+    from meeting_notes.diarize import average_linkage
+
+    # Two similar voices (cosine 0.8) merge at the default threshold.
+    a = [1.0, 0.0]
+    b = [0.8, 0.6]
+    assert len(set(average_linkage([a, a, b, b]))) == 1
+    assert len(set(average_linkage([a, a, b, b], min_clusters=2))) == 2
+
+
+def test_active_remote_speakers_counts_people_meet_highlighted():
+    from meeting_notes import speakers
+
+    events = []
+    for i in range(10):
+        events.append({"t": i * 1.0, "active": ["Jordan Lee"], "participants": ["Jordan Lee", "Casey Moore"], "self": "Lukas"})
+    for i in range(10, 20):
+        events.append({"t": i * 1.0, "active": ["Casey Moore"], "participants": ["Jordan Lee", "Casey Moore"], "self": "Lukas"})
+    events = [speakers.coerce_event(e) for e in events]
+    assert speakers.active_remote_speakers(events, "Lukas") == ["Casey Moore", "Jordan Lee"]

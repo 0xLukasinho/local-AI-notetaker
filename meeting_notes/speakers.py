@@ -1291,7 +1291,16 @@ def _needs_remote_diarization(events, self_label):
     return len(names) + len(anons) >= 2
 
 
-def _utterance_timeline(folder, others_segments, models_dir=None):
+def active_remote_speakers(events, self_label, minimum_seconds=3.0):
+    """Remote people Meet showed as the only active speaker for a while."""
+    totals = {}
+    for interval in exclusive_tile_intervals(events, self_label):
+        name = interval["speaker"]
+        totals[name] = totals.get(name, 0.0) + max(0.0, float(interval["end"]) - float(interval["start"]))
+    return [name for name, seconds in sorted(totals.items()) if seconds >= minimum_seconds]
+
+
+def _utterance_timeline(folder, others_segments, models_dir=None, min_clusters=1):
     """Voices on the remote track from Whisper utterances (sherpa-onnx).
 
     Returns `(segments, diarization, embeddings)` or None when the neural
@@ -1313,7 +1322,7 @@ def _utterance_timeline(folder, others_segments, models_dir=None):
         except (KeyError, TypeError, ValueError):
             continue
     try:
-        result = diarize_utterances(others, spans, models_dir=models_dir)
+        result = diarize_utterances(others, spans, models_dir=models_dir, min_clusters=min_clusters)
     except Exception as exc:
         return None, {"backend": None, "clusters": 0, "reason": " ".join(str(exc).split())[:180]}, {}
     segments = result.get("segments") or []
@@ -1441,7 +1450,12 @@ def produce_transcript(
         voice_embeddings = {}
         utterance = None
         if diarize and diarizer is None and by_role.get("others") and (diarize_backend or "auto") in ("auto", "sherpa"):
-            utterance = _utterance_timeline(folder, by_role.get("others"), (naming or {}).get("models_dir"))
+            # Split at least as many remote voices as Meet's active-speaker
+            # signal showed, so two people never share one voice label.
+            heard = len(active_remote_speakers(events, self_label))
+            utterance = _utterance_timeline(
+                folder, by_role.get("others"), (naming or {}).get("models_dir"), min_clusters=max(1, heard)
+            )
         if utterance is not None:
             voice_segments, diarization, voice_embeddings = utterance
         else:
