@@ -271,8 +271,8 @@ def test_active_remote_speakers_counts_people_meet_highlighted():
 
     events = []
     for i in range(10):
-        events.append({"t": i * 1.0, "active": ["Bill Liang"], "participants": ["Bill Liang", "Aaron Lamphere"], "self": "Lukas"})
+        events.append({"t": i * 1.0, "active": ["Jordan Lee"], "participants": ["Jordan Lee", "Casey Moore"], "self": "Lukas"})
     for i in range(10, 20):
-        events.append({"t": i * 1.0, "active": ["Aaron Lamphere"], "participants": ["Bill Liang", "Aaron Lamphere"], "self": "Lukas"})
+        events.append({"t": i * 1.0, "active": ["Casey Moore"], "participants": ["Jordan Lee", "Casey Moore"], "self": "Lukas"})
     events = [speakers.coerce_event(e) for e in events]
-    assert speakers.active_remote_speakers(events, "Lukas") == ["Aaron Lamphere", "Bill Liang"]
+    assert speakers.active_remote_speakers(events, "Lukas") == ["Casey Moore", "Jordan Lee"]

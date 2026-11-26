@@ -115,7 +115,7 @@ def test_unconfirmed_speaker_keeps_audio_and_flags_relabel(tmp_path):
             {
                 "speaker_map": {
                     "Lukas": {"status": "confirmed", "display": "Lukas"},
-                    "Speaker 2": {"status": "unconfirmed", "display": "Speaker 2 (unconfirmed: likely Bill Liang)"},
+                    "Speaker 2": {"status": "unconfirmed", "display": "Speaker 2 (unconfirmed: likely Jordan Lee)"},
                 }
             }
         ),

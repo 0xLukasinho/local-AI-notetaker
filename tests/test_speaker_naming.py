@@ -412,7 +412,7 @@ def test_e2e_regression_intro_drowned_out_but_addressing_names_the_voice():
 def test_common_words_are_never_names():
     turns = [
         t(0, "Lukas", "Awesome, yeah. Anything you need from us?"),
-        t(4, "Speaker 2", "Yeah, I think the diagrams would be good."),
+        t(4, "Speaker 2", "Yeah, I think the second option works."),
         t(9, "Speaker 2", "Awesome, thanks."),
     ]
     speaker_map, _ = sn.resolve_speakers(turns, "Lukas", roster=[])
@@ -422,11 +422,11 @@ def test_common_words_are_never_names():
 def test_unlisted_addressed_name_is_not_used_but_listed_one_is():
     turns = [
         t(0, "Speaker 2", "Hey Lukas."),
-        t(1, "Lukas", "Hey Bill, how's it going?"),
+        t(1, "Lukas", "Hey Jordan, how's it going?"),
         t(3, "Speaker 2", "Good, thanks. How are you?"),
     ]
     speaker_map, _ = sn.resolve_speakers(turns, "Lukas", roster=[])
-    assert "Bill" not in display(speaker_map, "Speaker 2")
-    roster = [sn.roster_entry("Bill Liang", "meet"), sn.roster_entry("Katia Banina", "meet")]
+    assert "Jordan" not in display(speaker_map, "Speaker 2")
+    roster = [sn.roster_entry("Jordan Lee", "meet"), sn.roster_entry("Sam Park", "meet")]
     speaker_map, _ = sn.resolve_speakers(turns, "Lukas", roster=roster)
-    assert "Bill Liang" in display(speaker_map, "Speaker 2")
+    assert "Jordan Lee" in display(speaker_map, "Speaker 2")
